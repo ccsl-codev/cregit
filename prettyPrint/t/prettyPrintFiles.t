@@ -68,6 +68,21 @@ use warnings;
 use File::Basename qw(dirname);
 use File::Path qw(make_path);
 
+if ($ENV{BARRIER_DIR}) {
+    open(my $ready, '>', "$ENV{BARRIER_DIR}/$$") or die $!;
+    close $ready;
+    my $released = 0;
+    for (1..200) {
+        my @ready = glob("$ENV{BARRIER_DIR}/*");
+        if (@ready >= 2) {
+            $released = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.01);
+    }
+    exit 9 unless $released;
+}
+
 exit 7 if $ENV{FAIL_RENDER};
 
 open(my $log, '>>', $ENV{CALL_LOG}) or die $!;
@@ -148,13 +163,36 @@ sub run_driver {
 
 {
     local $ENV{FAIL_RENDER} = 1;
-    my ($status, $stdout) = run_driver('--overwrite');
+    my ($status, $stdout) = run_driver('--overwrite', '--jobs=2');
     isnt($status, 0, 'a renderer failure makes the repository driver fail');
     like(
         $stdout,
         qr/Newly processed \[1\] Already done \[0\] files Error \[1\]/,
         'the failure summary reports the renderer error'
     );
+}
+
+{
+    write_file("$blame_dir/src/b.c.blame", "fixture\n");
+    my $barrier = "$workdir/pretty-barrier";
+    make_path($barrier);
+    local $ENV{BARRIER_DIR} = $barrier;
+    my ($status, $stdout) = run_driver('--overwrite', '--jobs=2');
+    is($status, 0, '--jobs runs renderers concurrently');
+    like(
+        $stdout,
+        qr/Newly processed \[2\] Already done \[0\] files Error \[0\]/,
+        'parallel rendering reports every completed file'
+    );
+    ok(-f "$output_dir/src/a.c.html" && -f "$output_dir/src/b.c.html",
+       'parallel rendering writes both outputs');
+}
+
+{
+    my ($status, undef, $stderr) = run_driver('--jobs=0');
+    isnt($status, 0, 'zero jobs is rejected');
+    like($stderr, qr/--jobs must be a positive integer/,
+         'invalid jobs reports a useful error');
 }
 
 done_testing();

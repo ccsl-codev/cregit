@@ -21,6 +21,8 @@ use File::Copy;
 use Pod::Usage;
 use Getopt::Long;
 use File::Basename;
+use Errno qw(EINTR);
+use POSIX qw(_exit);
 
 my $commandPath = dirname(__FILE__);
 
@@ -30,15 +32,19 @@ my $man = 0;
 my $blameExtension = ".blame";
 my $overwrite = 0;
 my $verbose = 0;
+my $jobs = 1;
 
 GetOptions ("formatblame=s" => \$blameCommand,
             "help"     => \$help,      # string
             "blameExtension=s" => \$blameExtension,
+            "jobs=i"            => \$jobs,
             "overwrite"         => \$overwrite,
             "verbose"           => \$verbose,
             "blameCommand=s"   => \$blameCommand,
             "man"      => \$man)   # flag
         or die("Error in command line arguments\n");
+
+die "--jobs must be a positive integer\n" unless $jobs >= 1;
 
 if ($man) {
     pod2usage(-verbose=>2);
@@ -56,14 +62,17 @@ my $fileRegExpr = shift;
 
 
 
-open(FILES, "git -C '$repoDir' ls-files|") or die "unable to traverse git repo [$repoDir] $!";
+open(my $files, '-|', 'git', '-C', $repoDir, 'ls-files')
+    or die "unable to traverse git repo [$repoDir] $!";
+my @trackedFiles = <$files>;
+close($files) or die "unable to traverse git repo [$repoDir]";
 
 my $count = 0;
 my $alreadyDone = 0;
 my $errorCount = 0;
+my %running;
 
-
-while (<FILES>) {
+foreach (@trackedFiles) {
 #    next unless /^kernel/;
     chomp;
 
@@ -94,14 +103,10 @@ while (<FILES>) {
     print STDERR ("$count: $name\n");
 
 
-    my $errorCode = execute_command($blameCommand, "--blameExtension=$blameExtension", $repoDir, $name, $outputDir);
-    if ($errorCode != 0) {
-        print "Error code [$errorCode][$name]\n";
-        $errorCount ++;
-    } else {
-        # command already moves file
-    }
+    start_command($name, $blameCommand, "--blameExtension=$blameExtension", $repoDir, $name, $outputDir);
 }
+
+reap_command() while %running;
 
 print "Newly processed [$count] Already done [$alreadyDone] files Error [$errorCount]\n";
 exit($errorCount == 0 ? 0 : 1);
@@ -114,19 +119,48 @@ sub Usage {
 }
 
 
-sub execute_command {
-    my (@command) = @_;
-    # make sure we have more than one element in the array
-    #    otherwise system will use the shell to do the execution
+sub start_command {
+    my ($name, @command) = @_;
+
+    reap_command() while scalar(keys %running) >= $jobs;
+
     if ($verbose) {
         print STDERR join(' ',@command), "\n";
     }
 
     die "command (@command) seems to be missing parameters" unless (scalar(@command) > 1);
 
-    my $status = system(@command);
+    my $pid = fork();
+    if (!defined $pid) {
+        print "Unable to start command [$name]: $!\n";
+        $errorCount ++;
+        return;
+    }
 
-    return $status;
+    if ($pid == 0) {
+        exec { $command[0] } @command;
+        print STDERR "Unable to execute command [$command[0]]: $!\n";
+        _exit(127);
+    }
+
+    $running{$pid} = $name;
+}
+
+sub reap_command {
+    my $pid;
+    do {
+        $pid = wait();
+    } while ($pid < 0 && $! == EINTR);
+
+    die "unable to wait for formatter process: $!" if $pid < 0;
+
+    my $status = $?;
+    my $name = delete $running{$pid};
+
+    if ($status != 0) {
+        print "Error code [$status][$name]\n";
+        $errorCount ++;
+    }
 }
 
 __END__
@@ -143,6 +177,7 @@ blameRepoFiles.pl: create the "blame" of files in a git repository
        --override         overwrite existing files
        --help             brief help message
        --man              full documentation
+       --jobs=N           maximum concurrent blame processes (default 1)
        --blameExtension=s extension to use in blame
        --formatblame=s    full path formatBlame (command to create them blame).
                           By default it looks in the same directory as this script,

@@ -22,6 +22,8 @@ use Pod::Usage;
 use Getopt::Long;
 use Cwd 'abs_path';
 use File::Basename;
+use Errno qw(EINTR);
+use POSIX qw(_exit);
 
 my $commandPath = dirname(__FILE__);
 
@@ -32,6 +34,7 @@ my $prettyExtension = ".html";
 my $overwrite = 0;
 my $verbose = 0;
 my $blameExtension = ".blame";
+my $jobs = 1;
 
 my $headerFile = "";
 my $footerFile = "";
@@ -41,6 +44,7 @@ my $footerFile = "";
 GetOptions (
             "prettyExtension=s" => \$prettyExtension,
             "blameExtension=s"  => \$blameExtension,
+            "jobs=i"            => \$jobs,
             "prettyCommand=s"   => \$prettyCommand,
             "header=s"          => \$headerFile,
             "footer=s"          => \$footerFile,
@@ -50,6 +54,8 @@ GetOptions (
             "verbose"           => \$verbose,
             "man"      => \$man)   # flag
         or die("Error in command line arguments\n");
+
+die "--jobs must be a positive integer\n" unless $jobs >= 1;
 
 if ($man) {
     pod2usage(-verbose=>2);
@@ -85,13 +91,17 @@ if ($footerFile ne "") {
     push (@options , "--footer=$footerFile");
 }
 
-open(FILES, "git -C '$repoDir' ls-files|") or die "unable to traverse git repo [$repoDir] $!";
+open(my $files, '-|', 'git', '-C', $repoDir, 'ls-files')
+    or die "unable to traverse git repo [$repoDir] $!";
+my @trackedFiles = <$files>;
+close($files) or die "unable to traverse git repo [$repoDir]";
 
 my $count = 0;
 my $alreadyDone = 0;
 my $errorCount = 0;
+my %running;
 
-while (<FILES>) {
+foreach (@trackedFiles) {
 #    next unless /^kernel/;
     chomp;
 
@@ -129,16 +139,11 @@ while (<FILES>) {
     $count++;
     print("$count: $name\n");
 
-    my $errorCode = execute_command($prettyCommand, @options, $cregitDB, $authorsDB, $originalFile,
-                                    $blameFile, $outputFile, "$name", $cregitRepoURL);
-
-    if ($errorCode != 0) {
-        print "Error code [$errorCode][$name]\n";
-        $errorCount ++;
-    } else {
-        # command already moves file
-    }
+    start_command($name, $prettyCommand, @options, $cregitDB, $authorsDB, $originalFile,
+                  $blameFile, $outputFile, "$name", $cregitRepoURL);
 }
+
+reap_command() while %running;
 
 print "Newly processed [$count] Already done [$alreadyDone] files Error [$errorCount]\n";
 exit($errorCount == 0 ? 0 : 1);
@@ -153,17 +158,46 @@ sub Usage {
 }
 
 
-sub execute_command {
-    my (@command) = @_;
-    # make sure we have more than one element in the array
-    #    otherwise system will use the shell to do the execution
+sub start_command {
+    my ($name, @command) = @_;
+
+    reap_command() while scalar(keys %running) >= $jobs;
+
     die "command (@command) seems to be missing parameters" unless (scalar(@command) > 1);
 
     print(join(" ", @command), "\n") if $verbose;
 
-    my $status = system(@command);
+    my $pid = fork();
+    if (!defined $pid) {
+        print "Unable to start command [$name]: $!\n";
+        $errorCount ++;
+        return;
+    }
 
-    return $status;
+    if ($pid == 0) {
+        exec { $command[0] } @command;
+        print STDERR "Unable to execute command [$command[0]]: $!\n";
+        _exit(127);
+    }
+
+    $running{$pid} = $name;
+}
+
+sub reap_command {
+    my $pid;
+    do {
+        $pid = wait();
+    } while ($pid < 0 && $! == EINTR);
+
+    die "unable to wait for renderer process: $!" if $pid < 0;
+
+    my $status = $?;
+    my $name = delete $running{$pid};
+
+    if ($status != 0) {
+        print "Error code [$status][$name]\n";
+        $errorCount ++;
+    }
 }
 
 __END__
@@ -180,6 +214,7 @@ prettyRepoFiles.pl: create the "pretty" of files in a git repository
        --override         overwrite existing files
        --help             brief help message
        --man              full documentation
+       --jobs=N           maximum concurrent renderer processes (default 1)
        --header=s         file to insert as a header
        --footer=s         file to insert as a footer
        --blameExtension=s extension of blame files (default .blame)
