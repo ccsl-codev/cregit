@@ -460,7 +460,7 @@ sub Print_Func_Stats {
     }
 
     Print_Stats_Header("Contributors");
-    foreach my $k (sort { $totalPerFunc{$b} <=> $totalPerFunc{$a} }  (keys %totalPerFunc)) {
+    foreach my $k (sort { $totalPerFunc{$b} <=> $totalPerFunc{$a} || $a cmp $b } (keys %totalPerFunc)) {
         my $toks = $totalPerFunc{$k};
 
         my $ccount = Function_Count_Commits($k);
@@ -490,7 +490,7 @@ sub  Print_File_Stats {
     Print_Stats_Header("Overall Contributors");
 
 
-    foreach my $k (sort { $total{$b} <=> $total{$a} } (keys %colors)) {
+    foreach my $k (sort { $total{$b} <=> $total{$a} || $a cmp $b } (keys %colors)) {
         my $toks = $total{$k};
         my $prop = sprintf("%.2f\%", 100.0 * $toks/$tot );
         my $ccount = Count_Commits($k);
