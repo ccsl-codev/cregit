@@ -36,7 +36,8 @@ Tokenizer:
                                   for repos too large to tokenize in one process;
                                   delegates to blobExec/shard_build.sh
   --shards N    shard count for --mode sharded (default: 4)
-
+  --jobs N      concurrent blame/HTML processes
+                (default: CREGIT_JOBS, otherwise min(4, available CPUs))
   FROM_STEP     resume from this step number (default: 1). A full run (step 1)
                 starts clean; resuming keeps existing work.
 
@@ -56,6 +57,13 @@ log() {
 
 MODE="pipeline"
 SHARDS=4
+CPU_COUNT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+case "$CPU_COUNT" in
+    ''|*[!0-9]*|0) CPU_COUNT=1 ;;
+esac
+DEFAULT_JOBS=4
+[ "$CPU_COUNT" -lt "$DEFAULT_JOBS" ] && DEFAULT_JOBS=$CPU_COUNT
+JOBS=${CREGIT_JOBS:-$DEFAULT_JOBS}
 FROM_STEP=1
 BUILD_ONLY=0
 REPO_GIT_URL=""
@@ -79,6 +87,7 @@ while [ $# -gt 0 ]; do
         --work)       need_val "$@"; WORK="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
+        --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         ''|*[!0-9]*) echo "unknown argument: $1" >&2; usage; exit 2 ;;
         *) FROM_STEP="$1"; shift ;;
@@ -116,6 +125,7 @@ esac
 if [ "$MODE" = "sharded" ]; then
     [ "$SHARDS" -ge 1 ] 2>/dev/null || { echo "--shards must be a positive integer" >&2; exit 2; }
 fi
+[ "$JOBS" -ge 1 ] 2>/dev/null || { echo "--jobs must be a positive integer" >&2; exit 2; }
 
 step() {
     STEP_NUM=${STEP_NUM:-0}
@@ -249,7 +259,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo ""
 echo "████████████████████████████████████████████████████████████████████████"
-echo "  CreGit Pipeline — ${REPO_NAME} (tokenize mode: ${MODE})"
+echo "  CreGit Pipeline — ${REPO_NAME} (tokenize mode: ${MODE}, file jobs: ${JOBS})"
 echo "  Repo: ${REPO_GIT_URL}"
 echo "  Mask: ${MASK}   Commit links: ${REPO_COMMIT_URL}"
 echo "  Log: $LOG_FILE"
@@ -365,6 +375,7 @@ step "blame"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_CREGIT" ] || die "step 6 did not produce $REPO_PATH_CREGIT"
 perl $CREGIT/blameRepo/blameRepoFiles.pl --verbose \
+  --jobs="$JOBS" \
   --formatBlame=$CREGIT/blameRepo/formatBlame.pl \
   $REPO_PATH_CREGIT $WORK/blame "$MASK"
 fi
@@ -388,6 +399,7 @@ step "generate HTML views"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -f "$DB_PATH_CREGIT" ] || die "step 8 did not complete"
 perl $CREGIT/prettyPrint/prettyPrintFiles.pl --verbose \
+  --jobs="$JOBS" \
   $DB_PATH_CREGIT $DB_PATH_PERSONS \
   $REPO_PATH_ORIGINAL $WORK/blame $WORK/html \
   $REPO_COMMIT_URL "$MASK"

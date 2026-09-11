@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 11;
+use Test::More;
 use FindBin;
 use File::Temp qw(tempdir);
 
@@ -68,8 +68,45 @@ mkdir $out or die $!;
 }
 
 {
-    my $stdout = `perl '$script' --blameCommand=/bin/false --overwrite '$repo' '$out' '\\.c\$' 2>/dev/null`;
+    my $stdout = `perl '$script' --jobs=2 --blameCommand=/bin/false --overwrite '$repo' '$out' '\\.c\$' 2>/dev/null`;
     isnt($?, 0, "a formatter failure makes the repository driver fail");
     like($stdout, qr/Newly processed \[2\] Already done \[0\] files Error \[2\]/,
-         "the failure summary reports every formatter error");
+         "the parallel failure summary reports every formatter error");
 }
+
+{
+    my $barrier = "$workdir/blame-barrier";
+    mkdir $barrier or die $!;
+    my $stub = "$workdir/blame-parallel-stub.pl";
+    write_file($stub, <<'STUB');
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+open(my $ready, '>', "$ENV{BARRIER_DIR}/$$") or die $!;
+close $ready;
+
+for (1..200) {
+    my @ready = glob("$ENV{BARRIER_DIR}/*");
+    exit 0 if @ready >= 2;
+    select(undef, undef, undef, 0.01);
+}
+exit 9;
+STUB
+    chmod 0755, $stub or die $!;
+
+    local $ENV{BARRIER_DIR} = $barrier;
+    my $stdout = `perl '$script' --jobs=2 --blameCommand='$stub' --overwrite '$repo' '$out' '\\.c\$' 2>/dev/null`;
+    is($?, 0, "--jobs runs blame commands concurrently");
+    like($stdout, qr/Newly processed \[2\] Already done \[0\] files Error \[0\]/,
+         "parallel blame reports every completed file");
+}
+
+{
+    my $stdout = `perl '$script' --jobs=0 '$repo' '$out' '\\.c\$' 2>&1`;
+    isnt($?, 0, "zero jobs is rejected");
+    like($stdout, qr/--jobs must be a positive integer/,
+         "invalid jobs reports a useful error");
+}
+
+done_testing();

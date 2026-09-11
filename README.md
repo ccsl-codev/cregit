@@ -140,6 +140,10 @@ dataset (see [generate_dataset/DATASET.md](./generate_dataset/DATASET.md)).
   --work ../cregit-files-REPO
 ```
 
+Blame and HTML generation process independent files concurrently. By default,
+the pipeline uses up to four workers (or fewer when fewer CPUs are available).
+Use `--jobs N` or `CREGIT_JOBS=N` to choose another limit.
+
 Flags (see `./run_pipeline_process.sh --help` for the full list):
 
 | flag                  | meaning                                                    | default                          |
@@ -150,6 +154,7 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--mask`              | regex of files to tokenize (C, C++, Java, Rust, m4); quote it | `'\.[ch]$'`                   |
 | `--work`              | working/output directory                                   | `../cregit-files`                |
 | `--mode` / `--shards` | tokenizer walk mode / shard count for `sharded`            | `pipeline` / `4`                 |
+| `--jobs`              | concurrent blame/HTML processes                            | `CREGIT_JOBS` or up to `4` CPUs  |
 
 A full run starts by **deleting the work directory** — to keep several target
 repositories side by side, give each its own `--work`. To resume a failed run
@@ -185,6 +190,7 @@ reference for manual invocations):
 | ------------------ | ------------------------------------------------------------------------------------------- |
 | `BFG_MEMO_DIR`     | directory used to memoize tokenized blobs                                                    |
 | `BFG_TOKENIZE_CMD` | tokenize command; the script routes it through `tokenize/tokenize.pl`, which dispatches by file extension |
+| `CREGIT_JOBS`      | concurrent blame/HTML processes when `--jobs` is not provided (otherwise up to four CPUs)   |
 | `LEGACY_JAVA_HOME` | JDK 8 home for the Scala 2.10 modules (provided by `devenv shell`)                           |
 
 ## Contributing
