@@ -139,6 +139,14 @@ def skip_literal(token_value: str, reader: SourceReader) -> str:
             while ch is not None and is_ws(ch):
                 text += ch
                 ch = reader.read_char()
+        # The loop above consumes to end-of-source, so `ch` may be None again.
+        # The guard at the top of the iteration cannot cover that, and without
+        # this one `text += ch` below raises:
+        #   TypeError: can only concatenate str (not "NoneType") to str
+        # microsoft/terminal died that way after 2,204s of work. skip_comment
+        # already re-checks in the same place; skip_literal did not.
+        if ch is None:
+            break
         if not is_ws(ch) and is_ws(cT):
             while token_value and is_ws(cT):
                 cT, token_value = consume(token_value)
@@ -295,22 +303,21 @@ def process_blame_file(
         source_text = f.read()
 
     reader = SourceReader(source_text)
-    count = 0
+    counted = [0]
 
-    for token_index, bline in enumerate(blame_lines):
-        parsed = parse_blame_line(bline)
-        if parsed is None:
-            continue
-        commit_sha, token_content = parsed
+    def rows():
+        # Order matters. classify_and_skip advances `reader`, so the tokens have
+        # to be consumed in file order. executemany walks this generator
+        # sequentially, which keeps that order.
+        for token_index, bline in enumerate(blame_lines):
+            parsed = parse_blame_line(bline)
+            if parsed is None:
+                continue
+            commit_sha, token_content = parsed
 
-        info = classify_and_skip(token_content, reader)
-
-        db_cursor.execute(
-            """INSERT INTO token_map
-               (file_path, token_index, commit_sha, token_type, token_value,
-                source_text, source_line, source_col, is_structural, func_name)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
+            info = classify_and_skip(token_content, reader)
+            counted[0] += 1
+            yield (
                 rel_path,
                 token_index,
                 commit_sha,
@@ -321,16 +328,56 @@ def process_blame_file(
                 info["source_col"],
                 info["is_structural"],
                 info["func_name"],
-            ),
-        )
-        count += 1
+            )
 
-    return count
+    # executemany over a generator, not one execute per token. Linux reaches
+    # this step with hundreds of millions of tokens, and at that scale the
+    # per-call Python overhead dominates. A generator keeps the memory bounded,
+    # so a single large file cannot be held in a list.
+    db_cursor.executemany(
+        """INSERT INTO token_map
+           (file_path, token_index, commit_sha, token_type, token_value,
+            source_text, source_line, source_col, is_structural, func_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows(),
+    )
+
+    return counted[0]
 
 
 # ===================================================================
 # Main
 # ===================================================================
+
+# DuckDB's own default memory limit is 80% of *total* RAM. On a shared box the
+# rest of that RAM is already taken, so 80% is more than what is free: the
+# kernel kills the process before DuckDB decides to spill. The Linux run died
+# that way on 2026-09-14, at 17.5 GB resident on a 30 GB host, in step 10.
+# So the limit is explicit here.
+DEFAULT_MEMORY_LIMIT = "8GB"
+
+_MEMORY_LIMIT_RE = re.compile(
+    r"^\d+(?:\.\d+)?\s?(?:B|K|M|G|T|KB|MB|GB|TB|KIB|MIB|GIB|TIB)$"
+)
+
+
+def parse_memory_limit(text):
+    """Return text when DuckDB can read it as an absolute size, else raise.
+
+    A percentage is refused on purpose. A percentage measures total RAM, and
+    the free part is the part that matters. Accepting one reintroduces the
+    setting that let the OOM killer win.
+    """
+    cleaned = text.strip()
+    if cleaned.endswith("%"):
+        raise ValueError(
+            "--memory-limit takes an absolute size, not a percentage. "
+            "A percentage measures total RAM, but only the free part is "
+            "usable. Example: 8GB"
+        )
+    if not _MEMORY_LIMIT_RE.match(cleaned.upper()):
+        raise ValueError(f"cannot read {text!r} as a memory size. Example: 8GB")
+    return cleaned
 
 
 def main():
@@ -356,9 +403,35 @@ def main():
         help="Repository name (default: inferred from output filename)",
     )
     parser.add_argument(
+        "--memory-limit",
+        default=DEFAULT_MEMORY_LIMIT,
+        metavar="SIZE",
+        help=f"cap DuckDB's heap (default: {DEFAULT_MEMORY_LIMIT}). DuckDB's own "
+        "default is 80%% of total RAM, which the OOM killer reaches on a "
+        "shared box. DuckDB spills to the temp directory instead.",
+    )
+    parser.add_argument(
+        "--duckdb-threads",
+        type=int,
+        default=0,
+        metavar="N",
+        help="cap DuckDB's worker threads (default: 0, meaning DuckDB decides). "
+        "Every sorting thread holds its own buffers, so N bounds peak memory "
+        "as well as CPU.",
+    )
+    parser.add_argument(
         "--verbose", action="store_true", help="Verbose output (info-level logging)"
     )
     args = parser.parse_args()
+
+    # Check both caps before Phase 1. Phase 1 costs half an hour on a large
+    # repository, and a typo in a size string must not surface after that.
+    try:
+        memory_limit = parse_memory_limit(args.memory_limit)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.duckdb_threads < 0:
+        parser.error(f"--duckdb-threads cannot be negative (got {args.duckdb_threads})")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -394,10 +467,26 @@ def main():
     # ------------------------------------------------------------------
     # Phase 1: sync blame → token_map (SQLite)
     # ------------------------------------------------------------------
-    sync_db_fd, sync_db_path = tempfile.mkstemp(suffix=".db", prefix="sync_")
+    # Put the scratch DB beside the output, not in TMPDIR.
+    #
+    # Phase 1 inserts one row per token, so this file grows with the repository.
+    # On this host /tmp is a 16 GB tmpfs, which is RAM: a large project would
+    # fill it, and filling a tmpfs also exhausts system memory. The output
+    # directory is the one place the caller has already sized for this project,
+    # because the Parquet file lands there.
+    scratch_dir = output_path.parent
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    sync_db_fd, sync_db_path = tempfile.mkstemp(
+        suffix=".db", prefix="sync_", dir=scratch_dir
+    )
     os.close(sync_db_fd)
 
     sync_conn = sqlite3.connect(sync_db_path)
+    # This DB is scratch: Phase 2 reads it once and the file is deleted below.
+    # So crash durability buys nothing, and a rollback journal doubles the write
+    # volume for a table with one row per token.
+    sync_conn.execute("PRAGMA journal_mode=OFF")
+    sync_conn.execute("PRAGMA synchronous=OFF")
     sync_conn.execute("""
         CREATE TABLE IF NOT EXISTS token_map (
             file_path    TEXT,
@@ -412,10 +501,6 @@ def main():
             func_name    TEXT
         )
     """)
-    sync_conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tm_file ON token_map(file_path, token_index)"
-    )
-
     cursor = sync_conn.cursor()
     total_tokens = 0
     files_processed = 0
@@ -437,6 +522,15 @@ def main():
         total_tokens += count
         files_processed += 1
 
+    sync_conn.commit()
+    # Index after the inserts, not before. Phase 1 only inserts, so nothing reads
+    # the index until Phase 2. Building it up front makes SQLite maintain a
+    # B-tree for every one of the rows above; building it once at the end is a
+    # single sort.
+    print("Indexing token_map...")
+    sync_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tm_file ON token_map(file_path, token_index)"
+    )
     sync_conn.commit()
     sync_conn.close()
 
@@ -461,6 +555,17 @@ def main():
         sys.exit(1)
 
     con = duckdb.connect()
+    # Cap the heap before the query runs. DuckDB spills to temp_directory when it
+    # reaches this limit. It cannot spill after the kernel has killed it, which
+    # is what its 80%-of-total-RAM default invites on a shared host.
+    con.execute(f"SET memory_limit='{memory_limit}'")
+    if args.duckdb_threads:
+        con.execute(f"SET threads={args.duckdb_threads}")
+    # Spill to the output volume for the same reason as the scratch DB above.
+    # The query ends in ORDER BY over every token in the repository, so DuckDB
+    # spills whenever the sort does not fit in memory. Its default temp
+    # directory would follow TMPDIR onto the tmpfs.
+    con.execute(f"SET temp_directory='{str(scratch_dir).replace(chr(39), chr(39) * 2)}'")
     con.execute("INSTALL sqlite_scanner; LOAD sqlite_scanner;")
 
     con.execute(f"CALL sqlite_attach('{sync_db_path}')")

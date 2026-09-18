@@ -27,6 +27,37 @@ Target repository:
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
 
+Output:
+  --skip-html       do not generate the HTML views (step 9). The views cost
+                    94-255 MB per project and step 10 does not read them, so a
+                    corpus run that only wants the Parquet dataset should skip
+                    them. NOTE: the HTML views are the fallback output when
+                    python3+duckdb is missing, so --skip-html without duckdb
+                    leaves the run with no final artifact.
+  --gc MODE         how to pack the generated cregit repo after tokenizing
+                    (default: plain)
+                      none        do not pack at all. Fastest, but every later
+                                  step then reads loose objects.
+                      plain       git gc --prune=now
+                      aggressive  git gc --prune=now --aggressive. Measured on
+                                  Linux (22 M loose objects) this failed with
+                                  "failed to run repack" after hours of work.
+                    A failed pack never aborts the run: the Parquet dataset is
+                    the product, and packing only makes later steps faster.
+  --memory-limit SIZE
+                    forward --memory-limit to step 10 (the DuckDB generator).
+                    Omit to accept that script's own default of 8GB. Takes an
+                    absolute size such as 3GB, never a percentage.
+                    Measured: the limit bounds DuckDB's buffers, not the
+                    process, which settles at about 1.4x the limit. A corpus run
+                    with N concurrent projects must therefore budget
+                    1.4 x N x SIZE of RAM. Two projects at 8GB need 22 GB and
+                    will exhaust a 30 GB box that already runs other software.
+  --duckdb-threads N
+                    forward --duckdb-threads to step 10. Each sorting thread
+                    holds its own buffers, so fewer threads lower the peak.
+                    Omit to accept the generator's default.
+
 Tokenizer:
   --mode MODE   tokenizer walk mode (default: pipeline)
                   serial          single-threaded reference walker
@@ -36,8 +67,12 @@ Tokenizer:
                                   for repos too large to tokenize in one process;
                                   delegates to blobExec/shard_build.sh
   --shards N    shard count for --mode sharded (default: 4)
-  --jobs N      concurrent blame/HTML processes
-                (default: CREGIT_JOBS, otherwise min(4, available CPUs))
+  --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
+                otherwise min(4, available CPUs)). Blame is the pipeline's
+                bottleneck: measured on Linux the serial step managed 8 files
+                per minute against 64,536 files, which is 5.6 days. Each
+                file is independent, so the output does not depend on N. The
+                step is resumable, so N can change between runs.
   FROM_STEP     resume from this step number (default: 1). A full run (step 1)
                 starts clean; resuming keeps existing work.
 
@@ -53,6 +88,44 @@ die() {
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# pack_cregit_repo: pack the generated repo, honouring --gc, and never abort.
+#
+# The repack is an optimisation, not a product. The keeper is the Parquet
+# dataset. So a repack failure must not end the run.
+#
+# Measured on Linux, 2026-09-14: `gc --prune=now --aggressive` on 22,258,632
+# loose objects printed "cannot be read" for four objects and then "failed to
+# run repack", exit 128. All four objects read fine with `git cat-file -t`
+# afterwards, so repack exhausted a resource rather than finding damage.
+# Because `set -euo pipefail` is on and the old call was unguarded, that exit
+# aborted the script and fired the EXIT trap, which deletes $WORK. One optional
+# optimisation was able to destroy 15.2 h of finished tokenizing.
+#
+# Default is `plain`: it packs the loose objects, which every later step reads
+# back, without the --window=250 --depth=50 delta search that failed.
+pack_cregit_repo() {
+    case "$GC_MODE" in
+        none)
+            log "gc skipped (--gc none)"
+            return 0
+            ;;
+        plain)      gc_args="--prune=now" ;;
+        aggressive) gc_args="--prune=now --aggressive" ;;
+        *) die "--gc takes none, plain or aggressive (got '$GC_MODE')" ;;
+    esac
+
+    git --git-dir="$REPO_PATH_CREGIT_BARE" reflog expire --expire=now --all \
+        || log "warning: reflog expire failed; continuing"
+    # shellcheck disable=SC2086
+    if git --git-dir="$REPO_PATH_CREGIT_BARE" gc $gc_args; then
+        log "gc ($GC_MODE) done"
+    else
+        log "warning: gc ($GC_MODE) failed; the object store is still readable"
+        log "warning: later steps run unpacked, so they read more slowly"
+    fi
+    return 0
 }
 
 MODE="pipeline"
@@ -71,6 +144,13 @@ REPO_NAME=""
 REPO_COMMIT_URL=""
 MASK='\.[ch]$'
 WORK="../cregit-files"
+SKIP_HTML=0
+GC_MODE="plain"
+# Empty means "do not pass the flag", so generate_dataset.py keeps its own
+# default. Step 10 settles at about 1.4x the limit, so a corpus run with N
+# concurrent projects must budget 1.4 x N x limit of RAM.
+MEMORY_LIMIT=""
+DUCKDB_THREADS=""
 
 # need_val <flag> <value...>: refuse a value-taking flag with no value.
 need_val() {
@@ -85,6 +165,10 @@ while [ $# -gt 0 ]; do
         --commit-url) need_val "$@"; REPO_COMMIT_URL="$2"; shift 2 ;;
         --mask)       need_val "$@"; MASK="$2"; shift 2 ;;
         --work)       need_val "$@"; WORK="$2"; shift 2 ;;
+        --skip-html)  SKIP_HTML=1; shift ;;
+        --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
+        --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
+        --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
         --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
@@ -93,6 +177,35 @@ while [ $# -gt 0 ]; do
         *) FROM_STEP="$1"; shift ;;
     esac
 done
+
+# Reject a bad --gc value now, not after tokenizing. pack_cregit_repo runs at the
+# end of step 2, so a typo caught there costs the whole tokenize first.
+case "$GC_MODE" in
+    none|plain|aggressive) ;;
+    *) echo "invalid --gc: '$GC_MODE' (want none, plain or aggressive)" >&2; exit 2 ;;
+esac
+
+# Step 10 is the LAST step, so a typo here costs the whole run. Reject it now.
+# The rule mirrors parse_memory_limit() in generate_dataset.py: an absolute
+# size, never a percentage, because a percentage measures total RAM and only the
+# free part is usable.
+if [ -n "$MEMORY_LIMIT" ]; then
+    case "$MEMORY_LIMIT" in
+        *%) echo "invalid --memory-limit: '$MEMORY_LIMIT' takes an absolute size, not a percentage (example: 3GB)" >&2; exit 2 ;;
+    esac
+    if ! printf '%s' "$MEMORY_LIMIT" \
+        | grep -Eqi '^[0-9]+(\.[0-9]+)?[[:space:]]?(B|K|M|G|T|KB|MB|GB|TB|KIB|MIB|GIB|TIB)$'; then
+        echo "invalid --memory-limit: cannot read '$MEMORY_LIMIT' as a memory size (example: 3GB)" >&2
+        exit 2
+    fi
+fi
+
+if [ -n "$DUCKDB_THREADS" ]; then
+    case "$DUCKDB_THREADS" in
+        ''|*[!0-9]*) echo "invalid --duckdb-threads: '$DUCKDB_THREADS' (want a positive integer)" >&2; exit 2 ;;
+        0) echo "invalid --duckdb-threads: 0 (want a positive integer)" >&2; exit 2 ;;
+    esac
+fi
 
 # The target repository is mandatory (only --build-only runs without one).
 if [ "$BUILD_ONLY" = 0 ]; then
@@ -254,7 +367,10 @@ if [ "$FROM_STEP" = "1" ] && [ -d "$WORK" ] && [ -n "$WORK" ] && [ "$WORK" != "/
 fi
 
 LOG_FILE="${WORK}/pipeline.log"
-mkdir -p $WORK/memo $WORK/blame $WORK/html
+mkdir -p $WORK/memo $WORK/blame
+# memo/ is mandatory: tokenizeByBlobId/tokenBySha.pl dies without BFG_MEMO_DIR.
+# html/ is only created when step 9 will actually write into it.
+[ "$SKIP_HTML" = 1 ] || mkdir -p $WORK/html
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo ""
@@ -319,8 +435,7 @@ else
 fi
 
 [ -d "$REPO_PATH_CREGIT_BARE" ] || die "tokenize did not produce $REPO_PATH_CREGIT_BARE"
-git --git-dir="$REPO_PATH_CREGIT_BARE" reflog expire --expire=now --all
-git --git-dir="$REPO_PATH_CREGIT_BARE" gc --prune=now --aggressive
+pack_cregit_repo
 fi
 end_step
 
@@ -374,7 +489,7 @@ end_step
 step "blame"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_CREGIT" ] || die "step 6 did not produce $REPO_PATH_CREGIT"
-perl $CREGIT/blameRepo/blameRepoFiles.pl --verbose \
+perl $CREGIT/blameRepo/blameRepoFiles.pl \
   --jobs="$JOBS" \
   --formatBlame=$CREGIT/blameRepo/formatBlame.pl \
   $REPO_PATH_CREGIT $WORK/blame "$MASK"
@@ -394,15 +509,21 @@ end_step
 
 # ---------------------------------------------------------------------------
 # Step 9 — generate HTML views
+#          Skippable: nothing downstream reads $WORK/html. Step 10 builds the
+#          Parquet dataset from the blame dir and the DBs only.
 # ---------------------------------------------------------------------------
 step "generate HTML views"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
+if [ "$SKIP_HTML" = 1 ]; then
+log "skip: --skip-html given, no HTML views written (step 10 does not read them)"
+else
 [ -f "$DB_PATH_CREGIT" ] || die "step 8 did not complete"
 perl $CREGIT/prettyPrint/prettyPrintFiles.pl --verbose \
   --jobs="$JOBS" \
   $DB_PATH_CREGIT $DB_PATH_PERSONS \
   $REPO_PATH_ORIGINAL $WORK/blame $WORK/html \
   $REPO_COMMIT_URL "$MASK"
+fi
 fi
 end_step
 
@@ -418,6 +539,17 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 DATASET_SCRIPT="$CREGIT/generate_dataset/generate_dataset.py"
 [ -f "$DATASET_SCRIPT" ] || die "dataset generator not found: $DATASET_SCRIPT"
 if [ -n "$PYTHON" ] && "$PYTHON" -c 'import duckdb' 2>/dev/null; then
+# Collect the optional flags, so an empty value passes nothing and the generator
+# keeps its own default. An array, not "$@": overwriting the positional
+# parameters here would be a side effect on the whole script.
+DATASET_OPTS=()
+if [ -n "$MEMORY_LIMIT" ]; then
+    DATASET_OPTS+=(--memory-limit "$MEMORY_LIMIT")
+fi
+if [ -n "$DUCKDB_THREADS" ]; then
+    DATASET_OPTS+=(--duckdb-threads "$DUCKDB_THREADS")
+fi
+# ${a[@]+"${a[@]}"} keeps an empty array safe under `set -u`.
 "$PYTHON" "$DATASET_SCRIPT" \
   --blame-dir  "$WORK/blame" \
   --source-dir "$REPO_PATH_ORIGINAL" \
@@ -425,8 +557,11 @@ if [ -n "$PYTHON" ] && "$PYTHON" -c 'import duckdb' 2>/dev/null; then
   --persons-db "$DB_PATH_PERSONS" \
   --output     "$DATASET_PATH" \
   --repo-name  "$REPO_NAME" \
+  ${DATASET_OPTS[@]+"${DATASET_OPTS[@]}"} \
   --verbose
 log "dataset written: $DATASET_PATH"
+elif [ "$SKIP_HTML" = 1 ]; then
+die "python3 with the duckdb module is unavailable (provided by devenv shell) and --skip-html suppressed the HTML views — this run produced no final artifact"
 else
 log "skip: python3 with the duckdb module is unavailable (provided by devenv shell); HTML views in $WORK/html are the final output"
 fi
