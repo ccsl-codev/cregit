@@ -648,7 +648,7 @@ final class Walker(
       )
       val res = outcome match {
         case BlobExec.Outcome.Skip =>
-          ensureOriginalBlobAvailable(task.origId, bytes, workerInserter)
+          ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
           BlobResult.Resolved(task.origId)
         case BlobExec.Outcome.Replace(newId) =>
           BlobResult.Resolved(newId)
@@ -788,7 +788,7 @@ final class Walker(
           // For Replace outcomes the worker has already inserted the new
           // blob. For Abort we do nothing (caller short-circuits).
           outcome match {
-            case BlobExec.Outcome.Skip => ensureOriginalBlobAvailable(task.origId, bytes, workerInserter)
+            case BlobExec.Outcome.Skip => ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
             case _                     => ()
           }
           workerInserter.flush()
@@ -817,6 +817,35 @@ final class Walker(
     val r = src.newObjectReader()
     try r.open(id, OBJ_BLOB).getBytes
     finally r.close()
+  }
+
+  /** Copy one original blob from src into dst by streaming it. Returns (id, size).
+    *
+    * Replaces readBlob on the pass-through path. `ObjectLoader.getBytes` throws
+    * LargeObjectException above JGit's stream threshold, and a blob that does not
+    * match the mask is copied verbatim, so its size is whatever the project
+    * committed rather than the size of a source file. redis/redis failed this way
+    * after 1,684s of work:
+    *
+    *   org.eclipse.jgit.errors.LargeObjectException: 12e1ac54... exceeds size limit
+    *     at cregit.blobexec.Walker.ensureOriginalBlobAvailable(Walker.scala:912)
+    *
+    * Streaming also removes the memory spike. Raising the threshold instead would
+    * still hold the whole blob, and three concurrent projects on a 30 GiB box
+    * cannot each afford a large fixture.
+    *
+    * The reader stays open for the whole copy: closing it before the stream is
+    * consumed would invalidate the stream.
+    */
+  private def streamBlobInto(id: ObjectId, inserter: ObjectInserter): (ObjectId, Long) = {
+    val r = src.newObjectReader()
+    try {
+      val loader = r.open(id, OBJ_BLOB)
+      val size   = loader.getSize
+      val in     = loader.openStream()
+      try (inserter.insert(OBJ_BLOB, size, in), size)
+      finally in.close()
+    } finally r.close()
   }
 
   // -- assembly ------------------------------------------------------------
@@ -866,18 +895,32 @@ final class Walker(
       ResolvedEntry(name, mode, newId, copyBytes = false)
   }
 
+  /** Make sure dst holds the original blob, inserting it at most once.
+    *
+    * `insertBlob` performs the insertion and returns (inserted id, size). It is
+    * a function rather than an `Array[Byte]` so each caller chooses how to supply
+    * the bytes, and it is only invoked when the blob really must be written:
+    *
+    *   tokenizer paths  already hold the bytes, because they just read them to
+    *                    tokenize a masked source file. They insert from memory.
+    *   pass-through     an unmasked blob of unknown size. It streams, because
+    *                    getBytes throws LargeObjectException above JGit's
+    *                    threshold. See streamBlobInto.
+    *
+    * All the deduplication, striped locking and accounting stays here, so the two
+    * kinds of caller cannot drift apart.
+    */
   private def ensureOriginalBlobAvailable(
       id: ObjectId,
-      bytes: => Array[Byte],
+      insertBlob: ObjectInserter => (ObjectId, Long),
       inserter: ObjectInserter
   ): Unit = {
     originalBlobCopyRequests.increment()
 
     if (!deduplicateOriginalBlobs) {
-      val content = bytes
-      inserter.insert(OBJ_BLOB, content)
+      val (_, size) = insertBlob(inserter)
       originalBlobCopies.increment()
-      originalBlobBytesCopied.add(content.length.toLong)
+      originalBlobBytesCopied.add(size)
       return
     }
 
@@ -909,14 +952,13 @@ final class Walker(
             recordOriginalBlobAlreadyPresent(value)
             value
           case None =>
-            val content  = bytes
-            val inserted = inserter.insert(OBJ_BLOB, content)
+            val (inserted, copied) = insertBlob(inserter)
             if (inserted != id)
               throw new IllegalStateException(
                 s"original blob ${id.name} produced unexpected id ${inserted.name} while copying to dst")
             originalBlobCopies.increment()
-            originalBlobBytesCopied.add(content.length.toLong)
-            content.length.toLong
+            originalBlobBytesCopied.add(copied)
+            copied
         }
         originalBlobCache.set(cacheSlot, OriginalBlobCacheEntry(id.copy(), size))
       }
@@ -942,8 +984,16 @@ final class Walker(
   }
 
   private def copyBlobIfMissing(id: ObjectId, inserter: ObjectInserter): Unit = {
-    ensureOriginalBlobAvailable(id, readBlob(id), inserter)
+    // Streams: this blob did not match the mask, so its size is unbounded.
+    ensureOriginalBlobAvailable(id, ins => streamBlobInto(id, ins), inserter)
   }
+
+  /** Insert bytes a caller already holds. Used by the tokenizer paths, which read
+    * the blob to tokenize it and so pay no second read. */
+  private def insertHeldBytes(content: Array[Byte])(
+      inserter: ObjectInserter
+  ): (ObjectId, Long) =
+    (inserter.insert(OBJ_BLOB, content), content.length.toLong)
 
   // -- commit construction -------------------------------------------------
 

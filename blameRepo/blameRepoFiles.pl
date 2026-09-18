@@ -71,6 +71,7 @@ my $count = 0;
 my $alreadyDone = 0;
 my $errorCount = 0;
 my %running;
+my @todo;
 
 foreach (@trackedFiles) {
 #    next unless /^kernel/;
@@ -80,10 +81,10 @@ foreach (@trackedFiles) {
         next unless /$fileRegExpr/;
     }
 
-            
-    
+
+
     my $name = $_;
-    
+
     if ($verbose) {
         print STDERR ("matched file: [$name]\n");
     }
@@ -99,9 +100,14 @@ foreach (@trackedFiles) {
         $alreadyDone ++;
         next;
     }
+    push @todo, $name;
+}
+
+make_output_dirs($outputDir, $blameExtension, \@todo);
+
+foreach my $name (@todo) {
     $count++;
     print STDERR ("$count: $name\n");
-
 
     start_command($name, $blameCommand, "--blameExtension=$blameExtension", $repoDir, $name, $outputDir);
 }
@@ -110,6 +116,18 @@ reap_command() while %running;
 
 print "Newly processed [$count] Already done [$alreadyDone] files Error [$errorCount]\n";
 exit($errorCount == 0 ? 0 : 1);
+
+sub make_output_dirs {
+    my ($outputDir, $blameExtension, $todo) = @_;
+    my %seen;
+    foreach my $name (@$todo) {
+        my $dir = dirname("$outputDir/$name$blameExtension");
+        next if $seen{$dir}++;
+        next if -d $dir;
+        make_path($dir);
+        die "unable to create directory [$dir]" unless -d $dir;
+    }
+}
 
 sub Usage {
     my ($m) = @_;
