@@ -5,7 +5,7 @@ import org.eclipse.jgit.internal.storage.file.FileRepository
 import org.eclipse.jgit.lib.Constants.{OBJ_BLOB, OBJ_TAG}
 import org.eclipse.jgit.lib._
 import org.eclipse.jgit.revwalk.{RevTag, RevWalk}
-import org.eclipse.jgit.storage.file.FileRepositoryBuilder
+import org.eclipse.jgit.storage.file.{FileRepositoryBuilder, WindowCacheConfig}
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -634,6 +634,78 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- shared dir helpers ----------------------------------------------------
+
+
+  // -- large pass-through blob (regression) ----------------------------------
+  //
+  // redis/redis failed after 1,684s of real work with:
+  //   org.eclipse.jgit.errors.LargeObjectException: 12e1ac54... exceeds size limit
+  //     at cregit.blobexec.Walker.ensureOriginalBlobAvailable
+  //
+  // A blob that does not match the mask is copied verbatim, so its size is
+  // whatever the project committed, not the size of a source file.
+  // ObjectLoader.getBytes refuses anything above JGit's stream threshold, so the
+  // copy path must stream instead of materialising.
+  //
+  // The threshold is lowered here so a small blob reproduces it in milliseconds
+  // rather than needing a 50 MB fixture.
+  private def withStreamFileThreshold[T](bytes: Int)(body: => T): T = {
+    val lowered = new WindowCacheConfig
+    lowered.setStreamFileThreshold(bytes)
+    lowered.install()
+    try body
+    finally new WindowCacheConfig().install()   // back to jgit's defaults
+  }
+
+  /** Read a blob without getBytes, which would itself throw under a lowered
+    * threshold and fail the test for the wrong reason. */
+  private def streamBlob(repo: Repository, id: ObjectId): Array[Byte] = {
+    val r = repo.newObjectReader()
+    try {
+      val in = r.open(id, OBJ_BLOB).openStream()
+      try in.readAllBytes() finally in.close()
+    } finally r.close()
+  }
+
+  test("an unmasked blob above jgit's stream threshold is copied, not refused") {
+    val dir = freshWorkDir("large-passthrough")
+    val git = initSrc(dir.resolve("src"))
+    // 64 KiB of non-random bytes, well above the 4 KiB threshold set below.
+    val big = ("payload-" * 8192)
+    try {
+      writeAndCommit(git, Map("keep.c" -> "int main(){}\n", "fixture.bin" -> big), "add both")
+    } finally git.close()
+
+    val srcRepo = openBare(dir.resolve("src/.git"))
+    val stats = try {
+      withStreamFileThreshold(4 * 1024) {
+        runWalker(
+          srcRepo,
+          dstPath = dir.resolve("dst.git"),
+          dbPath  = dir.resolve("db.sqlite"),
+          command = shellScript(dir, "cat"),
+          mask    = "\\.c$"          // fixture.bin is NOT masked: verbatim copy
+        )
+      }
+    } finally srcRepo.close()
+
+    stats.aborted shouldBe false
+
+    val dst = openBare(dir.resolve("dst.git"))
+    try {
+      fileAtHead(dst, "master", "keep.c") shouldBe Some("int main(){}\n")
+      val head = dst.exactRef("refs/heads/master")
+      val rw = new RevWalk(dst)
+      val id = try {
+        val tw = org.eclipse.jgit.treewalk.TreeWalk.forPath(
+          dst, "fixture.bin", rw.parseCommit(head.getObjectId).getTree)
+        try tw.getObjectId(0) finally tw.close()
+      } finally rw.close()
+
+      id should not be ObjectId.zeroId
+      new String(streamBlob(dst, id), UTF_8) shouldBe big
+    } finally dst.close()
+  }
 
   private def deleteRecursive(p: Path): Unit = {
     if (Files.isDirectory(p)) {

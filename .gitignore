@@ -4,3 +4,5 @@ jars
 *build
 .devenv
 .direnv
+__pycache__/
+*.pyc
