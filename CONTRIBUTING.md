@@ -60,6 +60,21 @@ Example:
 
 - `refactor!: change blame artifact format`
 
+### Do
+
+- Use an imperative, concise description: `fix: handle empty path in clone`
+- Prefer a scope when it clarifies the change
+- Keep the subject line under ~72 characters
+- Reference issues in the body or footer: `Fixes #123`
+
+### Do not
+
+- Do not use vague subjects: `update`, `fix stuff`, `WIP`
+- Do not mix unrelated changes in one commit when they can be split cleanly
+- Do not put implementation noise in the subject (file lists without a summary)
+- Do not skip the type prefix (`added tests` -> `test: cover empty path`)
+- Do not use past tense in the subject (`fixed bug` -> `fix: ...`)
+
 ## Pull requests
 
 Please follow the repository _pull request template_ when opening a PR.
