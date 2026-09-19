@@ -66,9 +66,8 @@ object ChildRunner {
 
   private val StdoutBufferBytes: Int = 1024
 
-  /** Longest one [[ChildRunner.run]] can take; see [[Walker.stallFloorFor]]. */
   private[blobexec] def maxLifetimeSeconds(budgetSeconds: Int): Int =
-    math.max(1, budgetSeconds) + DrainGraceSeconds + KillSettleSeconds
+    Saturating.sum(math.max(1, budgetSeconds), DrainGraceSeconds + KillSettleSeconds)
 
   /** Kill the child and every process beneath it, and report how many were
     * signalled. Signalling the direct child alone leaves grandchildren holding

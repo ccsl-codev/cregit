@@ -1435,28 +1435,19 @@ object Walker {
     * timed out but the walk finished) so the runner can tell them apart. */
   private[blobexec] val StalledExitStatus = 5
 
-  /** Headroom above one blob's maximum lifetime. The watchdog ticks every 30s at
-    * most, and the progress stamp lands only after the killed child is reaped. */
-  private val StallFloorMarginSeconds = 60
+  private val WatchdogTickMarginSeconds = 60
 
-  /** How much longer than the blob budget a defaulted window runs. */
   private val StallTimeoutMultiple = 3
 
-  /** Smallest stall window that cannot fire on healthy work: the watchdog counts
-    * completed work, and a commit whose last blob is slow completes nothing
-    * until that blob's child is killed and reaped. */
   private[blobexec] def stallFloorFor(blobTimeoutSeconds: Int): Int =
-    ChildRunner.maxLifetimeSeconds(blobTimeoutSeconds) + StallFloorMarginSeconds
+    Saturating.sum(ChildRunner.maxLifetimeSeconds(blobTimeoutSeconds), WatchdogTickMarginSeconds)
 
-  /** The window that goes with a blob budget when the operator sets neither. */
   private[blobexec] def stallTimeoutFor(blobTimeoutSeconds: Int): Int =
     math.max(
-      math.max(1, blobTimeoutSeconds) * StallTimeoutMultiple,
+      Saturating.product(math.max(1, blobTimeoutSeconds), StallTimeoutMultiple),
       stallFloorFor(blobTimeoutSeconds)
     )
 
-  /** Derived, so the two defaults cannot drift: the blob budget is the only
-    * number an operator has to think about. */
   private[blobexec] val DefaultStallTimeoutSeconds: Int =
     stallTimeoutFor(BlobExec.DefaultTimeoutSeconds)
 

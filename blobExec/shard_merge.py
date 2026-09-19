@@ -52,6 +52,14 @@ import sys
 import time
 
 
+# blobExec's "incomplete but resumable" exit statuses: 4 = a blob's tokenizer was
+# killed on its budget, 5 = the stall watchdog fired. They are propagated rather
+# than turned into a traceback (exit 1), because run_pipeline_process.sh uses them
+# to keep the work directory for a step-2 resume instead of deleting it.
+BLOBEXEC_TIMEOUT_RC = 4
+BLOBEXEC_STALL_RC = 5
+
+
 def run(cmd, **kw):
     return subprocess.run(cmd, check=True, **kw)
 
@@ -138,12 +146,18 @@ def parse_stats(stdout):
     )
 
 
-def refold(java, jar, src, final_git, final_db, command, mask, tok_cmd, memo):
+def refold(java, jar, src, final_git, final_db, command, mask, tok_cmd, memo,
+           blob_timeout=None, stall_timeout=None):
     env = dict(os.environ)
     env["BFG_TOKENIZE_CMD"] = tok_cmd
     env["BFG_MEMO_DIR"] = memo
     os.makedirs(memo, exist_ok=True)
-    argv = [java, "-jar", jar, src, final_git, final_db, command, mask]
+    flags = []
+    if blob_timeout:
+        flags.append(f"--blob-timeout={blob_timeout}")
+    if stall_timeout:
+        flags.append(f"--stall-timeout={stall_timeout}")
+    argv = [java, "-jar", jar] + flags + [src, final_git, final_db, command, mask]
     log("re-fold: " + " ".join(argv))
     t0 = time.time()
     r = subprocess.run(argv, env=env, capture_output=True, text=True)
@@ -151,6 +165,11 @@ def refold(java, jar, src, final_git, final_db, command, mask, tok_cmd, memo):
     sys.stdout.write(r.stdout)
     if r.stderr:
         sys.stderr.write(r.stderr)
+    if r.returncode in (BLOBEXEC_TIMEOUT_RC, BLOBEXEC_STALL_RC):
+        # Not a crash: the re-fold stopped on work that a step-2 resume retries.
+        # Exit with the same status so shard_build.sh and the runner can tell.
+        log(f"re-fold exited {r.returncode} (incomplete but resumable) after {dt:.1f}s")
+        sys.exit(r.returncode)
     r.check_returncode()
     stats = parse_stats(r.stdout)
     log(f"re-fold done in {dt:.1f}s: {stats}")
@@ -190,6 +209,10 @@ def main():
     ap.add_argument("--java", default=shutil.which("java") or "java")
     ap.add_argument("--warm-db", default=None, help="frozen prior blobmap.db to seed (incremental)")
     ap.add_argument("--warm-git", default=None, help="frozen prior dst.git to union objects from")
+    ap.add_argument("--blob-timeout", default=None, metavar="SECONDS",
+                    help="blobExec --blob-timeout for the re-fold (default: blobExec's own)")
+    ap.add_argument("--stall-timeout", default=None, metavar="SECONDS",
+                    help="blobExec --stall-timeout for the re-fold (default: blobExec's own)")
     args = ap.parse_args()
 
     shard_dirs = [os.path.abspath(d) for d in args.shards]
@@ -223,6 +246,7 @@ def main():
         args.java, os.path.abspath(args.jar), os.path.abspath(args.src),
         final_git, final_db, os.path.abspath(args.command), args.mask,
         args.tok_cmd, os.path.abspath(args.memo),
+        blob_timeout=args.blob_timeout, stall_timeout=args.stall_timeout,
     )
     finalize_repo(final_git)
 

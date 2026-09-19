@@ -30,6 +30,17 @@ Target repository:
                     resume instead, keeping the memo, the bare repos and the
                     blob map — that is how a tokenize timeout or stall is
                     recovered without redoing the work.
+  --blob-timeout N  wall-clock budget in seconds for one blob's tokenizer
+                    (blobExec default: 600). A child that exceeds it is killed,
+                    that blob is left untokenized, step 2 stops with exit 4 and
+                    a step-2 resume retries exactly those blobs. Also settable
+                    as CREGIT_BLOB_TIMEOUT in the environment, which is how to
+                    reach it through ctp.py.
+  --stall-timeout N watchdog window in seconds (blobExec default: 1800). If no
+                    blob, tree, commit or blob copy completes anywhere in this
+                    window the run is killed with exit 5. Must be larger than
+                    --blob-timeout; blobExec refuses an explicit value that is
+                    not, and raises a defaulted one. Also CREGIT_STALL_TIMEOUT.
   --force-clean     allow the FROM_STEP=1 wipe even when $WORK holds a
                     TOKENIZE-TIMEOUTS or TOKENIZE-STALLED marker. Without this
                     the runner refuses, because those markers mean the work is
@@ -74,20 +85,6 @@ Tokenizer:
                                   for repos too large to tokenize in one process;
                                   delegates to blobExec/shard_build.sh
   --shards N    shard count for --mode sharded (default: 4)
-  --blob-timeout SECONDS
-                wall-clock budget for tokenizing one blob (default: blobExec's
-                own 600). A tokenizer that exceeds it is killed and the run
-                stops with exit 4, leaving that blob to be retried by a re-run
-                from step 2. Raise this when a blob keeps timing out because it
-                is genuinely large; the stall window below is raised with it
-                automatically. Exit 4 and exit 5 keep --work rather than deleting
-                it, because the re-run resumes from the memo there.
-  --stall-timeout SECONDS
-                window with no completed work after which the run is declared
-                stuck and killed (default: blobExec's own 1800, or one blob
-                lifetime, whichever is larger). It must exceed --blob-timeout,
-                because a commit whose last blob is slow completes nothing until
-                that blob is killed.
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck. Each file is independent, so the output does not
@@ -106,51 +103,9 @@ die() {
     exit 1
 }
 
-# Stop, but keep $WORK, and exit with the status the failing tool reported.
-# For a retryable failure the work directory IS the recovery: blobExec's memo,
-# the partly tokenized repo and the marker file all live there, and re-running
-# the same command is the documented fix. `die` would instead leave the cleanup
-# trap to delete every commit the run had already folded.
-die_retryable() {
-    KEEP_WORK=1
+die_status() {
     log "ERROR: $2"
     exit "$1"
-}
-
-# tokenize_gate <exit status> <what ran>: turn blobExec's resumable statuses into
-# a marker file, a recovery message and its own exit status. 4 = a blob's
-# tokenizer was killed on its budget; 5 = the stall watchdog fired. Both keep
-# $WORK, because the memo in it is the recovery. Any other non-zero is an
-# ordinary failure. Shared by the serial and sharded branches, which have to give
-# the same answer.
-tokenize_gate() {
-    local rc=$1 what=$2 marker why knob
-    if [ "$rc" -eq 0 ]; then return 0; fi
-    case "$rc" in
-        4) marker="TOKENIZE-TIMEOUTS"
-           why="left blobs untokenized, so those files would carry raw source instead of tokens"
-           knob="If they keep timing out the tokenizer is too slow for them: raise the budget with --blob-timeout N (e.g. --blob-timeout 1800)." ;;
-        5) marker="TOKENIZE-STALLED"
-           why="stopped making progress and was killed by blobExec's watchdog"
-           knob="The STALLED line in this step's log names the blobs that were in flight; if one of them is pathological, raise --blob-timeout N (which raises the stall window with it) or exclude it via --mask." ;;
-        *) die "$what failed (blobExec exit $rc)" ;;
-    esac
-
-    date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/${marker}"
-    echo "$what exited $rc: it $why. Nothing was recorded for the containing" \
-         "commit, so resuming at step 2 retries exactly that work. Resuming at" \
-         "step 1 deletes this directory instead; while this marker exists the" \
-         "runner refuses to do that without --force-clean." >> "${WORK}/${marker}"
-
-    die_retryable "$rc" "$what $why (exit $rc). Refusing to continue.
-     Marker written to ${WORK}/${marker}, and $WORK is kept.
-     Recovery — resume at step 2. Do NOT re-run from step 1: that deletes $WORK,
-     including the memo and the tokenizing already done, and redoes all of it to
-     retry a handful of blobs. Step 2 retries exactly what failed and needs no
-     database surgery:
-       runner:  $0 --repo-url <url> --work $WORK [same flags] 2
-       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2
-     $knob"
 }
 
 log() {
@@ -215,10 +170,13 @@ SKIP_HTML=0
 GC_MODE="plain"
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
-BLOB_TIMEOUT=""
-STALL_TIMEOUT=""
-KEEP_WORK=0
 FORCE_CLEAN=0
+# Empty means "do not pass the flag", so blobExec keeps its own defaults (600s
+# per blob, 1800s stall window). The CREGIT_* environment fallbacks exist so the
+# values are reachable through ctp.py, which has no passthrough of its own but
+# does hand its environment to this script.
+BLOB_TIMEOUT="${CREGIT_BLOB_TIMEOUT:-}"
+STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
 
 # Markers meaning "the work in $WORK is incomplete but recoverable, and a
 # FROM_STEP=1 wipe would throw away days of tokenizing to redo it". Written by
@@ -238,6 +196,63 @@ keep_markers_present() {
     return 1
 }
 
+TOKENIZE_TIMEOUT_STATUS=4
+TOKENIZE_STALLED_STATUS=5
+
+resume_instructions() {
+    printf '%s' "Recovery — resume at step 2. Do NOT re-run from step 1: that deletes
+     $WORK, including the memo and the tokenizing already done, and redoes all of
+     it to retry a handful of blobs. Step 2 retries exactly what failed and needs
+     no database surgery:
+       runner:  $0 --repo-url <url> --work $WORK [same flags] 2
+       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2"
+}
+
+timeout_knob() {
+    printf '%s' "Slowness is --blob-timeout (runner: --blob-timeout N, or
+     CREGIT_BLOB_TIMEOUT=N in the environment, which reaches this script through
+     ctp.py too). A child that reported status 137 was SIGKILLed, which on this
+     box usually means the kernel's OOM killer rather than slowness — more time
+     will not help it; give the run more memory or exclude that blob via --mask."
+}
+
+write_resume_marker() {
+    local marker=$1 stage=$2 status=$3 detail=$4
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/${marker}"
+    echo "$stage exited $status: $detail Resuming at step 2 retries exactly that" \
+         "work; resuming at step 1 deletes this directory instead, and while this" \
+         "marker exists the runner refuses to do that without --force-clean." \
+         >> "${WORK}/${marker}"
+}
+
+tokenize_gate() {
+    local status=$1 stage=$2 marker detail summary
+    [ "$status" -eq 0 ] && return 0
+    case "$status" in
+        "$TOKENIZE_TIMEOUT_STATUS")
+            marker="TOKENIZE-TIMEOUTS"
+            detail="at least one blob timed out; see the blobsTimedOut count and the
+     'will retry on the next run' lines in this step's log. Nothing was recorded
+     for the containing commit."
+            summary="$stage left blobs untokenized (exit $status). Refusing to continue: the
+     dataset would carry raw source in place of tokens." ;;
+        "$TOKENIZE_STALLED_STATUS")
+            marker="TOKENIZE-STALLED"
+            detail="the stall watchdog fired. The STALLED line in this step's log names
+     the work that was in flight."
+            summary="$stage stalled and was killed by blobExec's watchdog (exit $status). The
+     memo in $WORK is durable, so resuming picks up where it stopped — but only
+     at step 2." ;;
+        *) die "$stage failed (exit $status)" ;;
+    esac
+
+    write_resume_marker "$marker" "$stage" "$status" "$detail"
+    die_status "$status" "$summary
+     Marker written to ${WORK}/${marker}.
+     $(resume_instructions)
+     If the same blobs keep failing: $(timeout_knob)"
+}
+
 # need_val <flag> <value...>: refuse a value-taking flag with no value.
 need_val() {
     [ $# -ge 2 ] || { echo "missing value for $1" >&2; usage; exit 2; }
@@ -253,13 +268,13 @@ while [ $# -gt 0 ]; do
         --work)       need_val "$@"; WORK="$2"; shift 2 ;;
         --skip-html)  SKIP_HTML=1; shift ;;
         --force-clean) FORCE_CLEAN=1; shift ;;
+        --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
+        --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
-        --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
-        --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         ''|*[!0-9]*) echo "unknown argument: $1" >&2; usage; exit 2 ;;
@@ -272,15 +287,6 @@ case "$GC_MODE" in
     none|plain|aggressive) ;;
     *) echo "invalid --gc: '$GC_MODE' (want none, plain or aggressive)" >&2; exit 2 ;;
 esac
-
-# Validate early: blobExec rejects these too, but step 2 can be an hour of
-# cloning away, and a typo must not cost that hour.
-for tmo in "--blob-timeout:$BLOB_TIMEOUT" "--stall-timeout:$STALL_TIMEOUT"; do
-    case "${tmo#*:}" in
-        '') ;;
-        0|*[!0-9]*) echo "invalid ${tmo%%:*}: '${tmo#*:}' (want a positive whole number of seconds)" >&2; exit 2 ;;
-    esac
-done
 
 # Validate early: the dataset generator is the last step. Mirrors
 # parse_memory_limit() in generate_dataset.py, which refuses a percentage
@@ -302,6 +308,18 @@ if [ -n "$DUCKDB_THREADS" ]; then
         0) echo "invalid --duckdb-threads: 0 (want a positive integer)" >&2; exit 2 ;;
     esac
 fi
+
+# Validate early: step 2 runs for hours on a large repository. blobExec enforces
+# the relationship between the two values (the stall window must exceed the
+# per-blob budget); this only checks that both are positive integers.
+for _tv in "BLOB_TIMEOUT:$BLOB_TIMEOUT:--blob-timeout" "STALL_TIMEOUT:$STALL_TIMEOUT:--stall-timeout"; do
+    _val=${_tv#*:}; _flag=${_val#*:}; _val=${_val%%:*}
+    [ -n "$_val" ] || continue
+    case "$_val" in
+        ''|*[!0-9]*) echo "invalid $_flag: '$_val' (want a positive whole number of seconds)" >&2; exit 2 ;;
+        0) echo "invalid $_flag: 0 (want a positive whole number of seconds)" >&2; exit 2 ;;
+    esac
+done
 
 # The target repository is mandatory (only --build-only runs without one).
 if [ "$BUILD_ONLY" = 0 ]; then
@@ -466,14 +484,7 @@ PYTHON=$(command -v python3 || true)  # only needed by step 10 (dataset)
 
 cleanup() {
     local ec=$?
-    # Two independent guards, because they cover different reaches. KEEP_WORK is
-    # the in-run signal die_retryable sets. The marker file is the cross-run one:
-    # it also stops the step-1 wipe of a LATER invocation, and it holds even if a
-    # future exit path forgets to set KEEP_WORK.
-    if [ $ec -ne 0 ] && [ "$KEEP_WORK" = 1 ]; then
-        log "Pipeline stopped (exit $ec) — keeping $WORK so a re-run can resume"
-        log "Resume with FROM_STEP=2 (runner: append '2'; ctp.py: --from-step 2)."
-    elif [ $ec -ne 0 ] && [ "$FROM_STEP" = "1" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
+    if [ $ec -ne 0 ] && [ "$FROM_STEP" = "1" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
         # A recoverable tokenize failure must survive its own error path. Without
         # this the exit-4 / exit-5 die below would delete the marker it just
         # wrote, plus the memo, the bare repos and the blob map it promises are
@@ -554,46 +565,50 @@ export BFG_TOKENIZE_CMD="${CREGIT}/tokenize/tokenize.pl \
   --srcml=$(which srcml) \
   --ctags=$(which ctags)"
 
-# Omitted flags leave blobExec on its own defaults, so the two tools never
-# disagree about what the default is.
-TIMEOUT_FLAGS=()
-[ -n "$BLOB_TIMEOUT" ]  && TIMEOUT_FLAGS+=("--blob-timeout=$BLOB_TIMEOUT")
-[ -n "$STALL_TIMEOUT" ] && TIMEOUT_FLAGS+=("--stall-timeout=$STALL_TIMEOUT")
-
+TOKENIZE_RC=0
 if [ "$MODE" = "sharded" ]; then
   # Memory-bounded path: N tree-only shards in parallel, then merge + serial
   # re-fold into $SHARD_OUT/final/{dst.git,blobmap.db} (byte-identical to serial).
-  SHARD_ARGV=(
-    --src "$REPO_PATH_ORIGINAL_BARE"
-    --out "$SHARD_OUT"
-    --shards "$SHARDS"
-    --jar "$BFG"
-    --command "${CREGIT}/tokenizeByBlobId/tokenBySha.pl"
-    --mask "$MASK"
-    --tok-cmd "$BFG_TOKENIZE_CMD"
-  )
-  [ -n "$BLOB_TIMEOUT" ]  && SHARD_ARGV+=(--blob-timeout "$BLOB_TIMEOUT")
-  [ -n "$STALL_TIMEOUT" ] && SHARD_ARGV+=(--stall-timeout "$STALL_TIMEOUT")
-  SHARD_RC=0
-  "${CREGIT}/blobExec/shard_build.sh" "${SHARD_ARGV[@]}" || SHARD_RC=$?
-  tokenize_gate "$SHARD_RC" "a tokenize shard"
+  # shard_build.sh propagates blobExec's 4 and 5 instead of collapsing them, so
+  # this branch gets the same marker and the same guard as the serial one.
+  "${CREGIT}/blobExec/shard_build.sh" \
+    --src "$REPO_PATH_ORIGINAL_BARE" \
+    --out "$SHARD_OUT" \
+    --shards "$SHARDS" \
+    --jar "$BFG" \
+    --command "${CREGIT}/tokenizeByBlobId/tokenBySha.pl" \
+    --mask "$MASK" \
+    --tok-cmd "$BFG_TOKENIZE_CMD" \
+    ${BLOB_TIMEOUT:+--blob-timeout "$BLOB_TIMEOUT"} \
+    ${STALL_TIMEOUT:+--stall-timeout "$STALL_TIMEOUT"} || TOKENIZE_RC=$?
+  tokenize_gate "$TOKENIZE_RC" "sharded tokenize (shard_build.sh)"
 else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
-  # Capture the status instead of letting `set -e` take it: steps 3-10 would
-  # otherwise build and validate an incomplete dataset.
-  BFG_RC=0
-  java -jar "$BFG" $MODE_FLAG "${TIMEOUT_FLAGS[@]+"${TIMEOUT_FLAGS[@]}"}" \
+  java -jar "$BFG" $MODE_FLAG \
+    ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
+    ${STALL_TIMEOUT:+--stall-timeout=$STALL_TIMEOUT} \
     "$REPO_PATH_ORIGINAL_BARE" \
     "$REPO_PATH_CREGIT_BARE" \
     "$DB_PATH_BLOBMAP" \
     "${CREGIT}/tokenizeByBlobId/tokenBySha.pl" \
-    "$MASK" || BFG_RC=$?
-  tokenize_gate "$BFG_RC" "tokenize"
+    "$MASK" || TOKENIZE_RC=$?
+  tokenize_gate "$TOKENIZE_RC" "tokenize (blobExec)"
 fi
 
 [ -d "$REPO_PATH_CREGIT_BARE" ] || die "tokenize did not produce $REPO_PATH_CREGIT_BARE"
+
+# Step 2 finished: the work here is no longer "incomplete but resumable", so drop
+# the markers. Leaving them would block every later FROM_STEP=1 run for the life
+# of the directory, and ctp.py has no --force-clean passthrough to get past that.
+for _m in $KEEP_MARKERS; do
+    if [ -e "${WORK}/${_m}" ]; then
+        log "tokenize completed — clearing ${WORK}/${_m}"
+        rm -f "${WORK}/${_m}"
+    fi
+done
+
 pack_cregit_repo
 fi
 end_step
