@@ -45,6 +45,32 @@ object Main {
   /** Seconds for `--blob-timeout=` / `--stall-timeout=`: a positive whole number
     * within [[MaxTimeoutSeconds]], else None. Zero is rejected rather than read
     * as "no limit". */
+
+  /** The process exit status for a finished walk.
+    *
+    * A function, and taking the whole [[WalkStats]], so that "which counters gate
+    * publication" is a property something can be asserted about rather than a
+    * conditional buried in `main`. Exactly two things gate it: an abort, and a
+    * blob whose tokenizer was killed on its budget. Deliberately NOT gating:
+    *
+    *   - `blobsOversized` — jgit will not materialise the object; deterministic,
+    *     explained per blob, and the file is absent rather than wrong.
+    *   - `blobsDenylisted` — srcML 1.1.0 does not terminate on it; diagnosed, with
+    *     an upstream citation, in a data file a paper can cite. Gating on this
+    *     would hold a project back for a fault that is already recorded.
+    *
+    * The distinction is the whole point of the denylist: a timeout is a hang
+    * nobody has explained yet, and that must keep blocking publication.
+    */
+  private[blobexec] def exitStatus(stats: WalkStats): Int =
+    if (stats.aborted) 2
+    else if (stats.blobsTimedOut > 0) TimedOutExitStatus
+    else 0
+
+  /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
+    * positive whole number, else None (which the caller reports and exits 1 on).
+    * Zero and negatives are rejected rather than read as "no limit" — an
+    * unbounded blob is the defect this whole change exists to remove. */
   private[blobexec] def parsePositiveSeconds(spec: String): Option[Int] =
     spec.toIntOption.filter(s => s > 0 && s <= MaxTimeoutSeconds)
 
@@ -68,6 +94,14 @@ object Main {
       |                    window the run exits ${Walker.StalledExitStatus}. Neither flag normally
       |                    needs setting: the window follows the budget, and a
       |                    window that one blob's lifetime could trip is refused.
+      |
+      |  Blobs on the shipped denylist (${BlobDenylist.ResourcePath} inside this
+      |  jar) are never handed to <command>: they are dropped from the rewritten
+      |  trees, counted as blobsDenylisted, named with their reason and citation on
+      |  an EXCLUDED line, and they do NOT change the exit status. srcML 1.1.0 does
+      |  not terminate on the four listed blobs, the defect is diagnosed and cited
+      |  upstream, and a diagnosed exclusion must not block publication the way an
+      |  unexplained timeout does.
       |
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
@@ -216,6 +250,17 @@ object Main {
     val dbParent = dbPath.getParent
     if (dbParent != null && !Files.isDirectory(dbParent)) Files.createDirectories(dbParent)
 
+    // Loaded here rather than on first use: a jar built without the resource, or a
+    // malformed line in it, must stop the run now and say so, not silently hand a
+    // known non-terminating blob to srcml an hour into the walk.
+    val denylist =
+      try BlobDenylist.shipped
+      catch {
+        case e: Exception =>
+          System.err.println(s"Error: cannot read the blob denylist: ${e.getMessage}")
+          sys.exit(1)
+      }
+
     val incremental = Files.isDirectory(dstPath)
     val shardStr = shard.map { case (k, n) => s"$k/$n" }.getOrElse("none")
     val warmStr  = warmPath.map(_.toString).getOrElse("none")
@@ -223,7 +268,8 @@ object Main {
       s"blobExec: src=$srcPath dst=$dstPath db=$dbPath command=$command mask=$mask " +
         s"abortOnError=$abortOnError pipeline=$pipeline pipelineTrees=$pipelineTrees " +
         s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s " +
-        s"stallTimeout=${stallTimeoutSeconds}s incremental=$incremental"
+        s"stallTimeout=${stallTimeoutSeconds}s incremental=$incremental " +
+        s"denylistEntries=${denylist.size}"
     )
 
     val src: FileRepository = openSrc(srcPath)
@@ -244,7 +290,8 @@ object Main {
         pipeline, pipelineTrees, shard,
         destinationMayContainObjects = incremental,
         blobTimeoutSeconds = blobTimeoutSeconds,
-        stallTimeoutSeconds = stallTimeoutSeconds
+        stallTimeoutSeconds = stallTimeoutSeconds,
+        denylist = denylist
       )
       val s = walker.run()
       val prior = mapping.getMeta(BlobsTimedOutMetaKey).flatMap(_.toLongOption).getOrElse(0L)
@@ -273,8 +320,25 @@ object Main {
         s"blobsTimedOut=${stats.blobsTimedOut} " +
         s"blobsTimedOutEver=$timedOutEver " +
         s"blobsOversized=${stats.blobsOversized} " +
+        s"blobsDenylisted=${stats.blobsDenylisted} " +
         s"aborted=${stats.aborted}"
     )
+
+    if (stats.blobsDenylisted > 0) {
+      // Reported, never fatal. The same blob on the timeout path spends the whole
+      // budget and then exits 4, which holds the project back for a third-party
+      // parser bug that is already diagnosed and cited.
+      System.err.println(
+        s"blobExec: ${stats.blobsDenylisted} blob(s) were excluded by the blob denylist " +
+          s"(${BlobDenylist.ResourcePath} in this jar, ${denylist.size} entr" +
+          s"${if (denylist.size == 1) "y" else "ies"}). Each one is named with its sha, path, " +
+          "reason and upstream citation on an 'EXCLUDED denylisted blob' line above; those " +
+          "lines and that file are the record of what this project's dataset does not contain. " +
+          "The files are absent from the tokenized repository, not present as raw source, so " +
+          "they produce no blame and no dataset row. This is not a failure and does not affect " +
+          "the exit status."
+      )
+    }
 
     if (stats.blobsOversized > 0) {
       System.err.println(
@@ -304,11 +368,7 @@ object Main {
     }
 
     // Exit explicitly: abandoned daemon readers must not decide JVM exit.
-    sys.exit(
-      if (stats.aborted) 2
-      else if (stats.blobsTimedOut > 0) TimedOutExitStatus
-      else 0
-    )
+    sys.exit(exitStatus(stats))
   }
 
   private def openSrc(path: java.nio.file.Path): FileRepository = {

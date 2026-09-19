@@ -158,6 +158,7 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--commit-url`        | base URL for commit links in the generated HTML            | `<repo-url minus .git>/commit/`  |
 | `--mask`              | regex of files to tokenize (C, C++, Java, Rust); quote it   | `perl tokenize/fileMask.pl`      |
 | `--work`              | working/output directory                                   | `../cregit-files`                |
+| `--memo-dir`          | where to memoize tokenized blobs; outside `--work` it survives the full-run wipe | `<work>/memo` |
 | `--mode` / `--shards` | tokenizer walk mode / shard count for `sharded`            | `pipeline` / `4`                 |
 | `--jobs`              | concurrent blame/HTML processes                            | `CREGIT_JOBS` or up to `4` CPUs  |
 
@@ -165,6 +166,20 @@ A full run starts by **deleting the work directory** — to keep several target
 repositories side by side, give each its own `--work`. To resume a failed run
 without starting over, pass the step number printed in the step banners (with
 the same target flags), e.g. `./run_pipeline_process.sh --repo-url … 5`.
+
+That wipe also takes the memo, which is the tokenizing already done: a memo hit
+returns without invoking `srcml` at all. Put it out of reach with `--memo-dir`,
+**one directory per repository** (the memo key is a hash of the file contents and
+names neither repository nor extension). The runner refuses a step-1 wipe that
+would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
+
+Four blobs in one corpus project are on a **blob denylist**
+(`blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv`): srcML 1.1.0 does
+not terminate on them (upstream srcML/srcML#2361, open). They are never handed to
+the tokenizer, are dropped from the rewritten trees rather than kept as raw
+source, are counted as `blobsDenylisted` and named with a reason and a citation —
+and, unlike a tokenizer timeout, they do **not** change the exit status. Adding an
+entry means editing that file and rebuilding the jar.
 
 Example run (cregit run on itself):
 ![Example cregit run](cregit.gif)

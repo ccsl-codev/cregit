@@ -23,6 +23,9 @@ make_stub_java() {  # $1 = bin dir
 #!/usr/bin/env bash
 : "${STUB_RC:=0}"
 [ -n "${STUB_ARGV:-}" ] && printf '%s\n' "$*" >> "$STUB_ARGV"
+# The tokenizer reads the memo location from the environment, not from argv, so
+# the only way to assert it arrives is to record it here.
+[ -n "${STUB_ENV:-}" ] && printf 'BFG_MEMO_DIR=%s\n' "${BFG_MEMO_DIR:-unset}" >> "$STUB_ENV"
 # Positional arguments after the jar are: src dst db command mask.
 pos=(); skip=0
 for a in "$@"; do
@@ -139,6 +142,24 @@ grep -q -- "--blob-timeout=1200" "$STUB_ARGV"; check "CREGIT_BLOB_TIMEOUT is hon
 grep -q -- "--stall-timeout=4800" "$STUB_ARGV"; check "CREGIT_STALL_TIMEOUT is honoured" $?
 unset STUB_ARGV
 rm -rf "$W"
+
+echo "case 9bis: BFG_MEMO_DIR reaches step 2, and --memo-dir is what sets it"
+# tokenizeByBlobId/tokenBySha.pl takes the memo location from the environment and
+# dies without it, and a memo hit is a tokenization that never runs srcml. So the
+# value that arrives here is the whole of --memo-dir's effect.
+W=$(fixture)
+export STUB_ENV="$W/java-env"
+OUT=$(STUB_RC=4 run_step2 "$W")
+grep -qx "BFG_MEMO_DIR=$W/memo" "$STUB_ENV"; check "default: <work>/memo, exactly as before" $?
+rm -f "$STUB_ENV"
+M=$(mktemp -d "${TMPDIR:-/tmp}/gatememo-XXXXXX")
+rmdir "$M"                       # the runner must create it, as it does for <work>/memo
+OUT=$(STUB_RC=4 run_step2 "$W" --memo-dir "$M")
+grep -qx "BFG_MEMO_DIR=$M" "$STUB_ENV"; check "--memo-dir: the memo lives outside \$WORK" $?
+[ -d "$M" ]; check "and the runner created it" $?
+! grep -q "warning: --memo-dir" <<<"$OUT"; check "no inside-\$WORK warning for an outside dir" $?
+unset STUB_ENV
+rm -rf "$W" "$M"
 
 echo "case 9: a bad timeout value is refused before any work"
 W=$(fixture)
