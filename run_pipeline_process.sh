@@ -26,6 +26,15 @@ Target repository:
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
+                    Pass FROM_STEP=2 (the trailing positional argument) to
+                    resume instead, keeping the memo, the bare repos and the
+                    blob map — that is how a tokenize timeout or stall is
+                    recovered without redoing the work.
+  --force-clean     allow the FROM_STEP=1 wipe even when $WORK holds a
+                    TOKENIZE-TIMEOUTS or TOKENIZE-STALLED marker. Without this
+                    the runner refuses, because those markers mean the work is
+                    incomplete but resumable at step 2, and deleting it means
+                    re-tokenizing everything to retry a few blobs.
 
 Output:
   --skip-html       do not generate the HTML views (step 9). The views cost
@@ -151,6 +160,25 @@ GC_MODE="plain"
 # concurrent projects must budget 1.4 x N x limit of RAM.
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
+FORCE_CLEAN=0
+
+# Markers meaning "the work in $WORK is incomplete but recoverable, and a
+# FROM_STEP=1 wipe would throw away days of tokenizing to redo it". Written by
+# step 2 when blobExec reports a timed-out blob (exit 4) or a stall (exit 5);
+# see keep_markers_present and --force-clean.
+KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED"
+
+# Prints the first marker found in $WORK and returns 0; returns 1 if none.
+keep_markers_present() {
+    local m
+    for m in $KEEP_MARKERS; do
+        if [ -e "${WORK}/${m}" ]; then
+            printf '%s' "${WORK}/${m}"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # need_val <flag> <value...>: refuse a value-taking flag with no value.
 need_val() {
@@ -166,6 +194,7 @@ while [ $# -gt 0 ]; do
         --mask)       need_val "$@"; MASK="$2"; shift 2 ;;
         --work)       need_val "$@"; WORK="$2"; shift 2 ;;
         --skip-html)  SKIP_HTML=1; shift ;;
+        --force-clean) FORCE_CLEAN=1; shift ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
@@ -355,6 +384,17 @@ PYTHON=$(command -v python3 || true)  # only needed by step 10 (dataset)
 cleanup() {
     local ec=$?
     if [ $ec -ne 0 ] && [ "$FROM_STEP" = "1" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
+        # A recoverable tokenize failure must survive its own error path. Without
+        # this the exit-4 / exit-5 die below would delete the marker it just
+        # wrote, plus the memo, the bare repos and the blob map it promises are
+        # still there — the work the operator is told to resume from.
+        local marker
+        if marker=$(keep_markers_present); then
+            log "Pipeline failed (exit $ec) — keeping $WORK: $marker says the work is resumable"
+            log "Resume with FROM_STEP=2 (runner: append '2'; ctp.py: --from-step 2),"
+            log "or discard it deliberately with --force-clean."
+            return 0
+        fi
         log "Pipeline failed (exit $ec) — removing $WORK for a clean restart"
         rm -rf "$WORK"
     fi
@@ -363,6 +403,21 @@ trap cleanup EXIT
 
 # A full run starts clean; resuming (FROM_STEP >= 2) keeps existing work.
 if [ "$FROM_STEP" = "1" ] && [ -d "$WORK" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
+    # ...unless the previous run left work that is incomplete but recoverable.
+    # Deleting it here is the expensive mistake: on a large repository this is
+    # days of tokenizing, and the re-run would redo all of it to retry one blob.
+    if marker=$(keep_markers_present) && [ "$FORCE_CLEAN" != "1" ]; then
+        die "refusing to delete $WORK: $marker
+     That run stopped with work that is incomplete but resumable — the memo,
+     the bare repos and the blob map in there are still good, and step 2 will
+     retry only the blobs that failed.
+     Resume (keeps the directory, retries the failed blobs):
+       runner:  $0 --repo-url <url> --work $WORK [same flags] 2
+       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2
+     Start over and lose that work, deliberately:
+       $0 --force-clean [same flags]
+     (or remove $marker by hand)"
+    fi
     rm -rf "$WORK"
 fi
 
@@ -445,22 +500,35 @@ else
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-TIMEOUTS"
     echo "blobExec exited 4: at least one blob timed out; see the blobsTimedOut" \
          "count and the 'will retry on the next run' lines in this step's log." \
-         "Nothing was recorded for the containing commit, so re-running retries" \
-         "those blobs." >> "${WORK}/TOKENIZE-TIMEOUTS"
+         "Nothing was recorded for the containing commit, so resuming at step 2" \
+         "retries those blobs. Resuming at step 1 deletes this directory instead;" \
+         "while this marker exists the runner refuses to do that without" \
+         "--force-clean." >> "${WORK}/TOKENIZE-TIMEOUTS"
     die "tokenize left blobs untokenized (blobExec exit 4). Refusing to continue:
      the dataset would carry raw source in place of tokens. Marker written to
-     ${WORK}/TOKENIZE-TIMEOUTS. Recovery: run this same command again — the
-     timed-out blobs are retried automatically and no database surgery is
-     needed. If they keep timing out, the tokenizer is too slow for them:
-     raise blobExec's --blob-timeout."
+     ${WORK}/TOKENIZE-TIMEOUTS.
+     Recovery — resume at step 2. Do NOT re-run from step 1: that deletes
+     $WORK, including the memo and the tokenizing already done, and redoes all
+     of it to retry a handful of blobs. Step 2 retries exactly the blobs that
+     failed and needs no database surgery:
+       runner:  $0 --repo-url <url> --work $WORK [same flags] 2
+       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2
+     If they keep timing out, the tokenizer is too slow for them: raise
+     blobExec's --blob-timeout (e.g. --blob-timeout=1800)."
   elif [ "$BFG_RC" -eq 5 ]; then
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-STALLED"
     echo "blobExec exited 5: the stall watchdog fired. The STALLED line in this" \
-         "step's log names the work that was in flight." >> "${WORK}/TOKENIZE-STALLED"
-    die "tokenize stalled and was killed by blobExec's watchdog (exit 5). The
-     memo is durable, so re-running resumes from where it stopped. The STALLED
-     line in this step's log names the blobs that were in flight; if one of them
-     is pathological, raise --blob-timeout or exclude it via --mask."
+         "step's log names the work that was in flight. Resume at step 2 to keep" \
+         "this directory; while this marker exists the runner refuses a step-1" \
+         "wipe without --force-clean." >> "${WORK}/TOKENIZE-STALLED"
+    die "tokenize stalled and was killed by blobExec's watchdog (exit 5). Marker
+     written to ${WORK}/TOKENIZE-STALLED. The memo in $WORK is durable and
+     resuming picks up where it stopped — but only at step 2. A step-1 re-run
+     deletes $WORK first, memo included, so the durability buys nothing:
+       runner:  $0 --repo-url <url> --work $WORK [same flags] 2
+       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2
+     The STALLED line in this step's log names the blobs that were in flight; if
+     one of them is pathological, raise --blob-timeout or exclude it via --mask."
   elif [ "$BFG_RC" -ne 0 ]; then
     die "tokenize failed (blobExec exit $BFG_RC)"
   fi
