@@ -77,6 +77,16 @@ Output:
                     forward --duckdb-threads to step 10. Each sorting thread
                     holds its own buffers, so fewer threads lower the peak.
                     Omit to accept the generator's default.
+  --project-meta PATH
+                    forward --project-meta to step 10: a JSON sidecar of
+                    per-project provenance written by cregit-token-pipeline's
+                    project_meta.py. Omit and the generator emits those columns
+                    as empty strings, so the schema is unchanged either way.
+  --project-key NAME
+                    forward --project-key to step 10: which key of the sidecar
+                    this project is (the corpus manifest name). Omit to let the
+                    generator use --repo-name. The generator fails loudly on a
+                    key the sidecar does not hold.
 
 Tokenizer:
   --mode MODE   tokenizer walk mode (default: pipeline)
@@ -171,6 +181,11 @@ GC_MODE="plain"
 # concurrent projects must budget 1.4 x N x limit of RAM.
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
+# Empty means "do not pass the flag", as above: step 10 then emits the
+# per-project provenance columns as empty strings, so the schema does not depend
+# on whether the caller knows about the sidecar.
+PROJECT_META=""
+PROJECT_KEY=""
 FORCE_CLEAN=0
 # Empty means "do not pass the flag", so blobExec keeps its own defaults (600s
 # per blob, 1800s stall window). The CREGIT_* environment fallbacks exist so the
@@ -275,6 +290,8 @@ while [ $# -gt 0 ]; do
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
+        --project-meta)   need_val "$@"; PROJECT_META="$2"; shift 2 ;;
+        --project-key)    need_val "$@"; PROJECT_KEY="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
         --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
@@ -311,6 +328,17 @@ if [ -n "$DUCKDB_THREADS" ]; then
         ''|*[!0-9]*) echo "invalid --duckdb-threads: '$DUCKDB_THREADS' (want a positive integer)" >&2; exit 2 ;;
         0) echo "invalid --duckdb-threads: 0 (want a positive integer)" >&2; exit 2 ;;
     esac
+fi
+
+# Same reasoning as --memory-limit: step 10 is the last step, so an unreadable
+# sidecar must be caught now rather than after the whole run.
+if [ -n "$PROJECT_META" ] && [ ! -f "$PROJECT_META" ]; then
+    echo "invalid --project-meta: '$PROJECT_META' is not a file (generate it with project_meta.py)" >&2
+    exit 2
+fi
+if [ -n "$PROJECT_KEY" ] && [ -z "$PROJECT_META" ]; then
+    echo "--project-key without --project-meta has nothing to key into" >&2
+    exit 2
 fi
 
 # Reject bad timeout values here rather than at step 2, which on a large repo is
@@ -716,6 +744,12 @@ if [ -n "$MEMORY_LIMIT" ]; then
 fi
 if [ -n "$DUCKDB_THREADS" ]; then
     DATASET_OPTS+=(--duckdb-threads "$DUCKDB_THREADS")
+fi
+if [ -n "$PROJECT_META" ]; then
+    DATASET_OPTS+=(--project-meta "$PROJECT_META")
+fi
+if [ -n "$PROJECT_KEY" ]; then
+    DATASET_OPTS+=(--project-key "$PROJECT_KEY")
 fi
 # ${a[@]+"${a[@]}"} keeps an empty array safe under `set -u`.
 "$PYTHON" "$DATASET_SCRIPT" \

@@ -380,6 +380,75 @@ def parse_memory_limit(text):
     return cleaned
 
 
+# The 29 per-project constants, in dataset order. This list mirrors META_FIELDS
+# in cregit-token-pipeline/project_meta.py, which writes the sidecar, and
+# EXPECTED_COLUMNS in cregit-token-pipeline/validate_schema.py, which gates the
+# corpus. All three must carry the same names in the same order; the pipeline
+# repo has a test (tests/test_meta_field_drift.py) that reads this tuple out of
+# this file and fails if it drifts, because the two copies live in different
+# repositories and nothing else keeps them in step.
+#
+# The sidecar is written with sort_keys=True, so it is alphabetical. Iterate this
+# tuple, never the JSON, or the columns come out in the wrong order.
+PROJECT_META_FIELDS = (
+    "clone_url", "provenance_status",
+    "source", "stratum", "fact", "contested", "label_date",
+    "owner", "repo", "roster_name", "roster_lang",
+    "language", "commits", "size_class", "size_kb", "stars", "pushed_at",
+    "license", "owner_type", "archived", "fork",
+    "history_cluster", "history_shared_with", "history_relation",
+    "history_includes", "history_first", "history_created",
+    "manifest_category", "file_mask",
+)
+
+
+def sql_literal(value) -> str:
+    """A single-quoted SQL literal, with embedded quotes doubled.
+
+    The COPY query is built by f-string, and these values are free text from
+    candidates.csv. An unescaped apostrophe in history_shared_with would end the
+    literal early, turning the rest of the value into SQL. A backslash is left
+    alone on purpose: DuckDB follows the standard and does not read backslash
+    escapes inside a single-quoted string, and file_mask is a regex full of them.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def load_project_meta(meta_path, project_key) -> dict:
+    """The project's constants, or empty strings when no sidecar was given.
+
+    An absent sidecar is allowed, so an older caller still produces a file with
+    the full column set. A sidecar that does not hold the key is not: that is a
+    stale sidecar or a mistyped slug, and falling back to empty strings would
+    publish 29 blank columns without saying so.
+    """
+    if not meta_path:
+        return {f: "" for f in PROJECT_META_FIELDS}
+    import json
+
+    with open(meta_path) as fh:
+        meta = json.load(fh)
+    if project_key not in meta:
+        raise SystemExit(
+            f"{project_key} is not in {meta_path}. Regenerate the sidecar with "
+            "project_meta.py, or the dataset would carry blank provenance."
+        )
+    row = meta[project_key]
+    return {f: row.get(f, "") for f in PROJECT_META_FIELDS}
+
+
+def project_meta_sql(project_meta) -> str:
+    """The metadata columns as SQL, one per line, in PROJECT_META_FIELDS order.
+
+    Every value goes through sql_literal. Each line ends in a comma, so the
+    block drops straight into the SELECT list.
+    """
+    return "".join(
+        f"                {sql_literal(project_meta[f])} AS {f},\n"
+        for f in PROJECT_META_FIELDS
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate unified Parquet dataset from CreGit pipeline outputs"
@@ -401,6 +470,20 @@ def main():
         "--repo-name",
         default="",
         help="Repository name (default: inferred from output filename)",
+    )
+    parser.add_argument(
+        "--project-meta",
+        default="",
+        metavar="PATH",
+        help="JSON sidecar of per-project constants, from project_meta.py. "
+        "Empty means emit the metadata columns as empty strings, so an older "
+        "caller still produces a schema-valid file.",
+    )
+    parser.add_argument(
+        "--project-key",
+        default="",
+        metavar="NAME",
+        help="key into --project-meta (the manifest name). Defaults to --repo-name.",
     )
     parser.add_argument(
         "--memory-limit",
@@ -455,6 +538,11 @@ def main():
 
     if not args.repo_name:
         args.repo_name = output_path.stem.replace("-dataset", "")
+
+    # Resolve the sidecar before Phase 1, for the same reason as the two caps
+    # above: a missing key must not surface after half an hour of inserts.
+    project_meta = load_project_meta(
+        args.project_meta, args.project_key or args.repo_name)
 
     blame_files = sorted(blame_root.rglob("*.blame"))
     if not blame_files:
@@ -572,11 +660,13 @@ def main():
     con.execute(f"CALL sqlite_attach('{args.cregit_db}')")
     con.execute(f"CALL sqlite_attach('{args.persons_db}')")
 
+    meta_sql = project_meta_sql(project_meta)
+
     query = f"""
         COPY (
             SELECT
-                '{args.repo_name}'           AS repo_name,
-                t.file_path,
+                {sql_literal(args.repo_name)} AS repo_name,
+{meta_sql}                t.file_path,
                 t.token_index,
                 t.source_line,
                 t.source_col,
