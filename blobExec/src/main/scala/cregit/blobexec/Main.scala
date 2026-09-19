@@ -37,15 +37,17 @@ object Main {
     * succeeded, but the output is incomplete and must not be validated. */
   private[blobexec] val TimedOutExitStatus = 4
 
-  /** Value parser for `--blob-timeout=<seconds>`: a positive whole number of
-    * seconds, else None (which the caller reports and exits 1 on). */
-  private[blobexec] def parseBlobTimeout(spec: String): Option[Int] =
+  /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
+    * positive whole number, else None (which the caller reports and exits 1 on).
+    * Zero and negatives are rejected rather than read as "no limit" — an
+    * unbounded blob is the defect this whole change exists to remove. */
+  private[blobexec] def parsePositiveSeconds(spec: String): Option[Int] =
     spec.toIntOption.filter(_ > 0)
 
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--blob-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
@@ -56,13 +58,23 @@ object Main {
       |                    left untokenized; the run continues, and
       |                    --abort-on-error does not turn a timeout into a
       |                    whole-run abort. The count is reported on the done
-      |                    line, recorded durably in the memo, and the process
-      |                    then exits ${TimedOutExitStatus} so the caller cannot
-      |                    publish a project whose tokens are incomplete.
+      |                    line and the process then exits ${TimedOutExitStatus},
+      |                    so the caller cannot publish a project whose tokens are
+      |                    incomplete. Nothing durable is recorded for the blob,
+      |                    the trees above it or its commit, so simply running
+      |                    the same command again retries just that blob.
+      |  --stall-timeout=<seconds>
+      |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}). If no blob, tree,
+      |                    commit or blob copy completes anywhere in this window,
+      |                    the run is stuck in a way the per-blob kill did not
+      |                    cover: it is reported with the work in flight and the
+      |                    process is killed with status ${Walker.StalledExitStatus}. The memo is
+      |                    durable, so re-running resumes.
       |
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
-      |               but some blob timed out (output incomplete).
+      |               but some blob timed out (output incomplete, re-run to
+      |               retry), ${Walker.StalledExitStatus} = killed by the stall watchdog.
       |  --pipeline        use the look-ahead pipelined walker (producer runs
       |                    ahead so the blob-command pool stays saturated);
       |                    output is identical to the default serial walker
@@ -101,6 +113,7 @@ object Main {
     var shard: Option[(Int, Int)] = None
     var warmPath: Option[java.nio.file.Path] = None
     var blobTimeoutSeconds = BlobExec.DefaultTimeoutSeconds
+    var stallTimeoutSeconds = Walker.DefaultStallTimeoutSeconds
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
       case "--pipeline"       => pipeline = true
@@ -129,10 +142,18 @@ object Main {
         warmPath = Some(p)
       case t if t.startsWith("--blob-timeout=") =>
         val spec = t.stripPrefix("--blob-timeout=")
-        parseBlobTimeout(spec) match {
+        parsePositiveSeconds(spec) match {
           case Some(secs) => blobTimeoutSeconds = secs
           case None =>
             System.err.println(s"Error: --blob-timeout must be a positive whole number of seconds [$spec]")
+            sys.exit(1)
+        }
+      case t if t.startsWith("--stall-timeout=") =>
+        val spec = t.stripPrefix("--stall-timeout=")
+        parsePositiveSeconds(spec) match {
+          case Some(secs) => stallTimeoutSeconds = secs
+          case None =>
+            System.err.println(s"Error: --stall-timeout must be a positive whole number of seconds [$spec]")
             sys.exit(1)
         }
       case other =>
@@ -187,7 +208,8 @@ object Main {
     println(
       s"blobExec: src=$srcPath dst=$dstPath db=$dbPath command=$command mask=$mask " +
         s"abortOnError=$abortOnError pipeline=$pipeline pipelineTrees=$pipelineTrees " +
-        s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s incremental=$incremental"
+        s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s " +
+        s"stallTimeout=${stallTimeoutSeconds}s incremental=$incremental"
     )
 
     val src: FileRepository = openSrc(srcPath)
@@ -199,18 +221,17 @@ object Main {
         sys.exit(3)
     }
 
-    // (stats, cumulative timed-out blobs recorded in this memo). The cumulative
-    // figure is durable on purpose: a timed-out blob is memoized as an identity
-    // row, so a later incremental run sees a cache hit, counts no timeout of its
-    // own, and would otherwise report a clean run over output that still carries
-    // raw source where tokens belong.
-    val (stats, timedOutTotal) = try {
+    // (stats, timeouts this memo has ever seen). The cumulative figure is kept
+    // for forensics only — it must NOT gate the exit status, or a blob that
+    // times out once could never be retried to a clean run.
+    val (stats, timedOutEver) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
       val walker = new Walker(
         src, dst, mapping, mask.r, command, abortOnError, parallelism,
         pipeline, pipelineTrees, shard,
         destinationMayContainObjects = incremental,
-        blobTimeoutSeconds = blobTimeoutSeconds
+        blobTimeoutSeconds = blobTimeoutSeconds,
+        stallTimeoutSeconds = stallTimeoutSeconds
       )
       val s = walker.run()
       val prior = mapping.getMeta(BlobsTimedOutMetaKey).flatMap(_.toLongOption).getOrElse(0L)
@@ -237,18 +258,19 @@ object Main {
         s"originalBlobBytesAvoided=${stats.originalBlobBytesAvoided} " +
         s"refsProjected=${stats.refsProjected} " +
         s"blobsTimedOut=${stats.blobsTimedOut} " +
-        s"blobsTimedOutCumulative=$timedOutTotal " +
+        s"blobsTimedOutEver=$timedOutEver " +
         s"aborted=${stats.aborted}"
     )
 
-    if (timedOutTotal > 0) {
+    if (stats.blobsTimedOut > 0) {
       System.err.println(
-        s"blobExec: DO NOT PUBLISH: blobsTimedOut=${stats.blobsTimedOut} this run, " +
-          s"$timedOutTotal cumulative for this memo ($dbPath, meta['$BlobsTimedOutMetaKey']). " +
-          "Those blobs are recorded as identity rows, so their files carry raw source " +
-          "instead of tokens and a re-run will not retry them. Exiting 4 so the step " +
-          "fails loudly instead of validating a project with missing tokens. Re-run with " +
-          "a larger --blob-timeout after clearing those rows, or accept them deliberately."
+        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsTimedOut} blob(s) timed out this " +
+          s"run ($timedOutEver ever for this memo, see meta['$BlobsTimedOutMetaKey'] in $dbPath). " +
+          "Their files would carry raw source instead of tokens, so the walk stopped at that " +
+          s"commit and recorded nothing for it: no blob row, no tree row, no commit row. " +
+          s"Exiting $TimedOutExitStatus. Recovery is to run the same command again — it retries " +
+          "exactly those blobs and needs no changes to the database. If they keep timing out, " +
+          "the tokenizer is too slow for them: raise --blob-timeout."
       )
     }
 
@@ -258,7 +280,7 @@ object Main {
     // behind a done-line that read `aborted=false`.
     sys.exit(
       if (stats.aborted) 2
-      else if (timedOutTotal > 0) TimedOutExitStatus
+      else if (stats.blobsTimedOut > 0) TimedOutExitStatus
       else 0
     )
   }
