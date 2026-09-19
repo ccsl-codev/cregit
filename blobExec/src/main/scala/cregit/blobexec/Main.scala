@@ -44,6 +44,40 @@ object Main {
   private[blobexec] def parsePositiveSeconds(spec: String): Option[Int] =
     spec.toIntOption.filter(_ > 0)
 
+  /** Multiple of `--blob-timeout` used when the stall window has to be widened
+    * for it, matching the ratio of the two defaults (600 and 1800). */
+  private[blobexec] val StallTimeoutMultiple = 3
+
+  /** Reconcile the two timeouts, which are not independent: during a commit that
+    * is pure blob work, a blob finishing or being killed is the only thing that
+    * stamps progress, so the watchdog window has to be strictly larger than the
+    * per-blob budget or a legitimately slow blob races its own watchdog.
+    *
+    *  - window already larger: accept it.
+    *  - window too small but never asked for (still the default): widen it, and
+    *    let the caller say so. Raising only `--blob-timeout` is the common case
+    *    and it should not need a second flag to be correct.
+    *  - window too small and explicitly requested: refuse, naming both values.
+    *    Silently overriding a number the operator typed is worse than stopping.
+    */
+  private[blobexec] def resolveStallTimeout(
+      blobTimeoutSeconds: Int,
+      stallTimeoutSeconds: Int,
+      stallExplicit: Boolean
+  ): Either[String, Int] =
+    if (stallTimeoutSeconds > blobTimeoutSeconds) Right(stallTimeoutSeconds)
+    else if (stallExplicit)
+      Left(
+        s"--stall-timeout=$stallTimeoutSeconds must be greater than --blob-timeout=$blobTimeoutSeconds. " +
+          "A blob completing or being killed is the only progress a pure-blob commit makes, so an " +
+          "equal or smaller stall window kills runs whose blobs are merely slow. Try " +
+          s"--stall-timeout=${widenedStall(blobTimeoutSeconds)} with --blob-timeout=$blobTimeoutSeconds."
+      )
+    else Right(widenedStall(blobTimeoutSeconds))
+
+  private def widenedStall(blobTimeoutSeconds: Int): Int =
+    math.min(blobTimeoutSeconds.toLong * StallTimeoutMultiple, Int.MaxValue.toLong).toInt
+
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
@@ -61,10 +95,15 @@ object Main {
       |                    line and the process then exits ${TimedOutExitStatus},
       |                    so the caller cannot publish a project whose tokens are
       |                    incomplete. Nothing durable is recorded for the blob,
-      |                    the trees above it or its commit, so simply running
-      |                    the same command again retries just that blob.
+      |                    the trees above it or its commit, so another run over
+      |                    the same memo retries just that blob (from the
+      |                    pipeline: resume at step 2, never step 1).
       |  --stall-timeout=<seconds>
-      |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}). If no blob, tree,
+      |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}); must be larger than
+      |                    --blob-timeout, since a pure-blob commit's only
+      |                    progress is a blob finishing or being killed. If it is
+      |                    not, an explicit value is refused and a defaulted one
+      |                    is raised to ${StallTimeoutMultiple}x --blob-timeout. If no blob, tree,
       |                    commit or blob copy completes anywhere in this window,
       |                    the run is stuck in a way the per-blob kill did not
       |                    cover: it is reported with the work in flight and the
@@ -114,6 +153,7 @@ object Main {
     var warmPath: Option[java.nio.file.Path] = None
     var blobTimeoutSeconds = BlobExec.DefaultTimeoutSeconds
     var stallTimeoutSeconds = Walker.DefaultStallTimeoutSeconds
+    var stallExplicit = false
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
       case "--pipeline"       => pipeline = true
@@ -151,7 +191,7 @@ object Main {
       case t if t.startsWith("--stall-timeout=") =>
         val spec = t.stripPrefix("--stall-timeout=")
         parsePositiveSeconds(spec) match {
-          case Some(secs) => stallTimeoutSeconds = secs
+          case Some(secs) => stallTimeoutSeconds = secs; stallExplicit = true
           case None =>
             System.err.println(s"Error: --stall-timeout must be a positive whole number of seconds [$spec]")
             sys.exit(1)
@@ -159,6 +199,21 @@ object Main {
       case other =>
         System.err.println(s"Error: unknown flag [$other]")
         System.err.println(Usage)
+        sys.exit(1)
+    }
+
+    resolveStallTimeout(blobTimeoutSeconds, stallTimeoutSeconds, stallExplicit) match {
+      case Right(secs) =>
+        if (secs != stallTimeoutSeconds) {
+          System.err.println(
+            s"blobExec: raising the stall window from ${stallTimeoutSeconds}s to ${secs}s, because " +
+              s"--blob-timeout=${blobTimeoutSeconds}s needs a watchdog window larger than itself. " +
+              "Pass --stall-timeout explicitly to choose your own."
+          )
+          stallTimeoutSeconds = secs
+        }
+      case Left(why) =>
+        System.err.println(s"Error: $why")
         sys.exit(1)
     }
 
@@ -271,8 +326,13 @@ object Main {
           s"Exiting $TimedOutExitStatus. Recovery is another blobExec run over this same memo: it " +
           "retries exactly those blobs and needs no changes to the database. Driven from " +
           "run_pipeline_process.sh, that means resuming at step 2 (trailing '2', or ctp.py " +
-          "--from-step 2) — a step-1 run deletes the work directory first, memo included. If " +
-          "they keep timing out, the tokenizer is too slow for them: raise --blob-timeout."
+          "--from-step 2) — a step-1 run deletes the work directory first, memo included. " +
+          "If the same blobs keep failing, check which kind of failure it is: a child killed on " +
+          s"its budget is slowness, and the knob is --blob-timeout (currently ${blobTimeoutSeconds}s; " +
+          "run_pipeline_process.sh --blob-timeout N, or CREGIT_BLOB_TIMEOUT=N in the environment). " +
+          "A child reporting status 137 was SIGKILLed, which on a memory-tight host usually means " +
+          "the kernel's OOM killer took it — more time will not help; give the run more memory or " +
+          "exclude that blob via the mask."
       )
     }
 

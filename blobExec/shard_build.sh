@@ -16,6 +16,15 @@ JAR="$HERE/target/scala-2.13/blobExec-0.1.0-assembly.jar"
 COMMAND="$CREGIT/tokenizeByBlobId/tokenBySha.pl"
 MASK='\.[ch]$'
 TOK_CMD=""; WARM_DB=""; WARM_GIT=""
+# Empty means "do not pass the flag", leaving blobExec's own defaults in place.
+BLOB_TIMEOUT=""; STALL_TIMEOUT=""
+
+# blobExec's "incomplete but resumable" statuses. They must reach the caller
+# instead of collapsing to 1: run_pipeline_process.sh turns them into the marker
+# that stops a later FROM_STEP=1 run from deleting the work, and a sharded build
+# is exactly the case where that work is days long.
+TIMEOUT_RC=4
+STALL_RC=5
 
 usage() {
   cat >&2 <<EOF
@@ -30,6 +39,13 @@ usage: shard_build.sh --src <bare.git> --out <dir> [options]
   --tok-cmd CMD    BFG_TOKENIZE_CMD                              [default: tokenize/tokenize.pl …]
   --warm-db DB     frozen prior blobmap.db (incremental)        [optional]
   --warm-git GIT   frozen prior dst.git to union objects from   [optional]
+  --blob-timeout N per-blob wall-clock budget, seconds          [blobExec default]
+  --stall-timeout N no-progress watchdog window, seconds        [blobExec default]
+
+exit status: 0 = ok, 2 = usage, $TIMEOUT_RC = a shard or the re-fold left blobs
+untokenized, $STALL_RC = a shard or the re-fold stalled and was killed, 1 = other
+failure. $TIMEOUT_RC and $STALL_RC are propagated deliberately: the caller uses
+them to keep the work directory for a step-2 resume.
 EOF
 }
 
@@ -45,6 +61,8 @@ while [ $# -gt 0 ]; do
     --tok-cmd) TOK_CMD="$2"; shift 2;;
     --warm-db) WARM_DB="$2"; shift 2;;
     --warm-git) WARM_GIT="$2"; shift 2;;
+    --blob-timeout) BLOB_TIMEOUT="$2"; shift 2;;
+    --stall-timeout) STALL_TIMEOUT="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "unknown arg: $1" >&2; usage; exit 2;;
   esac
@@ -81,6 +99,10 @@ flock -n 9 || { log "another shard build holds the lock -- exiting"; exit 0; }
 
 log "=== sharded build: N=$N threads/shard=$THREADS src=$SRC out=$OUT warm=${WARM_DB:-none} ==="
 
+TIMEOUT_FLAGS=()
+[ -n "$BLOB_TIMEOUT" ]  && TIMEOUT_FLAGS+=("--blob-timeout=$BLOB_TIMEOUT")
+[ -n "$STALL_TIMEOUT" ] && TIMEOUT_FLAGS+=("--stall-timeout=$STALL_TIMEOUT")
+
 run_shard() {
   local k="$1" sd="$OUT/shard-$k" memo="$OUT/memo-$k" rc t0 t1
   local warm=()
@@ -88,7 +110,7 @@ run_shard() {
   [ -n "$WARM_DB" ] && warm=(--warm="$WARM_DB")
   t0=$(date +%s)
   BFG_MEMO_DIR="$memo" "$JAVA" -XX:ActiveProcessorCount="$THREADS" -XX:+ExitOnOutOfMemoryError \
-    -jar "$JAR" "--shard=$k/$N" "${warm[@]}" \
+    -jar "$JAR" "--shard=$k/$N" "${warm[@]}" "${TIMEOUT_FLAGS[@]+"${TIMEOUT_FLAGS[@]}"}" \
     "$SRC" "$sd/dst.git" "$sd/blobmap.db" "$COMMAND" "$MASK" \
     > "$sd/run.log" 2>&1
   rc=$?; t1=$(date +%s)
@@ -99,11 +121,29 @@ run_shard() {
 log "launching $N shards (ActiveProcessorCount=$THREADS each)"
 G0=$(date +%s); pids=(); ks=()
 for k in $(seq 0 $((N-1))); do run_shard "$k" & pids+=($!); ks+=("$k"); done
-fail=0
+fail=0; resumable=0
 for i in "${!pids[@]}"; do
-  wait "${pids[$i]}" || { log "SHARD ${ks[$i]} FAILED (see $OUT/shard-${ks[$i]}/run.log)"; fail=1; }
+  rc=0; wait "${pids[$i]}" || rc=$?
+  case "$rc" in
+    0) ;;
+    "$TIMEOUT_RC")
+      log "SHARD ${ks[$i]} left blobs untokenized (exit $rc, see $OUT/shard-${ks[$i]}/run.log)"
+      [ "$resumable" -eq "$STALL_RC" ] || resumable=$TIMEOUT_RC ;;
+    "$STALL_RC")
+      log "SHARD ${ks[$i]} stalled and was killed by the watchdog (exit $rc, see $OUT/shard-${ks[$i]}/run.log)"
+      resumable=$STALL_RC ;;
+    *) log "SHARD ${ks[$i]} FAILED (see $OUT/shard-${ks[$i]}/run.log)"; fail=1 ;;
+  esac
 done
-log "shard phase wall=$(( $(date +%s) - G0 ))s fail=$fail"
+log "shard phase wall=$(( $(date +%s) - G0 ))s fail=$fail resumable=$resumable"
+# A resumable status wins over a plain failure: it is the one that makes the
+# caller keep this build instead of deleting it, and the plain failure is still
+# in the logs. Merging a slice that is knowingly incomplete would be worse than
+# stopping, so this returns before the re-fold either way.
+if [ "$resumable" -ne 0 ]; then
+  log "ABORT: a shard reported incomplete-but-resumable work (exit $resumable); not merging"
+  exit "$resumable"
+fi
 [ $fail -eq 0 ] || { log "ABORT: a shard failed"; exit 1; }
 
 FINAL="$OUT/final"
@@ -112,10 +152,20 @@ MERGE=(--src "$SRC" --final "$FINAL" --jar "$JAR" --command "$COMMAND" --mask "$
 for k in $(seq 0 $((N-1))); do MERGE+=(--shard "$OUT/shard-$k"); done
 [ -n "$WARM_DB" ]  && MERGE+=(--warm-db "$WARM_DB")
 [ -n "$WARM_GIT" ] && MERGE+=(--warm-git "$WARM_GIT")
+[ -n "$BLOB_TIMEOUT" ]  && MERGE+=(--blob-timeout "$BLOB_TIMEOUT")
+[ -n "$STALL_TIMEOUT" ] && MERGE+=(--stall-timeout "$STALL_TIMEOUT")
 
 log "merge + serial re-fold"
 python3 "$HERE/shard_merge.py" "${MERGE[@]}" 2>&1 | tee -a "$LOG"
 mrc=${PIPESTATUS[0]}
-[ "$mrc" -eq 0 ] || { log "ABORT: merge failed (exit $mrc)"; exit 1; }
+case "$mrc" in
+  0) ;;
+  "$TIMEOUT_RC"|"$STALL_RC")
+    # The re-fold is a blobExec run too, so it has the same two resumable
+    # statuses and they must survive this layer as well.
+    log "ABORT: re-fold reported incomplete-but-resumable work (exit $mrc)"
+    exit "$mrc" ;;
+  *) log "ABORT: merge failed (exit $mrc)"; exit 1 ;;
+esac
 
 log "=== DONE. final DB: $FINAL/blobmap.db  final git: $FINAL/dst.git ==="

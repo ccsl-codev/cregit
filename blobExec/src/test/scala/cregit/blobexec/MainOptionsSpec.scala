@@ -47,6 +47,48 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Set(0, 1, 2, 3) should not contain Walker.StalledExitStatus
   }
 
+  // -- the two timeouts are coupled -------------------------------------------
+  //
+  // A pure-blob commit's only progress stamp is a blob finishing or being killed,
+  // so the watchdog window must exceed the per-blob budget. The defaults (600 and
+  // 1800) satisfy it; following the advice to raise --blob-timeout to 1800 without
+  // touching the window would not, and a legitimately slow blob would then race
+  // its own watchdog.
+
+  test("a window larger than the budget is accepted unchanged") {
+    Main.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, 601, stallExplicit = true) shouldEqual Right(601)
+  }
+
+  test("the defaults satisfy the relationship") {
+    Main.resolveStallTimeout(
+      BlobExec.DefaultTimeoutSeconds,
+      Walker.DefaultStallTimeoutSeconds,
+      stallExplicit = false
+    ) shouldEqual Right(Walker.DefaultStallTimeoutSeconds)
+  }
+
+  test("a defaulted window is widened to fit a raised --blob-timeout") {
+    // The exact collision the printed advice used to create: --blob-timeout=1800
+    // against the 1800 default window.
+    Main.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
+    Main.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
+  }
+
+  test("an explicit window that is too small is refused, naming both values") {
+    val bad = Main.resolveStallTimeout(1800, 1800, stallExplicit = true)
+    bad.isLeft shouldBe true
+    val why = bad.swap.getOrElse("")
+    why should include("--stall-timeout=1800")
+    why should include("--blob-timeout=1800")
+    Main.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
+  }
+
+  test("widening cannot overflow Int") {
+    Main.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
+  }
+
   // -- the watchdog's decision ------------------------------------------------
 
   private val second = 1000000000L
