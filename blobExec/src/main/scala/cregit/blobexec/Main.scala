@@ -29,6 +29,19 @@ import java.nio.file.{Files, Paths}
  */
 object Main {
 
+  /** Memo `meta` key holding the cumulative number of blobs whose command was
+    * killed for exceeding its budget. Durable because the skip is durable. */
+  private[blobexec] val BlobsTimedOutMetaKey = "blobs_timed_out"
+
+  /** Exit status when any blob in this memo has ever timed out: the walk itself
+    * succeeded, but the output is incomplete and must not be validated. */
+  private[blobexec] val TimedOutExitStatus = 4
+
+  /** Value parser for `--blob-timeout=<seconds>`: a positive whole number of
+    * seconds, else None (which the caller reports and exits 1 on). */
+  private[blobexec] def parseBlobTimeout(spec: String): Option[Int] =
+    spec.toIntOption.filter(_ > 0)
+
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
@@ -39,9 +52,17 @@ object Main {
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
-      |                    killed and that single blob is left untokenized;
-      |                    the run continues, and --abort-on-error does not
-      |                    turn a timeout into a whole-run abort.
+      |                    killed (whole process group) and that single blob is
+      |                    left untokenized; the run continues, and
+      |                    --abort-on-error does not turn a timeout into a
+      |                    whole-run abort. The count is reported on the done
+      |                    line, recorded durably in the memo, and the process
+      |                    then exits ${TimedOutExitStatus} so the caller cannot
+      |                    publish a project whose tokens are incomplete.
+      |
+      |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
+      |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
+      |               but some blob timed out (output incomplete).
       |  --pipeline        use the look-ahead pipelined walker (producer runs
       |                    ahead so the blob-command pool stays saturated);
       |                    output is identical to the default serial walker
@@ -108,9 +129,9 @@ object Main {
         warmPath = Some(p)
       case t if t.startsWith("--blob-timeout=") =>
         val spec = t.stripPrefix("--blob-timeout=")
-        spec.toIntOption match {
-          case Some(secs) if secs > 0 => blobTimeoutSeconds = secs
-          case _ =>
+        parseBlobTimeout(spec) match {
+          case Some(secs) => blobTimeoutSeconds = secs
+          case None =>
             System.err.println(s"Error: --blob-timeout must be a positive whole number of seconds [$spec]")
             sys.exit(1)
         }
@@ -178,7 +199,12 @@ object Main {
         sys.exit(3)
     }
 
-    val stats = try {
+    // (stats, cumulative timed-out blobs recorded in this memo). The cumulative
+    // figure is durable on purpose: a timed-out blob is memoized as an identity
+    // row, so a later incremental run sees a cache hit, counts no timeout of its
+    // own, and would otherwise report a clean run over output that still carries
+    // raw source where tokens belong.
+    val (stats, timedOutTotal) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
       val walker = new Walker(
         src, dst, mapping, mask.r, command, abortOnError, parallelism,
@@ -186,7 +212,11 @@ object Main {
         destinationMayContainObjects = incremental,
         blobTimeoutSeconds = blobTimeoutSeconds
       )
-      walker.run()
+      val s = walker.run()
+      val prior = mapping.getMeta(BlobsTimedOutMetaKey).flatMap(_.toLongOption).getOrElse(0L)
+      val total = prior + s.blobsTimedOut
+      if (s.blobsTimedOut > 0) mapping.setMeta(BlobsTimedOutMetaKey, total.toString)
+      (s, total)
     } finally {
       mapping.close()
       dst.close()
@@ -206,10 +236,31 @@ object Main {
         s"originalBlobBytesCopied=${stats.originalBlobBytesCopied} " +
         s"originalBlobBytesAvoided=${stats.originalBlobBytesAvoided} " +
         s"refsProjected=${stats.refsProjected} " +
+        s"blobsTimedOut=${stats.blobsTimedOut} " +
+        s"blobsTimedOutCumulative=$timedOutTotal " +
         s"aborted=${stats.aborted}"
     )
 
-    if (stats.aborted) sys.exit(2)
+    if (timedOutTotal > 0) {
+      System.err.println(
+        s"blobExec: DO NOT PUBLISH: blobsTimedOut=${stats.blobsTimedOut} this run, " +
+          s"$timedOutTotal cumulative for this memo ($dbPath, meta['$BlobsTimedOutMetaKey']). " +
+          "Those blobs are recorded as identity rows, so their files carry raw source " +
+          "instead of tokens and a re-run will not retry them. Exiting 4 so the step " +
+          "fails loudly instead of validating a project with missing tokens. Re-run with " +
+          "a larger --blob-timeout after clearing those rows, or accept them deliberately."
+      )
+    }
+
+    // Always exit explicitly. A timed-out blob abandons its (daemon) reader
+    // threads while they are blocked on a pipe, and on the pre-fix build the
+    // JVM outlived the finished walk on exactly those threads — a silent stall
+    // behind a done-line that read `aborted=false`.
+    sys.exit(
+      if (stats.aborted) 2
+      else if (timedOutTotal > 0) TimedOutExitStatus
+      else 0
+    )
   }
 
   private def openSrc(path: java.nio.file.Path): FileRepository = {

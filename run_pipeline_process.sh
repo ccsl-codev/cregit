@@ -426,12 +426,32 @@ else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
+  # Capture the status instead of letting `set -e` take it: exit 4 means the
+  # walk completed but at least one blob's tokenizer was killed on its timeout,
+  # so those files hold raw source instead of tokens. That must stop the run
+  # here — steps 3-10 would otherwise build and validate an incomplete dataset —
+  # and it must leave a durable marker, because the skip is memoized and a
+  # re-run reports a clean walk.
+  BFG_RC=0
   java -jar "$BFG" $MODE_FLAG \
     "$REPO_PATH_ORIGINAL_BARE" \
     "$REPO_PATH_CREGIT_BARE" \
     "$DB_PATH_BLOBMAP" \
     "${CREGIT}/tokenizeByBlobId/tokenBySha.pl" \
-    "$MASK"
+    "$MASK" || BFG_RC=$?
+  if [ "$BFG_RC" -eq 4 ]; then
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-TIMEOUTS"
+    echo "blobExec exited 4: at least one blob timed out; see the blobsTimedOut" \
+         "count on its done line and meta['blobs_timed_out'] in ${DB_PATH_BLOBMAP}" \
+         >> "${WORK}/TOKENIZE-TIMEOUTS"
+    die "tokenize left blobs untokenized (blobExec exit 4). Refusing to continue:
+     the dataset would carry raw source in place of tokens. Marker written to
+     ${WORK}/TOKENIZE-TIMEOUTS. Investigate the timed-out blobs, then either
+     raise --blob-timeout and clear their rows from ${DB_PATH_BLOBMAP}, or
+     accept them deliberately by clearing meta['blobs_timed_out']."
+  elif [ "$BFG_RC" -ne 0 ]; then
+    die "tokenize failed (blobExec exit $BFG_RC)"
+  fi
 fi
 
 [ -d "$REPO_PATH_CREGIT_BARE" ] || die "tokenize did not produce $REPO_PATH_CREGIT_BARE"
