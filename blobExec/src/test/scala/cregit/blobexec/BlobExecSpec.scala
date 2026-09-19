@@ -145,6 +145,42 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     out shouldBe BlobExec.Outcome.Skip
   }
 
+  test("an orphan grandchild holding the pipes cannot outlive the timeout") {
+    // The real process shape, tokenBySha.pl -> sh -> srcml, where killing the
+    // direct child leaves grandchildren holding the JVM's stdout/stderr pipes,
+    // the reader threads blocked, and `exitValue()`'s join unreturnable. The
+    // background `sleep` is that grandchild. Only a process-group kill returns
+    // near the budget; a destroy() of the direct child alone would park here
+    // until the JVM-side backstop latch, far past this assertion.
+    val cmd     = shellScript("sleep 30 & sleep 30")
+    val started = System.currentTimeMillis()
+    val (exit, _, _) = BlobExec.invoke(
+      "irrelevant".getBytes(UTF_8), "0" * 40, "input.java", "input.java", cmd, timeoutSeconds = 1)
+    val elapsed = System.currentTimeMillis() - started
+    assert(elapsed < 10000, s"invoke took ${elapsed}ms; the process group was not killed")
+    exit shouldEqual BlobExec.TimeoutExitCode
+  }
+
+  test("a timeout is reported to the caller exactly once, and only on a timeout") {
+    val timeouts = new java.util.concurrent.atomic.AtomicInteger(0)
+
+    val hanging = shellScript("sleep 30")
+    BlobExec.run("anything".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", hanging,
+                 abortOnError = false, inserter, timeoutSeconds = 1,
+                 onTimeout = () => { timeouts.incrementAndGet(); () }) shouldBe BlobExec.Outcome.Skip
+    timeouts.get shouldEqual 1
+
+    // A healthy blob and an honestly failing one must leave the count alone,
+    // or a project would be held back from publication for nothing.
+    BlobExec.run("hello".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", shellScript("tr a-z A-Z"),
+                 abortOnError = false, inserter, timeoutSeconds = 30,
+                 onTimeout = () => { timeouts.incrementAndGet(); () })
+    BlobExec.run("hello".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", shellScript("exit 7"),
+                 abortOnError = false, inserter, timeoutSeconds = 30,
+                 onTimeout = () => { timeouts.incrementAndGet(); () })
+    timeouts.get shouldEqual 1
+  }
+
   // tiny `inside` helper to keep the test bodies readable
   private def inside[T](v: T)(pf: PartialFunction[T, Unit]): Unit =
     if (pf.isDefinedAt(v)) pf(v) else fail(s"value did not match: $v")

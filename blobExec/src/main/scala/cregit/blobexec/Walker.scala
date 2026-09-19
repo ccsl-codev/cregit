@@ -20,6 +20,10 @@ final case class WalkStats(
     blobsCacheHit: Int,
     refsProjected: Int,
     aborted: Boolean,
+    /** Blobs whose command was killed for exceeding its budget. Each one is a
+      * file left holding raw source instead of tokens, so a non-zero count must
+      * reach the caller rather than living only in stderr. */
+    blobsTimedOut: Long,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
     originalBlobCopies: Long,
@@ -55,6 +59,7 @@ final class Walker(
   private val dbLock = new AnyRef
 
   private val blobCommandExecutions          = new LongAdder
+  private val blobsTimedOut                  = new LongAdder
   private val originalBlobCopyRequests       = new LongAdder
   private val originalBlobCopies             = new LongAdder
   private val originalBlobAlreadyPresent     = new LongAdder
@@ -75,12 +80,8 @@ final class Walker(
     * serving neighbouring commits, plus a fixed floor for read/insert time.
     * Overrunning it means something is wedged beyond the per-blob kill, and a
     * loud TimeoutException beats a silent multi-day stall. */
-  private def awaitBudget(blobCount: Int): Duration = {
-    val p       = math.max(1, parallelism)
-    val waves   = (math.max(0, blobCount).toLong + p - 1) / p
-    val perBlob = math.max(1, blobTimeoutSeconds).toLong
-    Duration(math.min((2L * waves + 10L) * perBlob, MaxAwaitBudgetSeconds), SECONDS)
-  }
+  private def awaitBudget(blobCount: Int): Duration =
+    Duration(Walker.awaitBudgetSeconds(blobCount, parallelism, blobTimeoutSeconds), SECONDS)
 
   private val originalBlobCache = new AtomicReferenceArray[OriginalBlobCacheEntry](OriginalBlobCacheSize)
   private val originalBlobCopyLocks = Array.fill[AnyRef](OriginalBlobCopyLockCount)(new AnyRef)
@@ -119,6 +120,7 @@ final class Walker(
         blobsCacheHit          = blobsHit,
         refsProjected          = refsCount,
         aborted                = aborted,
+        blobsTimedOut          = blobsTimedOut.sum(),
         blobCommandExecutions       = blobCommandExecutions.sum(),
         originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
         originalBlobCopies          = originalBlobCopies.sum(),
@@ -154,6 +156,7 @@ final class Walker(
       blobsCacheHit          = blobsHit,
       refsProjected          = 0,     // shards deliberately never project refs
       aborted                = aborted,
+      blobsTimedOut          = blobsTimedOut.sum(),
       blobCommandExecutions       = blobCommandExecutions.sum(),
       originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
       originalBlobCopies          = originalBlobCopies.sum(),
@@ -667,7 +670,8 @@ final class Walker(
         command      = command,
         abortOnError = abortOnError,
         inserter     = workerInserter,
-        timeoutSeconds = blobTimeoutSeconds
+        timeoutSeconds = blobTimeoutSeconds,
+        onTimeout      = () => blobsTimedOut.increment()
       )
       val res = outcome match {
         case BlobExec.Outcome.Skip =>
@@ -804,7 +808,8 @@ final class Walker(
             command      = command,
             abortOnError = abortOnError,
             inserter     = workerInserter,
-            timeoutSeconds = blobTimeoutSeconds
+            timeoutSeconds = blobTimeoutSeconds,
+            onTimeout      = () => blobsTimedOut.increment()
           )
           // For Skip outcomes (identical output OR non-zero exit with
           // abortOnError=false) we keep the original blob id, so the dst
@@ -1239,9 +1244,29 @@ object Walker {
     * memory stays modest. */
   private val PipelineWindow = 32
 
-  /** Hard ceiling on [[Walker.awaitBudget]], so the arithmetic stays inside
+  /** Hard ceiling on [[awaitBudgetSeconds]], so the arithmetic stays inside
     * `Duration`'s nanosecond range on pathologically large commits. */
-  private val MaxAwaitBudgetSeconds = 30L * 24L * 3600L  // 30 days
+  private[blobexec] val MaxAwaitBudgetSeconds = 30L * 24L * 3600L  // 30 days
+
+  /** Pure form of the per-commit await budget, in seconds; see the instance
+    * method `Walker.awaitBudget` for why it is shaped this way. Extracted so
+    * the formula can be tested without standing up a repository. */
+  private[blobexec] def awaitBudgetSeconds(
+      blobCount: Int,
+      parallelism: Int,
+      blobTimeoutSeconds: Int
+  ): Long = {
+    val p       = math.max(1, parallelism)
+    val waves   = (math.max(0, blobCount).toLong + p - 1) / p
+    val perBlob = math.max(1, blobTimeoutSeconds).toLong
+    val factor  = 2L * waves + 10L
+    // Saturating multiply: `factor * perBlob` overflows Long on absurd inputs
+    // (a huge commit plus a huge --blob-timeout), and a negative budget would
+    // make `Await.result` throw immediately instead of waiting. Same result as
+    // the plain product for every input that does not overflow.
+    if (factor > MaxAwaitBudgetSeconds / perBlob) MaxAwaitBudgetSeconds
+    else math.min(factor * perBlob, MaxAwaitBudgetSeconds)
+  }
 
   /** Immutable snapshot of a RevCommit, so the consumer never reaches back
     * into the single-threaded RevWalk that the producer is iterating. */
