@@ -39,6 +39,33 @@ ORDER BY file_path, token_index;
 | `token_value` | `TEXT` | srcml2token | Normalised token value with whitespace stripped. For content tokens this is the text after the `\|` separator (e.g. `main`, `int`, `"hello"`). For structural tokens it may be identical to `token_type`. |
 | `is_structural` | `INTEGER` | computed | `1` for structural markers (file boundaries, function boundaries, declarations), `0` for actual code content. Use `WHERE is_structural = 0` to count only real code tokens. |
 
+### Per-project provenance
+
+Written only when `--project-meta` names a JSON sidecar (produced by
+`cregit-token-pipeline/project_meta.py`) and the project is keyed in it by
+`--project-key`; otherwise every column here is the empty string, so the column
+set does not depend on the caller. All 29 are `TEXT`, they are constants per
+file, and they repeat per row by design: a reader can filter a corpus without a
+second join against `candidates.csv`.
+
+| Column | Description |
+|--------|-------------|
+| `clone_url` | Clone URL the project was selected by. `repo_name` is a lossy slug; this is not. |
+| `provenance_status` | `candidates.csv` for a corpus project, or a flag such as `fixture-needs-rework` for a development fixture that shares the output directory. |
+| `source` | Which roster or search found the project. |
+| `stratum` | Sampling stratum the project was assigned. |
+| `fact` | The evidence for that assignment. |
+| `contested` | Whether two sources disagreed on the stratum. |
+| `label_date` | When the stratum was assigned. |
+| `owner`, `repo` | GitHub owner and repository name. |
+| `roster_name`, `roster_lang` | Name and language as the roster spelled them. |
+| `language` | Primary language reported by GitHub. |
+| `commits`, `size_class`, `size_kb`, `stars`, `pushed_at` | Repository metrics at selection time. |
+| `license`, `owner_type`, `archived`, `fork` | Repository attributes at selection time. |
+| `history_cluster`, `history_shared_with`, `history_relation`, `history_includes`, `history_first`, `history_created` | Shared-history analysis: projects that share commit history are not independent observations. |
+| `manifest_category` | The category column of the corpus manifest row. |
+| `file_mask` | The regex this project was tokenized with. Without it nobody can tell which rows came from which mask after a mask widening. |
+
 ### Git commit metadata
 
 | Column | Type | Source | Description |
@@ -247,6 +274,8 @@ uv run python generate_dataset/generate_dataset.py \
 | `--persons-db` | yes | Path to `persons.db` (Step 6 output). |
 | `--output` | yes | Output Parquet file path. |
 | `--repo-name` | no | Repository name. Default: inferred from output filename. |
+| `--project-meta` | no | JSON sidecar of per-project provenance, from `project_meta.py`. Omit and those columns are written empty. |
+| `--project-key` | no | Which key of the sidecar this project is. Default: `--repo-name`. A key the sidecar does not hold is an error, not a blank row. |
 | `--verbose` | no | Enable info-level logging to stderr. |
 
 ## Cross-reference: Perl ↔ Python
