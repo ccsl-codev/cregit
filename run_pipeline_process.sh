@@ -642,8 +642,12 @@ end_step
 step "clone non-bare working clones"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -f "$DB_PATH_PERSONS" ] || die "step 5 did not produce $DB_PATH_PERSONS"
-git clone $REPO_PATH_ORIGINAL_BARE $REPO_PATH_ORIGINAL
-git clone $REPO_PATH_CREGIT_BARE $REPO_PATH_CREGIT
+# GitHub's LFS no longer serves some objects in this corpus, and a smudge
+# failure exits 128 — which the EXIT trap then answers by deleting a finished
+# step 2. The tokenizer never reads LFS payloads: the mask selects source
+# files, and the pointers are enough to walk the tree.
+GIT_LFS_SKIP_SMUDGE=1 git clone $REPO_PATH_ORIGINAL_BARE $REPO_PATH_ORIGINAL
+GIT_LFS_SKIP_SMUDGE=1 git clone $REPO_PATH_CREGIT_BARE $REPO_PATH_CREGIT
 fi
 end_step
 
