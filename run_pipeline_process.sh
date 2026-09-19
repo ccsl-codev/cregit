@@ -432,12 +432,14 @@ else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
-  # Capture the status instead of letting `set -e` take it: exit 4 means the
-  # walk completed but at least one blob's tokenizer was killed on its timeout,
-  # so those files hold raw source instead of tokens. That must stop the run
-  # here — steps 3-10 would otherwise build and validate an incomplete dataset —
-  # and it must leave a durable marker, because the skip is memoized and a
-  # re-run reports a clean walk.
+  # Capture the status instead of letting `set -e` take it. Two statuses need
+  # their own message:
+  #   4 = a blob's tokenizer was killed on its budget, so those files would hold
+  #       raw source instead of tokens. The walk stopped at that commit and
+  #       recorded nothing for it, so re-running retries just those blobs. Stop
+  #       here: steps 3-10 would otherwise build and validate an incomplete
+  #       dataset.
+  #   5 = the stall watchdog killed a run that stopped making progress.
   BFG_RC=0
   java -jar "$BFG" $MODE_FLAG \
     "$REPO_PATH_ORIGINAL_BARE" \
@@ -448,13 +450,23 @@ else
   if [ "$BFG_RC" -eq 4 ]; then
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-TIMEOUTS"
     echo "blobExec exited 4: at least one blob timed out; see the blobsTimedOut" \
-         "count on its done line and meta['blobs_timed_out'] in ${DB_PATH_BLOBMAP}" \
-         >> "${WORK}/TOKENIZE-TIMEOUTS"
+         "count and the 'will retry on the next run' lines in this step's log." \
+         "Nothing was recorded for the containing commit, so re-running retries" \
+         "those blobs." >> "${WORK}/TOKENIZE-TIMEOUTS"
     die "tokenize left blobs untokenized (blobExec exit 4). Refusing to continue:
      the dataset would carry raw source in place of tokens. Marker written to
-     ${WORK}/TOKENIZE-TIMEOUTS. Investigate the timed-out blobs, then either
-     raise --blob-timeout and clear their rows from ${DB_PATH_BLOBMAP}, or
-     accept them deliberately by clearing meta['blobs_timed_out']."
+     ${WORK}/TOKENIZE-TIMEOUTS. Recovery: run this same command again — the
+     timed-out blobs are retried automatically and no database surgery is
+     needed. If they keep timing out, the tokenizer is too slow for them:
+     raise blobExec's --blob-timeout."
+  elif [ "$BFG_RC" -eq 5 ]; then
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-STALLED"
+    echo "blobExec exited 5: the stall watchdog fired. The STALLED line in this" \
+         "step's log names the work that was in flight." >> "${WORK}/TOKENIZE-STALLED"
+    die "tokenize stalled and was killed by blobExec's watchdog (exit 5). The
+     memo is durable, so re-running resumes from where it stopped. The STALLED
+     line in this step's log names the blobs that were in flight; if one of them
+     is pathological, raise --blob-timeout or exclude it via --mask."
   elif [ "$BFG_RC" -ne 0 ]; then
     die "tokenize failed (blobExec exit $BFG_RC)"
   fi
