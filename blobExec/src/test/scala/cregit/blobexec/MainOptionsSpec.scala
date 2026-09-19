@@ -47,19 +47,45 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Set(0, 1, 2, 3) should not contain Walker.StalledExitStatus
   }
 
-  // -- the stall window's floor -----------------------------------------------
-  //
-  // The watchdog counts completed work, and a blob is the smallest thing that
-  // completes, so a stall window shorter than one blob's lifetime kills healthy
-  // runs. That is the trap the "raise --blob-timeout" recovery advice leads to.
+  // -- the two timeouts are coupled -------------------------------------------
 
-  test("the floor clears one blob's whole lifetime, kill grace included") {
-    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
-    Walker.stallFloorFor(1) should be > ChildRunner.maxLifetimeSeconds(1)
+  test("a window larger than the budget is accepted unchanged") {
+    Main.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, 601, stallExplicit = true) shouldEqual Right(601)
   }
 
-  test("the default window already clears the default blob budget") {
-    Walker.DefaultStallTimeoutSeconds should be >= Walker.stallFloorFor(BlobExec.DefaultTimeoutSeconds)
+  test("the defaults satisfy the relationship") {
+    Main.resolveStallTimeout(
+      BlobExec.DefaultTimeoutSeconds,
+      Walker.DefaultStallTimeoutSeconds,
+      stallExplicit = false
+    ) shouldEqual Right(Walker.DefaultStallTimeoutSeconds)
+  }
+
+  test("a defaulted window is widened to fit a raised --blob-timeout") {
+    Main.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
+    Main.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
+  }
+
+  test("an explicit window that is too small is refused, naming both values") {
+    val bad = Main.resolveStallTimeout(1800, 1800, stallExplicit = true)
+    bad.isLeft shouldBe true
+    val why = bad.swap.getOrElse("")
+    why should include("--stall-timeout=1800")
+    why should include("--blob-timeout=1800")
+    Main.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
+  }
+
+  test("widening cannot overflow Int") {
+    Main.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
+  }
+
+  // -- the stall window's floor -----------------------------------------------
+
+  test("the floor clears one blob's whole lifetime, kill path included") {
+    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
+    Walker.stallFloorFor(1) should be > ChildRunner.maxLifetimeSeconds(1)
   }
 
   test("the default window is derived from the blob budget, not a second literal") {
@@ -72,16 +98,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Walker.stallTimeoutFor(1) should be >= Walker.stallFloorFor(1)
   }
 
-  test("the accepted range of a timeout keeps every derived window inside Int") {
-    Main.parsePositiveSeconds((Main.MaxTimeoutSeconds + 1).toString) shouldEqual None
-    Main.parsePositiveSeconds(Int.MaxValue.toString) shouldEqual None
-    Walker.stallTimeoutFor(Main.MaxTimeoutSeconds) should be > 0
-    ChildRunner.maxLifetimeSeconds(Main.MaxTimeoutSeconds) should be > 0
-  }
-
   test("a blob budget past the default window raises the floor above it") {
-    // `--blob-timeout=3600` with the default 1800s window is the configuration
-    // that used to halt a healthy run at exit 5.
     Walker.stallFloorFor(3600) should be > Walker.DefaultStallTimeoutSeconds
   }
 
@@ -96,6 +113,13 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     val floor      = Walker.stallFloorFor(blobBudget)
     val quiet      = ChildRunner.maxLifetimeSeconds(blobBudget).toLong * 1000000000L
     Walker.isStalled(nowNanos = quiet, lastProgressNanos = 0L, floor) shouldBe false
+  }
+
+  test("the accepted range of a timeout keeps every derived window inside Int") {
+    Main.parsePositiveSeconds((Main.MaxTimeoutSeconds + 1).toString) shouldEqual None
+    Main.parsePositiveSeconds(Int.MaxValue.toString) shouldEqual None
+    Walker.stallTimeoutFor(Main.MaxTimeoutSeconds) should be > 0
+    ChildRunner.maxLifetimeSeconds(Main.MaxTimeoutSeconds) should be > 0
   }
 
   // -- the watchdog's decision ------------------------------------------------
