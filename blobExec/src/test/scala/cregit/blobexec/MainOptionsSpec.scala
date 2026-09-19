@@ -89,6 +89,55 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
   }
 
+  // -- which counters gate publication ----------------------------------------
+  //
+  // The denylist only earns its place if it does NOT gate the exit status: the
+  // four blobs it holds hang srcml, the timeout path answers that with exit 4
+  // ("incomplete, do not publish"), and a project cannot sit unpublishable
+  // forever over a diagnosed third-party parser bug. A timeout is different — it
+  // is a hang nobody has explained — and it must keep blocking.
+
+  private def stats(
+      aborted: Boolean = false,
+      blobsTimedOut: Long = 0L,
+      blobsOversized: Long = 0L,
+      blobsDenylisted: Long = 0L
+  ) = WalkStats(
+    commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = 1,
+    blobsCacheHit = 0, refsProjected = 1, aborted = aborted,
+    blobsTimedOut = blobsTimedOut, blobsOversized = blobsOversized,
+    blobsDenylisted = blobsDenylisted, blobCommandExecutions = 1,
+    originalBlobCopyRequests = 0, originalBlobCopies = 0,
+    originalBlobAlreadyPresent = 0, originalBlobCacheHits = 0,
+    originalBlobDestinationLookups = 0, originalBlobBytesCopied = 0,
+    originalBlobBytesAvoided = 0)
+
+  test("a clean walk exits 0") {
+    Main.exitStatus(stats()) shouldEqual 0
+  }
+
+  test("denylisted blobs do not change the exit status, at any count") {
+    Main.exitStatus(stats(blobsDenylisted = 1)) shouldEqual 0
+    Main.exitStatus(stats(blobsDenylisted = 4)) shouldEqual 0
+    Main.exitStatus(stats(blobsDenylisted = 1000)) shouldEqual 0
+  }
+
+  test("oversized blobs do not change it either, unchanged from before") {
+    Main.exitStatus(stats(blobsOversized = 3)) shouldEqual 0
+    Main.exitStatus(stats(blobsOversized = 3, blobsDenylisted = 4)) shouldEqual 0
+  }
+
+  test("a timeout still blocks publication, even alongside a denylisted blob") {
+    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual Main.TimedOutExitStatus
+    Main.exitStatus(stats(blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual
+      Main.TimedOutExitStatus
+  }
+
+  test("an abort still wins over everything") {
+    Main.exitStatus(stats(aborted = true)) shouldEqual 2
+    Main.exitStatus(stats(aborted = true, blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual 2
+  }
+
   // -- the watchdog's decision ------------------------------------------------
 
   private val second = 1000000000L

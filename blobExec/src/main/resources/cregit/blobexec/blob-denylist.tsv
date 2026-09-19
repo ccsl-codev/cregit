@@ -1,0 +1,69 @@
+# blobExec blob denylist — blobs excluded from the rewrite by content id.
+#
+# A denylisted blob is never handed to the tokenizer. It is dropped from every
+# rewritten tree, exactly like an oversized blob (Walker.readBlob), so the file is
+# ABSENT from the tokenized repository rather than present as raw source: it
+# produces no blame and no dataset row. It is counted separately from
+# blobsOversized and blobsTimedOut, logged once with its sha, path and reason, and
+# it does NOT affect the exit status. That last point is the difference between
+# this list and a timeout: an entry here is a diagnosed, deterministic, cited
+# exclusion, while a timeout is a hang nobody has explained yet and must keep
+# blocking publication.
+#
+# This is a DATA file, not a constant in the code, so a paper can cite the list
+# itself. It is loaded from the classpath (BlobDenylist.ResourcePath) and shipped
+# inside the assembly jar, so adding an entry means editing this file and running
+# `sbt assembly`. Nothing at run time can extend or override it: an undocumented
+# exclusion is the one thing that would make the dataset's omissions unauditable.
+#
+# FORMAT: three TAB-separated fields. Blank lines and lines starting with # are
+# ignored. Leading and trailing whitespace on a field is stripped.
+#
+#     <git blob sha1, 40 lowercase hex>  <citation>  <one-line reason>
+#
+# The key is the GIT BLOB id, which is what the walker has in hand
+# (Walker.BlobMissTask.origId) and what blobExec's own timeout line prints. It is
+# not the memo's key: tokenizeByBlobId/tokenBySha.pl hashes the file contents
+# alone, with no git object header.
+#
+# The key is deliberately NOT the path. One of the entries below is the same
+# source file at two different paths, moved by an OpenJDK repository
+# reorganisation, and a path-keyed list would have to be updated every time a
+# project moves a file. Content is the stable identity. The paths are recorded
+# here for a reader rather than matched on:
+#
+#   test/langtools/tools/javac/annotations/typeAnnotations/classfile/TestNewCastArray.java
+#       2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65   14,503 B
+#   langtools/test/tools/javac/annotations/typeAnnotations/classfile/TestNewCastArray.java
+#       303c1a109f1fdc4b9d84e15111c56931202844ac   14,506 B
+#       504aaf9109fc01d6d62d99ac529ded99a8dfa8ca   14,451 B
+#       c91924d1e87cb82d372a73b24579ccc34609efaa   14,450 B
+#
+# All four are historical versions of ONE file in tencent__tencentkona-21
+# (OpenJDK-derived, 50,663 .java files at HEAD, 147,265 blobs recorded). It is a
+# compiler regression test, @bug 8005681 "Repeated annotations on new,array,cast",
+# whose stated purpose is to stress exactly the grammar that breaks the parser. It
+# is not production source and carries no contributor-behaviour signal.
+#
+# The root cause is written up, with measurements and the upstream citation, in
+# cregit-token-pipeline/.superpowers/sdd/peppy-pondering-music/
+# srcml-nontermination-analysis.md. In short: srcML 1.1.0 does not terminate on a
+# local variable declaration whose declared type is a multi-dimensional array
+# carrying a type annotation on its first dimension when the initializer is an
+# array-creation expression that also carries one — minimal reproducer
+# `String @A [] [] s = new String @A [2] [2];`. It is non-termination, not
+# slowness: 0 bytes of output, one core at 101%, resident memory flat at
+# 10,544 kB, at every budget from 5 s to 600 s. Upstream srcML/srcML#2361 is open
+# with no patch, and v1.1.0 (2025-08-14) is the latest release, so there is
+# nothing to upgrade to. A working patch was built and validated at 12,016/12,016
+# byte-identical blobs, and was deliberately NOT adopted, on provenance grounds:
+# see srcml-upstream-fix-adjudication.md.
+#
+# Re-verified against the pinned binary on 2026-09-19: each of the four blobs
+# produced 0 bytes and was killed at a 15 s budget.
+#
+# sha	citation	reason
+2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar
+303c1a109f1fdc4b9d84e15111c56931202844ac	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar
+504aaf9109fc01d6d62d99ac529ded99a8dfa8ca	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar
+c91924d1e87cb82d372a73b24579ccc34609efaa	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar

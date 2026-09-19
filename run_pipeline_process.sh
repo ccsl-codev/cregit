@@ -39,6 +39,23 @@ Target repository:
                     resume instead, keeping the memo, the bare repos and the
                     blob map — that is how a tokenize timeout or stall is
                     recovered without redoing the work.
+  --memo-dir DIR    where to memoize tokenized blobs (default: <work>/memo).
+                    Pass a directory OUTSIDE --work and no FROM_STEP=1 wipe can
+                    reach it, so a from-scratch rebuild still gets every memo
+                    hit. That matters when the mask changes: blobExec refuses to
+                    resume against a different mask, so the whole project must be
+                    rebuilt — but a memo hit returns without invoking srcml at
+                    all (tokenizeByBlobId/tokenBySha.pl), which turns a cold
+                    tokenize back into a commit walk. torvalds__linux's memo
+                    holds ~2.6 million entries against 3,228,137 blobs.
+                    ONE DIRECTORY PER REPOSITORY. The memo key is sha1 of the
+                    file's CONTENT with no extension in it, so two repositories
+                    sharing a directory would serve each other's entries, and
+                    identical content under a different extension is a different
+                    language and different tokens.
+                    A step-1 wipe that would delete a memo holding 10,000 entries
+                    or more (MEMO_KEEP_THRESHOLD, overridable as
+                    CREGIT_MEMO_KEEP_THRESHOLD) is refused; see --force-clean.
   --blob-timeout N  wall-clock budget in seconds for one blob's tokenizer
                     (blobExec default: 600). A child that exceeds it is killed,
                     that blob is left untokenized, step 2 stops with exit 4 and
@@ -51,10 +68,12 @@ Target repository:
                     --blob-timeout; blobExec refuses an explicit value that is
                     not, and raises a defaulted one. Also CREGIT_STALL_TIMEOUT.
   --force-clean     allow the FROM_STEP=1 wipe even when $WORK holds a
-                    TOKENIZE-TIMEOUTS or TOKENIZE-STALLED marker. Without this
-                    the runner refuses, because those markers mean the work is
-                    incomplete but resumable at step 2, and deleting it means
-                    re-tokenizing everything to retry a few blobs.
+                    TOKENIZE-TIMEOUTS or TOKENIZE-STALLED marker, or a memo big
+                    enough to be worth keeping. Without this the runner refuses:
+                    those markers mean the work is incomplete but resumable at
+                    step 2, and deleting it means re-tokenizing everything to
+                    retry a few blobs, while deleting a large memo means
+                    re-tokenizing from cold what is already tokenized.
 
 Output:
   --skip-html       do not generate the HTML views (step 9). The views cost
@@ -189,6 +208,10 @@ REPO_COMMIT_URL=""
 # untokenized. Resolved after argument parsing, so --mask still wins.
 MASK=""
 WORK="../cregit-files"
+# Empty means "<work>/memo", resolved after argument parsing because it depends on
+# --work. A caller that wants the memo to survive a FROM_STEP=1 wipe passes a
+# directory outside $WORK; nothing else about the run changes.
+MEMO_DIR=""
 SKIP_HTML=0
 GC_MODE="plain"
 # Empty means "do not pass the flag", so generate_dataset.py keeps its own
@@ -225,6 +248,76 @@ keep_markers_present() {
         fi
     done
     return 1
+}
+
+# How many memoized tokenizations make a memo directory too expensive to delete
+# on a default flag. A memo hit returns without invoking srcml at all
+# (tokenizeByBlobId/tokenBySha.pl), so the entries ARE the tokenizing already
+# done. Measured on this machine, 2026-09-19, non-empty memos in corpus-files:
+# jq 1,813 | libuv 13,381 | zstd 15,091 | tmux 26,976 |
+# tencent__tencentkona-21 89,453 | torvalds__linux ~2,600,000 (>= 200,001 counted).
+# 10,000 sits above the smallest of those and far below the two that matter.
+# Overridable so the guard can be tested without planting 10,000 files.
+MEMO_KEEP_THRESHOLD="${CREGIT_MEMO_KEEP_THRESHOLD:-10000}"
+
+# Canonical form of a path, whether or not it exists yet. Used to decide whether
+# the memo sits inside $WORK: a textual comparison answers that wrongly whenever
+# the two are spelled differently (one relative, one absolute), and the wrong
+# answer here is a silently deleted memo.
+canonical_path() {
+    readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# memo_entries_at_least <dir> <n>: true when <dir> holds at least <n> entries.
+# Counts at most <n> and stops: torvalds__linux's memo holds ~2.6 million files,
+# and a full count would be minutes of stat() before the run has even started.
+# find dies of SIGPIPE when head closes the pipe, which `|| true` absorbs so
+# `set -o pipefail` does not abort the script.
+memo_entries_at_least() {
+    local dir=$1 n=$2 count
+    [ -d "$dir" ] || return 1
+    # Entries are <memo>/xx/yy/<sha1-of-contents>, so depth 3 counts memoized
+    # tokenizations and nothing else.
+    count=$( { find "$dir" -mindepth 3 -maxdepth 3 -type f -print 2>/dev/null || true; } \
+             | head -n "$n" | wc -l )
+    [ "$count" -ge "$n" ]
+}
+
+# True when the memo lives inside $WORK, so a wipe of $WORK would take it too.
+memo_inside_work() {
+    local cw cm
+    cw=$(canonical_path "$WORK")
+    cm=$(canonical_path "$MEMO_DIR")
+    case "$cm" in
+        "$cw"|"$cw"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Prints the memo directory and returns 0 when deleting $WORK would destroy a
+# memo worth keeping. The partner's instruction was "create exceptions for the
+# rm -rf for the Linux run": losing 2.6 million memoized tokenizations must not
+# be possible by leaving a flag off.
+memo_at_risk() {
+    [ -n "$MEMO_DIR" ] || return 1
+    memo_inside_work || return 1
+    memo_entries_at_least "$MEMO_DIR" "$MEMO_KEEP_THRESHOLD" || return 1
+    printf '%s' "$MEMO_DIR"
+}
+
+# The recovery the guard prints, and the whole reason --memo-dir exists.
+memo_rescue_advice() {
+    cat <<EOF
+     Move it out of the way first, then this run keeps every memo hit:
+       mv "$MEMO_DIR" /some/other/place/${REPO_NAME:-repo}-memo
+       $0 --repo-url <url> --work $WORK --memo-dir /some/other/place/${REPO_NAME:-repo}-memo [same flags]
+       ctp.py: python3 ./ctp.py run [same flags] --memo-dir /some/other/place
+     A memo hit returns without invoking srcml at all, so this is the difference
+     between re-walking the commits and tokenizing the whole repository again.
+     ONE DIRECTORY PER REPOSITORY: the memo key is sha1 of the file contents and
+     carries no repository and no extension.
+     Delete it deliberately instead: --force-clean (or rm -rf "$MEMO_DIR").
+EOF
 }
 
 # tokenize_gate <exit status> <what ran>: turn blobExec's two "incomplete but
@@ -298,6 +391,7 @@ while [ $# -gt 0 ]; do
         --commit-url) need_val "$@"; REPO_COMMIT_URL="$2"; shift 2 ;;
         --mask)       need_val "$@"; MASK="$2"; shift 2 ;;
         --work)       need_val "$@"; WORK="$2"; shift 2 ;;
+        --memo-dir)   need_val "$@"; MEMO_DIR="$2"; shift 2 ;;
         --skip-html)  SKIP_HTML=1; shift ;;
         --force-clean) FORCE_CLEAN=1; shift ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
@@ -403,6 +497,23 @@ if [ "$BUILD_ONLY" = 0 ]; then
     case "$WORK" in
         /|.|..|'') echo "refusing unsafe --work: '$WORK'" >&2; exit 2 ;;
     esac
+fi
+
+# Resolve the memo location now that --work is final. The default is unchanged
+# from before this option existed, so a caller that does not pass --memo-dir gets
+# exactly the old layout and the old behaviour.
+if [ -z "$MEMO_DIR" ]; then
+    MEMO_DIR="${WORK}/memo"
+else
+    case "$MEMO_DIR" in
+        /|.|..) echo "refusing unsafe --memo-dir: '$MEMO_DIR'" >&2; exit 2 ;;
+    esac
+    # An explicit memo dir inside $WORK is legal but pointless, and saying so is
+    # cheaper than discovering it after a wipe.
+    if memo_inside_work; then
+        log "warning: --memo-dir $MEMO_DIR is inside $WORK, so a FROM_STEP=1 run still deletes it"
+        log "warning: pass a directory outside $WORK for a memo that survives the wipe"
+    fi
 fi
 
 case "$MODE" in
@@ -533,11 +644,20 @@ cleanup() {
         # this the exit-4 / exit-5 die below would delete the marker it just
         # wrote, plus the memo, the bare repos and the blob map it promises are
         # still there — the work the operator is told to resume from.
-        local marker
+        local marker memo
         if marker=$(keep_markers_present); then
             log "Pipeline failed (exit $ec) — keeping $WORK: $marker says the work is resumable"
             log "Resume with FROM_STEP=2 (runner: append '2'; ctp.py: --from-step 2),"
             log "or discard it deliberately with --force-clean."
+            return 0
+        fi
+        # Same reasoning, for the memo rather than the markers: a failed run must
+        # not be the thing that deletes 2.6 million memoized tokenizations. There
+        # is no marker to write here — the memo itself is the evidence.
+        if memo=$(memo_at_risk); then
+            log "Pipeline failed (exit $ec) — keeping $WORK: $memo holds at least" \
+                "$MEMO_KEEP_THRESHOLD memoized tokenizations"
+            log "Move the memo out with --memo-dir, or discard it with --force-clean."
             return 0
         fi
         log "Pipeline failed (exit $ec) — removing $WORK for a clean restart"
@@ -563,12 +683,25 @@ if [ "$FROM_STEP" = "1" ] && [ -d "$WORK" ] && [ -n "$WORK" ] && [ "$WORK" != "/
        $0 --force-clean [same flags]
      (or remove $marker by hand)"
     fi
+    # Losing a large memo is the second expensive mistake, and unlike the markers
+    # it is not written by a failure: a perfectly healthy, fully validated project
+    # carries one. The mask changed corpus-wide on 2026-09-19 and blobExec refuses
+    # to resume against a different mask, so every re-run of those projects is a
+    # FROM_STEP=1 run — which is exactly when this fires. Checked after the marker
+    # so a resumable directory still gets the more useful advice.
+    if memo=$(memo_at_risk) && [ "$FORCE_CLEAN" != "1" ]; then
+        die "refusing to delete $WORK: $memo holds at least $MEMO_KEEP_THRESHOLD memoized
+     tokenizations, and deleting them means tokenizing this repository from cold.
+$(memo_rescue_advice)"
+    fi
     rm -rf "$WORK"
 fi
 
 LOG_FILE="${WORK}/pipeline.log"
-mkdir -p $WORK/memo $WORK/blame
-# memo/ is mandatory: tokenizeByBlobId/tokenBySha.pl dies without BFG_MEMO_DIR.
+mkdir -p "$MEMO_DIR" "$WORK/blame"
+# The memo is mandatory: tokenizeByBlobId/tokenBySha.pl dies without BFG_MEMO_DIR,
+# and refuses to run if the directory does not exist. It defaults to $WORK/memo
+# and lives wherever --memo-dir says, which may be outside $WORK entirely.
 # html/ is only created when step 9 will actually write into it.
 [ "$SKIP_HTML" = 1 ] || mkdir -p $WORK/html
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -578,6 +711,11 @@ echo "████████████████████████�
 echo "  CreGit Pipeline — ${REPO_NAME} (tokenize mode: ${MODE}, file jobs: ${JOBS})"
 echo "  Repo: ${REPO_GIT_URL}"
 echo "  Mask: ${MASK}   Commit links: ${REPO_COMMIT_URL}"
+if memo_inside_work; then
+    echo "  Memo: ${MEMO_DIR}  (inside the work dir: a FROM_STEP=1 run deletes it)"
+else
+    echo "  Memo: ${MEMO_DIR}  (outside the work dir: survives a FROM_STEP=1 wipe)"
+fi
 echo "  Log: $LOG_FILE"
 echo "████████████████████████████████████████████████████████████████████████"
 echo ""
@@ -601,7 +739,7 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_ORIGINAL_BARE" ] || die "step 1 did not produce $REPO_PATH_ORIGINAL_BARE"
 [ -f "$BFG" ] || die "blobExec jar not found: $BFG (run: ./run_pipeline_process.sh --build-only)"
 
-export BFG_MEMO_DIR="${WORK}/memo"
+export BFG_MEMO_DIR="$MEMO_DIR"
 
 # Route through the tokenize.pl dispatcher (not tokenizeSrcMl.pl directly) so it can
 # fan out by language: srcML for .c/.h, rustTokenizer for .rs, etc. The --srcml* /

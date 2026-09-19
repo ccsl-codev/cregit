@@ -81,7 +81,11 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       pipeline: Boolean = false,
       pipelineTrees: Boolean = false,
       parallelism: Int = 4,
-      deduplicateOriginalBlobs: Boolean = true
+      deduplicateOriginalBlobs: Boolean = true,
+      // Empty by default: a fixture blob must never be excluded because it happens
+      // to collide with the shipped list, and the shipped list must never be
+      // exercised by accident. The denylist tests pass their own.
+      denylist: BlobDenylist = BlobDenylist.empty
   ): WalkStats = {
     val destinationMayContainObjects = Files.isDirectory(dstPath)
     val dst = openBare(dstPath)
@@ -91,7 +95,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
         srcRepo, dst, mapping, mask.r, command, abortOnError, parallelism,
         pipeline = pipeline, pipelineTrees = pipelineTrees,
         deduplicateOriginalBlobs = deduplicateOriginalBlobs,
-        destinationMayContainObjects = destinationMayContainObjects
+        destinationMayContainObjects = destinationMayContainObjects,
+        denylist = denylist
       )
       walker.run()
     } finally {
@@ -793,6 +798,130 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
 
   test("a mask-matched blob jgit refuses to materialise is excluded, not fatal (pipeline-trees)") {
     checkOversizedExclusion("pipeline-trees", pipeline = false, pipelineTrees = true)
+  }
+
+  // -- DENYLISTED mask-matched blob -------------------------------------------
+  //
+  // tencent__tencentkona-21 holds four blobs on which srcML 1.1.0 does not
+  // terminate: 0 bytes of output, one core at 101%, at every budget from 5s to
+  // 600s. Upstream srcML/srcML#2361 is open with no patch and v1.1.0 is the latest
+  // release, so there is nothing to upgrade to. The timeout path contains the hang
+  // but answers it with exit 4, "incomplete, do not publish", which would leave
+  // that project permanently unpublishable over a diagnosed third-party defect.
+  //
+  // So a denylisted blob takes Task 5's EXCLUSION path instead: dropped in
+  // microseconds, never handed to the tokenizer, counted on its own, and NOT
+  // gating the exit status. A timeout still gates it, because a timeout is a hang
+  // nobody has explained yet.
+
+  /** The git blob id of `content`, computed the way git computes it, so a fixture
+    * can be denylisted without first asking the repository what its sha is. */
+  private def blobIdOf(content: String): ObjectId =
+    new ObjectInserter.Formatter().idFor(OBJ_BLOB, content.getBytes(UTF_8))
+
+  private def checkDenylistExclusion(label: String, pipeline: Boolean, pipelineTrees: Boolean): Unit = {
+    val dir = freshWorkDir("denylisted-" + label)
+    val keep = "int main(){}\n"
+    // Stands in for TestNewCastArray.java. Its content is irrelevant: the point is
+    // that the tokenizer is never asked about it, so a fixture that would hang is
+    // not needed and would make the test itself hang.
+    val hangs = "String @A [] [] s = new String @A [2] [2];\n"
+    val git = initSrc(dir.resolve("src"))
+    try {
+      writeAndCommit(git, Map("keep.c" -> keep, "hangs.c" -> hangs),
+        "one ordinary file and one the parser cannot handle")
+    } finally git.close()
+
+    val denied = blobIdOf(hangs)
+    val denylist = BlobDenylist.parse(
+      Vector(s"${denied.name}\tsrcML/srcML#2361\tsrcML 1.1.0 does not terminate on it"),
+      "fixture")
+
+    // Every invocation of the tokenizer records the blob it was given. "Excluded in
+    // milliseconds, never handed to the tokenizer" is only checkable from the
+    // tokenizer's side.
+    val invoked = dir.resolve("invoked.txt")
+    val cmd = shellScript(dir, s"""printf '%s\\n' "$$BFG_BLOB" >> "$invoked"\ncat\n""")
+
+    val srcRepo = openBare(dir.resolve("src/.git"))
+    val stats = try {
+      runWalker(
+        srcRepo,
+        dstPath = dir.resolve("dst.git"),
+        dbPath  = dir.resolve("db.sqlite"),
+        command = cmd,
+        mask    = "\\.c$",              // hangs.c IS masked
+        pipeline = pipeline,
+        pipelineTrees = pipelineTrees,
+        denylist = denylist
+      )
+    } finally srcRepo.close()
+
+    withClue(s"mode=$label: ") {
+      stats.aborted shouldBe false               // the walk carries on
+      stats.commitsProcessed shouldEqual 1
+      stats.blobsDenylisted shouldEqual 1L
+      // Its own counter: not folded into either of the neighbours.
+      stats.blobsOversized shouldEqual 0L
+      stats.blobsTimedOut shouldEqual 0L
+      // The whole point. A timeout here would be exit 4 and no publication.
+      Main.exitStatus(stats) shouldEqual 0
+
+      val seen = Files.readString(invoked).linesIterator.filter(_.nonEmpty).toSet
+      seen should contain(blobIdOf(keep).name)   // the ordinary file was tokenized
+      seen should not contain denied.name        // the denylisted one never ran
+      stats.blobCommandExecutions shouldEqual 1L
+    }
+
+    val dst = openBare(dir.resolve("dst.git"))
+    try {
+      withClue(s"mode=$label: ") {
+        fileAtHead(dst, "master", "keep.c") shouldBe Some(keep)
+        // Excluded means absent. Present-as-raw-source is the one outcome that
+        // would corrupt the meaning of the dataset: every other masked path holds
+        // tokens, and a later reader could not tell.
+        fileAtHead(dst, "master", "hangs.c") shouldBe None
+      }
+    } finally dst.close()
+  }
+
+  test("a denylisted blob is excluded without running the tokenizer (serial)") {
+    checkDenylistExclusion("serial", pipeline = false, pipelineTrees = false)
+  }
+
+  test("a denylisted blob is excluded without running the tokenizer (pipeline)") {
+    // The mode run_pipeline_process.sh actually uses for S/M projects, which is
+    // what tencent__tencentkona-21 runs as.
+    checkDenylistExclusion("pipeline", pipeline = true, pipelineTrees = false)
+  }
+
+  test("a denylisted blob is excluded without running the tokenizer (pipeline-trees)") {
+    checkDenylistExclusion("pipeline-trees", pipeline = false, pipelineTrees = true)
+  }
+
+  test("an empty denylist excludes nothing, so the default path is unchanged") {
+    val dir = freshWorkDir("denylist-empty")
+    val git = initSrc(dir.resolve("src"))
+    try writeAndCommit(git, Map("keep.c" -> "int main(){}\n"), "one file")
+    finally git.close()
+
+    val srcRepo = openBare(dir.resolve("src/.git"))
+    val stats = try {
+      runWalker(
+        srcRepo,
+        dstPath = dir.resolve("dst.git"),
+        dbPath  = dir.resolve("db.sqlite"),
+        command = shellScript(dir, "cat"),
+        mask    = "\\.c$",
+        denylist = BlobDenylist.empty
+      )
+    } finally srcRepo.close()
+
+    stats.blobsDenylisted shouldEqual 0L
+    stats.blobCommandExecutions shouldEqual 1L
+    val dst = openBare(dir.resolve("dst.git"))
+    try fileAtHead(dst, "master", "keep.c") shouldBe Some("int main(){}\n")
+    finally dst.close()
   }
 
   private def deleteRecursive(p: Path): Unit = {

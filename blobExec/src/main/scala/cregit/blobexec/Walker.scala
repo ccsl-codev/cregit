@@ -29,6 +29,12 @@ final case class WalkStats(
       * explainable and deterministic, so it is reported but does not block
       * publication: see [[Walker.MaxBlobBytes]]. */
     blobsOversized: Long,
+    /** Distinct mask-matched blobs excluded because they are on the shipped blob
+      * denylist ([[BlobDenylist]]): srcML 1.1.0 does not terminate on them, the
+      * defect is diagnosed and cited, and excluding them is deterministic. Like
+      * [[blobsOversized]] and unlike [[blobsTimedOut]] this is reported but does
+      * not block publication. */
+    blobsDenylisted: Long,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
     originalBlobCopies: Long,
@@ -55,7 +61,11 @@ final class Walker(
     deduplicateOriginalBlobs: Boolean = true,
     destinationMayContainObjects: Boolean = true,
     blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
-    stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds
+    stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
+    // The shipped list by default, so a caller cannot forget it and hand a known
+    // non-terminating blob to srcml. A parameter only so a test can supply its
+    // own fixture; nothing at run time chooses a different list.
+    denylist: BlobDenylist = BlobDenylist.shipped
 ) {
   import Walker._
 
@@ -67,6 +77,7 @@ final class Walker(
   private val blobCommandExecutions          = new LongAdder
   private val blobsTimedOut                  = new LongAdder
   private val blobsOversized                 = new LongAdder
+  private val blobsDenylisted                = new LongAdder
   private val originalBlobCopyRequests       = new LongAdder
   private val originalBlobCopies             = new LongAdder
   private val originalBlobAlreadyPresent     = new LongAdder
@@ -214,6 +225,7 @@ final class Walker(
         aborted                = aborted,
         blobsTimedOut          = blobsTimedOut.sum(),
         blobsOversized         = blobsOversized.sum(),
+      blobsDenylisted        = blobsDenylisted.sum(),
         blobCommandExecutions       = blobCommandExecutions.sum(),
         originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
         originalBlobCopies          = originalBlobCopies.sum(),
@@ -251,6 +263,7 @@ final class Walker(
       aborted                = aborted,
       blobsTimedOut          = blobsTimedOut.sum(),
       blobsOversized         = blobsOversized.sum(),
+      blobsDenylisted        = blobsDenylisted.sum(),
       blobCommandExecutions       = blobCommandExecutions.sum(),
       originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
       originalBlobCopies          = originalBlobCopies.sum(),
@@ -844,6 +857,10 @@ final class Walker(
     * into dst). Never touches `mapping`, keeping the hot path lock-free. */
   private def executeBlobTask(task: BlobMissTask): BlobResult =
     readBlob(task) match {
+      // None means "excluded from the rewrite": too large for jgit to
+      // materialise, or on the blob denylist. Both take the same downstream path
+      // — no id, no tree entry, no blob_map row — which is why one result covers
+      // them. readBlob has already counted and explained whichever it was.
       case None        => BlobResult.Oversized(task.origId)
       case Some(bytes) => executeBlobTask(task, bytes)
     }
@@ -1089,6 +1106,13 @@ final class Walker(
     * a box with about 5 GiB to spare.
     */
   private def readBlob(task: BlobMissTask): Option[Array[Byte]] = {
+    // Before anything is read or opened: a denylisted blob is one srcML cannot be
+    // trusted with, so the cheapest possible check is the right one. This is a map
+    // lookup on a 4-entry map, and it is what turns a 600 s timeout plus exit 4
+    // into a microsecond and a logged exclusion.
+    val denied = denylist.entryFor(task.origId.name)
+    if (denied.isDefined) { noteDenylisted(task, denied.get); return None }
+
     val r = src.newObjectReader()
     try {
       val loader = r.open(task.origId, OBJ_BLOB)
@@ -1109,6 +1133,38 @@ final class Walker(
     * key's absence from `resolved` is what omits the file, and this set is what
     * distinguishes a deliberate omission from a missing-key bug. */
   private val oversizedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
+
+  /** `(origSha, fullPath)` of every blob excluded by the denylist. Read by
+    * [[resolveEntry]] for the same reason as [[oversizedKeys]]: the key's absence
+    * from `resolved` is what omits the path, and this set is what separates a
+    * deliberate omission from a missing-key bug. Kept separate from
+    * `oversizedKeys` so the two exclusions can never be confused in the counts. */
+  private val denylistedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
+
+  /** Count and explain one denylisted blob, once per `(sha, path)`. The sha, the
+    * path, the reason and the citation are all in the line, because this line is
+    * the only per-blob record of what the dataset does not contain, and "we could
+    * not parse it" is not a defensible sentence in a paper. */
+  private def noteDenylisted(task: BlobMissTask, entry: BlobDenylist.Entry): Unit = {
+    val key = (task.origId.name, task.fullPath)
+    // Counted and logged once per (sha, path), exactly like an oversized blob, so
+    // the two counters mean the same thing. One blob reached through two paths is
+    // therefore two, which is the honest figure for "paths the dataset is missing"
+    // — but note the four shipped entries are ONE file's history, so a count of 4
+    // is not four distinct files.
+    if (denylistedKeys.add(key)) {
+      blobsDenylisted.increment()
+      System.err.println(
+        s"blobExec: EXCLUDED denylisted blob: sha=${task.origId.name} " +
+          s"path=${task.fullPath} reason=${entry.reason} citation=${entry.citation}. " +
+          "The blob is left out of the rewritten tree, so it produces no blame and no dataset " +
+          "row, and the file is absent from the tokenized repository rather than present as raw " +
+          "source. The exclusion is deterministic and cited, so unlike a tokenizer timeout it " +
+          "does NOT block publication: the walk carries on and the run still exits 0. See " +
+          s"${BlobDenylist.ResourcePath} in the blobExec jar for the list itself."
+      )
+    }
+  }
 
   /** Count and explain one exclusion, once per `(sha, path)`. The path and the
     * size are in the line on purpose: a bare sha cannot be cited in a paper,
@@ -1210,15 +1266,16 @@ final class Walker(
       val key = (origId.name, fullPath)
       resolved.get(key) match {
         case Some(newId) => Some(ResolvedEntry(name, mode, newId, copyBytes = false))
-        // Excluded as oversized (see readBlob): drop the entry, so the file is
-        // absent from the rewritten tree rather than present as raw source.
-        case None if oversizedKeys.contains(key) => None
+        // Excluded as oversized or by the denylist (see readBlob): drop the entry,
+        // so the file is absent from the rewritten tree rather than present as raw
+        // source.
+        case None if oversizedKeys.contains(key) || denylistedKeys.contains(key) => None
         // Anything else missing is a bug, and used to surface as a bare
         // NoSuchElementException. Keep it fatal and say which blob it was.
         case None =>
           throw new IllegalStateException(
             s"blob ${origId.name} ($fullPath) is a mask-matched miss with no resolution " +
-              "and was not excluded as oversized")
+              "and was excluded neither as oversized nor by the blob denylist")
       }
   }
 
