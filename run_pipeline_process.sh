@@ -20,9 +20,18 @@ Target repository:
   --commit-url URL  base URL for the commit links in the generated HTML
                     (default: derived from --repo-url as <url minus .git>/commit/,
                     which is correct for GitHub/GitLab-style hosts)
-  --mask REGEX      regex selecting the files to tokenize; quote it
-                    (default: '\.[ch]$' — C sources and headers.
-                    Tokenizers exist for C, C++, Java, Rust and m4 files)
+  --mask REGEX      regex selecting the files to tokenize; quote it.
+                    Default: the universal mask, every extension the tokenizer
+                    can parse (C, C++, Java, Rust), case-insensitively. It is
+                    derived from tokenize/CregitLanguages.pm rather than written
+                    out here; print it with `perl tokenize/fileMask.pl`.
+                    Note .am/.ac are routed to the m4 parser but are NOT in the
+                    default mask — m4Tokenizer/m4.py mis-lexes real autotools
+                    quoting; see %MASKED_LANGUAGES in CregitLanguages.pm.
+                    Changing the mask forces a full rebuild: blobExec records the
+                    mask in its blob map and refuses to resume against a
+                    different one, because the old tree_map entries would omit
+                    the newly selected files.
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
@@ -174,7 +183,13 @@ BUILD_ONLY=0
 REPO_GIT_URL=""
 REPO_NAME=""
 REPO_COMMIT_URL=""
-MASK='\.[ch]$'
+# Empty means "use the universal mask", which is DERIVED from the tokenizer's own
+# extension table by tokenize/fileMask.pl rather than written out here. A default
+# typed beside the table drifts from it, and both directions are quiet: a mask
+# naming an extension with no parser kills the run part-way through, and an
+# extension the table knows but no mask names is source silently left
+# untokenized. Resolved after argument parsing, so --mask still wins.
+MASK=""
 WORK="../cregit-files"
 SKIP_HTML=0
 GC_MODE="plain"
@@ -291,6 +306,19 @@ while [ $# -gt 0 ]; do
         *) FROM_STEP="$1"; shift ;;
     esac
 done
+
+# Resolve the default mask from the extension table. Read from this script's own
+# directory rather than $(pwd), so it does not depend on the caller's working
+# directory the way $CREGIT below does.
+if [ -z "$MASK" ]; then
+    SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    MASK="$(perl "${SELF_DIR}/tokenize/fileMask.pl")" || {
+        echo "cannot read the universal mask from ${SELF_DIR}/tokenize/fileMask.pl;" \
+             "pass --mask explicitly" >&2
+        exit 2
+    }
+    [ -n "$MASK" ] || { echo "${SELF_DIR}/tokenize/fileMask.pl printed nothing" >&2; exit 2; }
+fi
 
 # Validate early: pack_cregit_repo runs only once tokenizing has finished.
 case "$GC_MODE" in
