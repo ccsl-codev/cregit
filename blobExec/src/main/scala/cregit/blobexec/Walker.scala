@@ -106,8 +106,9 @@ final class Walker(
         s"(limit ${stallTimeoutSeconds}s). Last completed work: ${lastProgressWhat.get()}.",
       s"    blobs in flight: ${inFlight.size}"
     ) ++ inFlight.take(16) ++ Vector(
-      s"    Killing the process with status ${Walker.StalledExitStatus} rather than waiting: " +
-        "the memo is durable, so re-running resumes from here."
+      s"    Killing the process with status ${Walker.StalledExitStatus} rather than waiting: the " +
+        "memo is durable, so a resuming run picks up from here (from the pipeline, resume at " +
+        "step 2 — step 1 deletes the work directory)."
     )).mkString("\n")
   }
 
@@ -354,7 +355,8 @@ final class Walker(
     System.err.println(
       s"blobExec: commit $origCommitSha contains ${misses.timedOutKeys.size} timed-out blob(s): " +
         s"kept ${keep.size} good blob row(s), recorded no tree and no commit for it. " +
-        "Re-run to retry just those blobs; nothing needs clearing by hand."
+        "Another run over this memo retries just those blobs (from the pipeline: resume at " +
+        "step 2, never step 1); nothing needs clearing by hand."
     )
     misses.timedOutKeys.toVector.sorted.foreach { case (sha, path) =>
       System.err.println(s"blobExec:   will retry on the next run: $sha ($path)")
