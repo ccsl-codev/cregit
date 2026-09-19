@@ -90,7 +90,12 @@ in
 
     perlEnv
 
-    (pkgs.python3.withPackages (ps: [ ps.duckdb ]))
+    # pytest belongs here, not on a PYTHONPATH bridge. The only other pytest on
+    # this box is under system python 3.9, whose duckdb build will not load, and
+    # pointing PYTHONPATH at it also replaces the one devenv sets, so duckdb
+    # disappears. Without pytest here, generate_dataset's duckdb tests skip
+    # silently and the Parquet column contract goes untested.
+    (pkgs.python3.withPackages (ps: [ ps.duckdb ps.pytest ]))
   ];
 
   # Scala 2.13 + sbt 1.x needs a modern JDK; the legacy sbt 0.13 hack is gone.
