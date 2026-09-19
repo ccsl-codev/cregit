@@ -286,9 +286,11 @@ object Main {
           s"run ($timedOutEver ever for this memo, see meta['$BlobsTimedOutMetaKey'] in $dbPath). " +
           "Their files would carry raw source instead of tokens, so the walk stopped at that " +
           s"commit and recorded nothing for it: no blob row, no tree row, no commit row. " +
-          s"Exiting $TimedOutExitStatus. Recovery is to run the same command again — it retries " +
-          "exactly those blobs and needs no changes to the database. If they keep timing out, " +
-          "the tokenizer is too slow for them: raise --blob-timeout."
+          s"Exiting $TimedOutExitStatus. Recovery is another blobExec run over this same memo: it " +
+          "retries exactly those blobs and needs no changes to the database. Driven from " +
+          "run_pipeline_process.sh, that means resuming at step 2 (trailing '2', or ctp.py " +
+          "--from-step 2) — a step-1 run deletes the work directory first, memo included. If " +
+          "they keep timing out, the tokenizer is too slow for them: raise --blob-timeout."
       )
     }
 
