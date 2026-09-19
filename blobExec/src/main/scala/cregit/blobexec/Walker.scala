@@ -44,7 +44,8 @@ final class Walker(
     pipelineTrees: Boolean = false,
     shard: Option[(Int, Int)] = None,
     deduplicateOriginalBlobs: Boolean = true,
-    destinationMayContainObjects: Boolean = true
+    destinationMayContainObjects: Boolean = true,
+    blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds
 ) {
   import Walker._
 
@@ -61,6 +62,25 @@ final class Walker(
   private val originalBlobDestinationLookups = new LongAdder
   private val originalBlobBytesCopied        = new LongAdder
   private val originalBlobBytesAvoided       = new LongAdder
+
+  /** Finite backstop for the consumer's `Await.result` calls.
+    *
+    * `Duration.Inf` was the second half of the tencentkona-21 stall: with the
+    * child now bounded, a worker that still never completes (killed thread,
+    * abandoned io thread) would park the consumer forever and the run would go
+    * silent again. The budget must never cut off healthy work, so it is derived
+    * from the worst case the per-blob timeout permits: `blobCount` blobs run
+    * `parallelism` at a time, each bounded by `blobTimeoutSeconds`; doubled,
+    * because futures are shared across the pipeline window and the pool may be
+    * serving neighbouring commits, plus a fixed floor for read/insert time.
+    * Overrunning it means something is wedged beyond the per-blob kill, and a
+    * loud TimeoutException beats a silent multi-day stall. */
+  private def awaitBudget(blobCount: Int): Duration = {
+    val p       = math.max(1, parallelism)
+    val waves   = (math.max(0, blobCount).toLong + p - 1) / p
+    val perBlob = math.max(1, blobTimeoutSeconds).toLong
+    Duration(math.min((2L * waves + 10L) * perBlob, MaxAwaitBudgetSeconds), SECONDS)
+  }
 
   private val originalBlobCache = new AtomicReferenceArray[OriginalBlobCacheEntry](OriginalBlobCacheSize)
   private val originalBlobCopyLocks = Array.fill[AnyRef](OriginalBlobCopyLockCount)(new AnyRef)
@@ -419,8 +439,10 @@ final class Walker(
             if (aborted.get()) {
               // Draining after abort/producer-error: discard until EndOfWalk.
             } else {
-              // Await only this commit's futures (typically already complete).
-              val results = missFutures.map { case (k, f) => k -> Await.result(f, Duration.Inf) }
+              // Await only this commit's futures (typically already complete),
+              // under a finite backstop rather than Duration.Inf.
+              val budget  = awaitBudget(missFutures.size)
+              val results = missFutures.map { case (k, f) => k -> Await.result(f, budget) }
               results.values.collectFirst { case a: BlobResult.Aborted => a } match {
                 case Some(_) =>
                   aborted.set(true)  // stop the producer; drain the remainder
@@ -556,7 +578,7 @@ final class Walker(
               // Draining after abort/producer-error: discard until EndOfTreeWalk.
             } else {
               // The assembly (and any abort it observed) is already done off-thread.
-              Await.result(treeFuture, Duration.Inf) match {
+              Await.result(treeFuture, awaitBudget(blobKeys.size)) match {
                 case TreeResult.Aborted(_, _) =>
                   aborted.set(true)  // stop the producer; drain the remainder
                 case TreeResult.Built(newTreeId, resolved, subtrees) =>
@@ -644,7 +666,8 @@ final class Walker(
         fullPath     = task.fullPath,
         command      = command,
         abortOnError = abortOnError,
-        inserter     = workerInserter
+        inserter     = workerInserter,
+        timeoutSeconds = blobTimeoutSeconds
       )
       val res = outcome match {
         case BlobExec.Outcome.Skip =>
@@ -780,7 +803,8 @@ final class Walker(
             fullPath     = task.fullPath,
             command      = command,
             abortOnError = abortOnError,
-            inserter     = workerInserter
+            inserter     = workerInserter,
+            timeoutSeconds = blobTimeoutSeconds
           )
           // For Skip outcomes (identical output OR non-zero exit with
           // abortOnError=false) we keep the original blob id, so the dst
@@ -797,7 +821,7 @@ final class Walker(
       }
     }
 
-    val results = Await.result(Future.sequence(futures), Duration.Inf)
+    val results = Await.result(Future.sequence(futures), awaitBudget(futures.size))
 
     val abort = results.exists { case (_, o) => o.isInstanceOf[BlobExec.Outcome.Abort] }
     if (abort) (IMap.empty, true)
@@ -1222,6 +1246,10 @@ object Walker {
     * so the pool never idles waiting for the producer, but small enough that
     * memory stays modest. */
   private val PipelineWindow = 32
+
+  /** Hard ceiling on [[Walker.awaitBudget]], so the arithmetic stays inside
+    * `Duration`'s nanosecond range on pathologically large commits. */
+  private val MaxAwaitBudgetSeconds = 30L * 24L * 3600L  // 30 days
 
   /** Immutable snapshot of a RevCommit, so the consumer never reaches back
     * into the single-threaded RevWalk that the producer is iterating. */

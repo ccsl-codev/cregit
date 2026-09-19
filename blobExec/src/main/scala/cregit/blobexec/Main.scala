@@ -29,11 +29,19 @@ import java.nio.file.{Files, Paths}
  */
 object Main {
 
+  // `raw` (not `s`): the mask example below contains a regex backslash, which a
+  // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    """Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--blob-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
+      |  --blob-timeout=<seconds>
+      |                    wall-clock budget for one <command> invocation
+      |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
+      |                    killed and that single blob is left untokenized;
+      |                    the run continues, and --abort-on-error does not
+      |                    turn a timeout into a whole-run abort.
       |  --pipeline        use the look-ahead pipelined walker (producer runs
       |                    ahead so the blob-command pool stays saturated);
       |                    output is identical to the default serial walker
@@ -60,7 +68,7 @@ object Main {
       |  <dst.git>         bare destination repo (created on first run, reused on incremental)
       |  <db.sqlite>       SQLite mapping file (created on first run, reused on incremental)
       |  <command>         absolute path to the per-blob script to run
-      |  <fileMaskRegex>   regex matched against each blob's filename (e.g. '\.[ch]$')
+      |  <fileMaskRegex>   regex matched against each blob's filename (e.g. '\.[ch]$$')
       |""".stripMargin
 
   def main(args: Array[String]): Unit = {
@@ -71,6 +79,7 @@ object Main {
     var pipelineTrees = false
     var shard: Option[(Int, Int)] = None
     var warmPath: Option[java.nio.file.Path] = None
+    var blobTimeoutSeconds = BlobExec.DefaultTimeoutSeconds
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
       case "--pipeline"       => pipeline = true
@@ -97,6 +106,14 @@ object Main {
           sys.exit(1)
         }
         warmPath = Some(p)
+      case t if t.startsWith("--blob-timeout=") =>
+        val spec = t.stripPrefix("--blob-timeout=")
+        spec.toIntOption match {
+          case Some(secs) if secs > 0 => blobTimeoutSeconds = secs
+          case _ =>
+            System.err.println(s"Error: --blob-timeout must be a positive whole number of seconds [$spec]")
+            sys.exit(1)
+        }
       case other =>
         System.err.println(s"Error: unknown flag [$other]")
         System.err.println(Usage)
@@ -149,7 +166,7 @@ object Main {
     println(
       s"blobExec: src=$srcPath dst=$dstPath db=$dbPath command=$command mask=$mask " +
         s"abortOnError=$abortOnError pipeline=$pipeline pipelineTrees=$pipelineTrees " +
-        s"shard=$shardStr warm=$warmStr incremental=$incremental"
+        s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s incremental=$incremental"
     )
 
     val src: FileRepository = openSrc(srcPath)
@@ -166,7 +183,8 @@ object Main {
       val walker = new Walker(
         src, dst, mapping, mask.r, command, abortOnError, parallelism,
         pipeline, pipelineTrees, shard,
-        destinationMayContainObjects = incremental
+        destinationMayContainObjects = incremental,
+        blobTimeoutSeconds = blobTimeoutSeconds
       )
       walker.run()
     } finally {
