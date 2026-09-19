@@ -15,6 +15,9 @@
 
 use strict;
 use File::Basename;
+use FindBin;
+use lib $FindBin::Bin;
+use CregitLanguages;
 
 my %declarations;
 my %listDeclarations;
@@ -23,19 +26,10 @@ my %languages = ("C" => 1,
                  "C++" => 1,
                  "Java" => 1);
 
-my %extensions = (
-                  ".c" => 'C',
-                  ".c++" => 'C++',
-                  ".cc" => "C++",
-                  ".cp" => 'C++',
-                  ".cpp" => "C++",
-                  ".cxx" => 'C++',
-                  ".h" => "C",
-                  ".h++" => 'C++',
-                  ".hh" => 'C++',
-                  ".hpp" => "C++",
-                  ".java" => "Java",
-                 );
+# Only the srcML-routed extensions: this script is the srcML parser, so
+# autodetecting a .rs file here would hand `-l Rust` to srcml. tokenize.pl is the
+# dispatcher that knows about the other parsers.
+my %extensions = CregitLanguages::srcml_extensions_by_dot();
 
 
 

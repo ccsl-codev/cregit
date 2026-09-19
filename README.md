@@ -38,8 +38,13 @@ the checkout — the repo ships an [`.envrc`](./.envrc), so the devenv shell the
 activates automatically whenever you `cd` in, and typing `devenv shell` is no
 longer needed.
 
-By default only C files (`'\.[ch]$'`) are tokenized; pass `--mask` for other
-languages (C, C++, Java, Rust and m4 are supported). The browsable per-file
+By default every file the tokenizer can parse is tokenized — C, C++, Java and
+Rust, case-insensitively. The default mask is derived from the tokenizer's own
+extension table, so it cannot drift from it; print it with `perl
+tokenize/fileMask.pl`. Pass `--mask` to narrow it to one language. `.am`/`.ac`
+are routed to the m4 parser but are not in the default mask, because that parser
+mis-lexes real autotools quoting (see `%MASKED_LANGUAGES` in
+`tokenize/CregitLanguages.pm`). The browsable per-file
 HTML views land in the sibling directory `../cregit-files/html`. See
 [How to use](#how-to-use) for all flags and outputs.
 
@@ -151,7 +156,7 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--repo-url`          | git URL or local path of the repository to process         | **required**                     |
 | `--repo-name`         | short name prefixed to the output files                    | derived from `--repo-url`        |
 | `--commit-url`        | base URL for commit links in the generated HTML            | `<repo-url minus .git>/commit/`  |
-| `--mask`              | regex of files to tokenize (C, C++, Java, Rust, m4); quote it | `'\.[ch]$'`                   |
+| `--mask`              | regex of files to tokenize (C, C++, Java, Rust); quote it   | `perl tokenize/fileMask.pl`      |
 | `--work`              | working/output directory                                   | `../cregit-files`                |
 | `--mode` / `--shards` | tokenizer walk mode / shard count for `sharded`            | `pipeline` / `4`                 |
 | `--jobs`              | concurrent blame/HTML processes                            | `CREGIT_JOBS` or up to `4` CPUs  |
