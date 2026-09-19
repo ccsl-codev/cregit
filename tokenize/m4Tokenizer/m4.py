@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import itertools
 import sys
@@ -68,12 +68,14 @@ class peek_insert_iter:
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         if self.inserted:
             return self.inserted.pop(0)
         if self.peeked:
             return self.peeked.pop(0)
-        return self.iter.next()
+        return next(self.iter)
+
+    next = __next__      # the name the rest of this file used under Python 2
 
     def insert(self, iterable):
         self.inserted[0:0] = iterable
@@ -81,7 +83,7 @@ class peek_insert_iter:
     def _peek(self):
         if not self.peeked:
             try:
-                self.peeked.append(self.iter.next())
+                self.peeked.append(next(self.iter))
             except StopIteration:
                 pass
 
@@ -131,8 +133,10 @@ class Lexer:
             def __iter__(self):
                 return self.iter
 
-            def next(self):
-                return self.iter.next()
+            def __next__(self):
+                return next(self.iter)
+
+            next = __next__
 
             def peek_char(self):
                 return lexer.iter.peek()
@@ -160,7 +164,7 @@ class Lexer:
 
     def _generic(self, c):
         if c is not EOF:
-            self.chars.append(self.iter.next())
+            self.chars.append(next(self.iter))
         if c.isalpha() or c == '_':
             self.state = self._identifier
         elif c == '#':
@@ -176,7 +180,7 @@ class Lexer:
         return []
 
     def _string(self, c):
-        self.chars.append(self.iter.next())
+        self.chars.append(next(self.iter))
         if (
                 self.start_quote != self.end_quote and
                 endswith(self.chars, self.start_quote)
@@ -197,12 +201,12 @@ class Lexer:
             self.state = None
             return [self._finish_token('IDENTIFIER')]
 
-        self.chars.append(self.iter.next())
+        self.chars.append(next(self.iter))
         return []
 
     def _comment(self, c):
         if c != '\n' and c is not EOF:
-            self.chars.append(self.iter.next())
+            self.chars.append(next(self.iter))
             return []
 
         self.state = None
@@ -258,7 +262,7 @@ class Parser:
         current_arg = []
         if self.token_iter.peek_char() == '(':
             # drop that token
-            tok = self.token_iter.next()
+            tok = next(self.token_iter)
             if tok.value != '(':
                 raise ParseError('Expected open parenthesis but got %s'
                                  % tok.value)
@@ -299,14 +303,14 @@ class Parser:
 
     def parse(self, stream=sys.stdout):
         if options.verbose:
-            print >> sys.stderr, 'Parsing ', filename
+            print('Parsing ', filename, file=sys.stderr)
 
         for tok in self.token_iter:
             if tok.value != '\n' and tok.value != "\t" and tok.value != ' ':
                 if options.location:
-                    print "%d:%d\t%s" % (tok.line , tok.column, tok)
+                    print("%d:%d\t%s" % (tok.line, tok.column, tok))
                 else:
-                    print tok
+                    print(tok)
 
 #            if self.current_diversion == 0:
 #                stream.write(tok.value)
@@ -323,7 +327,7 @@ class Parser:
 
 if __name__ == '__main__':
 
-    print "begin_unit|revision:0.1;language:m4;cregit-version:0.0.1"
+    print("begin_unit|revision:0.1;language:m4;cregit-version:0.0.1")
     parser = OptionParser()
     parser.add_option("-v", "--verbose",
                   action="store_true", dest="verbose", default=False,
@@ -337,14 +341,14 @@ if __name__ == '__main__':
     (options, args) = parser.parse_args()
 
     if options.language != "M4":
-       print >> sys.stderr, "We can only parse language m4"
+       print("We can only parse language m4", file=sys.stderr)
        exit(2)
 
     filename = args[0]
 
     if options.verbose:
-       print >> sys.stderr, 'Parsing ', filename
+       print('Parsing ', filename, file=sys.stderr)
 
     f = open(filename, "r")
     Parser(f.read()).parse()
-    print "end_unit"
+    print("end_unit")

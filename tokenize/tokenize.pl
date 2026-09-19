@@ -15,42 +15,25 @@
 
 use strict;
 use File::Basename;
+use FindBin;
+use lib $FindBin::Bin;
+# The extension table and the language->parser table both come from here, and so
+# does tokenizeByBlobId/tokenBySha.pl's. They used to be separate literals that
+# disagreed; see CregitLanguages.pm.
+use CregitLanguages;
 
 my %declarations;
 my %listDeclarations;
 
-my %extensions = (
-                  ".c" => 'C',
-                  ".c++" => 'C++',
-                  ".cc" => "C++",
-                  ".cp" => 'C++',
-                  ".cpp" => "C++",
-                  ".cxx" => 'C++',
-                  ".h" => "C",
-                  ".h++" => 'C++',
-                  ".hh" => 'C++',
-                  ".hpp" => "C++",
-                  ".java" => "Java",
-                  ".am" => "M4",
-                  ".ac" => "M4",
-                  ".rs" => "Rust",
-                 );
+my %extensions = CregitLanguages::extensions_by_dot();
 
 my $basedir = dirname($0);
 $basedir = "." if ($basedir eq "");
 
 
-my $srcMlparser = "$basedir/tokenizeSrcMl.pl";
-my $m4Parser    = "$basedir/m4Tokenizer/m4.py";
-my $rustParser  = "$basedir/rustTokenizer/target/release/rust_tokenizer";
+my $srcMlparser = "$basedir/$CregitLanguages::SRCML_PARSER_REL";
 
-
-my %parsers = ("C" => $srcMlparser,
-               "C++" => $srcMlparser,
-               "Java" => $srcMlparser,
-               "M4" => $m4Parser,
-               "Rust" => $rustParser,
-              );
+my %parsers = CregitLanguages::parsers($basedir);
 
 
 use Getopt::Long;
