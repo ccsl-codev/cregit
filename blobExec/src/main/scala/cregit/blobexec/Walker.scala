@@ -24,6 +24,11 @@ final case class WalkStats(
       * file left holding raw source instead of tokens, so a non-zero count must
       * reach the caller rather than living only in stderr. */
     blobsTimedOut: Long,
+    /** Distinct mask-matched blobs excluded from the rewrite because JGit will
+      * not materialise an object that large. Unlike [[blobsTimedOut]] this is
+      * explainable and deterministic, so it is reported but does not block
+      * publication: see [[Walker.MaxBlobBytes]]. */
+    blobsOversized: Long,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
     originalBlobCopies: Long,
@@ -61,6 +66,7 @@ final class Walker(
 
   private val blobCommandExecutions          = new LongAdder
   private val blobsTimedOut                  = new LongAdder
+  private val blobsOversized                 = new LongAdder
   private val originalBlobCopyRequests       = new LongAdder
   private val originalBlobCopies             = new LongAdder
   private val originalBlobAlreadyPresent     = new LongAdder
@@ -198,6 +204,7 @@ final class Walker(
         refsProjected          = refsCount,
         aborted                = aborted,
         blobsTimedOut          = blobsTimedOut.sum(),
+        blobsOversized         = blobsOversized.sum(),
         blobCommandExecutions       = blobCommandExecutions.sum(),
         originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
         originalBlobCopies          = originalBlobCopies.sum(),
@@ -234,6 +241,7 @@ final class Walker(
       refsProjected          = 0,     // shards deliberately never project refs
       aborted                = aborted,
       blobsTimedOut          = blobsTimedOut.sum(),
+      blobsOversized         = blobsOversized.sum(),
       blobCommandExecutions       = blobCommandExecutions.sum(),
       originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
       originalBlobCopies          = originalBlobCopies.sum(),
@@ -813,8 +821,13 @@ final class Walker(
     * and return the id the rewritten tree should reference. Mirrors the
     * per-task logic in [[resolveMisses]] (a Skip re-inserts the original bytes
     * into dst). Never touches `mapping`, keeping the hot path lock-free. */
-  private def executeBlobTask(task: BlobMissTask): BlobResult = {
-    val bytes = readBlob(task.origId)
+  private def executeBlobTask(task: BlobMissTask): BlobResult =
+    readBlob(task) match {
+      case None        => BlobResult.Oversized(task.origId)
+      case Some(bytes) => executeBlobTask(task, bytes)
+    }
+
+  private def executeBlobTask(task: BlobMissTask, bytes: Array[Byte]): BlobResult = {
     val workerInserter = dst.newObjectInserter()
     val label = s"${task.origId.name} (${task.fullPath})"
     inFlightBlobs.put(label, System.nanoTime())
@@ -964,47 +977,51 @@ final class Walker(
     // single commit (e.g. the same (blob, path) reached via two subtrees).
     val unique = misses.map(m => (m.origId.name, m.fullPath) -> m).toMap.values.toVector
 
+    // An oversized blob yields None: it contributes no id, so no tree entry, no
+    // blob_map row and no dataset row. See readBlob and resolveEntry.
     val futures = unique.map { task =>
       Future {
-        val bytes = readBlob(task.origId)
-        val workerInserter = dst.newObjectInserter()
-        val label = s"${task.origId.name} (${task.fullPath})"
-        inFlightBlobs.put(label, System.nanoTime())
-        try {
-          blobCommandExecutions.increment()
-          val timedOut = new AtomicBoolean(false)
-          val outcome = BlobExec.run(
-            bytes        = bytes,
-            origSha      = task.origId.name,
-            filename     = task.filename,
-            fullPath     = task.fullPath,
-            command      = command,
-            abortOnError = abortOnError,
-            inserter     = workerInserter,
-            timeoutSeconds = blobTimeoutSeconds,
-            onTimeout      = () => { blobsTimedOut.increment(); timedOut.set(true) }
-          )
-          // For Skip outcomes (identical output, a non-zero exit with
-          // abortOnError=false, or a timeout) we keep the original blob id, so
-          // the dst tree will reference it — meaning the bytes must exist in
-          // dst. For Replace outcomes the worker has already inserted the new
-          // blob. For Abort we do nothing (caller short-circuits).
-          outcome match {
-            case BlobExec.Outcome.Skip => ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
-            case _                     => ()
+        readBlob(task).map { bytes =>
+          val workerInserter = dst.newObjectInserter()
+          val label = s"${task.origId.name} (${task.fullPath})"
+          inFlightBlobs.put(label, System.nanoTime())
+          try {
+            blobCommandExecutions.increment()
+            val timedOut = new AtomicBoolean(false)
+            val outcome = BlobExec.run(
+              bytes        = bytes,
+              origSha      = task.origId.name,
+              filename     = task.filename,
+              fullPath     = task.fullPath,
+              command      = command,
+              abortOnError = abortOnError,
+              inserter     = workerInserter,
+              timeoutSeconds = blobTimeoutSeconds,
+              onTimeout      = () => { blobsTimedOut.increment(); timedOut.set(true) }
+            )
+            // For Skip outcomes (identical output, a non-zero exit with
+            // abortOnError=false, or a timeout) we keep the original blob id, so
+            // the dst tree will reference it — meaning the bytes must exist in
+            // dst. For Replace outcomes the worker has already inserted the new
+            // blob. For Abort we do nothing (caller short-circuits).
+            outcome match {
+              case BlobExec.Outcome.Skip => ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
+              case _                     => ()
+            }
+            workerInserter.flush()
+            progress(s"blob $label")
+            (task, outcome, timedOut.get())
+          } finally {
+            inFlightBlobs.remove(label)
+            workerInserter.close()
           }
-          workerInserter.flush()
-          progress(s"blob $label")
-          (task, outcome, timedOut.get())
-        } finally {
-          inFlightBlobs.remove(label)
-          workerInserter.close()
         }
       }
     }
 
-    // Unbounded: the stall watchdog is the backstop, not a budget.
-    val results = Await.result(Future.sequence(futures), Duration.Inf)
+    // Unbounded: the stall watchdog is the backstop, not a budget. `flatten`
+    // drops the oversized blobs: they are excluded, not resolved.
+    val results = Await.result(Future.sequence(futures), Duration.Inf).flatten
 
     val abort = results.exists { case (_, o, _) => o.isInstanceOf[BlobExec.Outcome.Abort] }
     if (abort) MissResolution(IMap.empty, abort = true, timedOutKeys = Set.empty)
@@ -1023,10 +1040,62 @@ final class Walker(
     }
   }
 
-  private def readBlob(id: ObjectId): Array[Byte] = {
+  /** Read one mask-matched blob, or `None` when it is too large for JGit to
+    * materialise and must therefore be excluded from the rewrite.
+    *
+    * A mask-matched blob can still be machine-generated and far larger than any
+    * tokenizer can process, so the walk excludes it rather than aborting.
+    *
+    * Two layers, because one is not enough:
+    *   - the size check is a fast path, at the threshold JGit itself uses;
+    *   - the `LargeObjectException` catch is the real mechanism, and covers any
+    *     blob that sits between [[Walker.MaxBlobBytes]] and a JGit configured
+    *     lower than its own default. A bare size check with a hand-picked
+    *     constant above JGit's threshold would still throw in that band.
+    *
+    * Streaming the bytes, the way the pass-through path does, would hand the
+    * tokenizer the whole blob.
+    */
+  private def readBlob(task: BlobMissTask): Option[Array[Byte]] = {
     val r = src.newObjectReader()
-    try r.open(id, OBJ_BLOB).getBytes
-    finally r.close()
+    try {
+      val loader = r.open(task.origId, OBJ_BLOB)
+      val size   = loader.getSize
+      if (Walker.isOversized(size)) { noteOversized(task, size); None }
+      else
+        try Some(loader.getBytes)
+        catch {
+          case _: org.eclipse.jgit.errors.LargeObjectException =>
+            noteOversized(task, size)
+            None
+        }
+    } finally r.close()
+  }
+
+  /** `(origSha, fullPath)` of every blob excluded as oversized. Read by
+    * [[resolveEntry]], which drops those entries from the rewritten tree: the
+    * key's absence from `resolved` is what omits the file, and this set is what
+    * distinguishes a deliberate omission from a missing-key bug. */
+  private val oversizedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
+
+  /** Count and explain one exclusion, once per `(sha, path)`. The path and the
+    * size are in the line on purpose: a bare sha cannot be cited in a paper,
+    * and this line is the only durable record of what the dataset is missing. */
+  private def noteOversized(task: BlobMissTask, sizeBytes: Long): Unit = {
+    val key = (task.origId.name, task.fullPath)
+    if (oversizedKeys.add(key)) {
+      blobsOversized.increment()
+      System.err.println(
+        s"blobExec: EXCLUDED oversized blob: sha=${task.origId.name} " +
+          s"path=${task.fullPath} size=${sizeBytes}B limit=${Walker.MaxBlobBytes}B. " +
+          "JGit will not materialise an object this large, and a source file this size is " +
+          "machine-generated rather than authored. The blob is left out of the rewritten " +
+          "tree, so it produces no blame and no dataset row, and the file is absent from " +
+          "the tokenized repository rather than present as raw source. Deterministic and " +
+          "fully explained, so unlike a tokenizer timeout this does NOT block publication: " +
+          "the walk carries on and the run still exits 0."
+      )
+    }
   }
 
   /** Copy one original blob from src into dst by streaming it. Returns (id, size).
@@ -1065,7 +1134,9 @@ final class Walker(
     case TreeExisting(id) => id
     case TreeBuild(origId, entries) =>
       val tf = new org.eclipse.jgit.lib.TreeFormatter
-      val resolvedEntries = entries.map(resolveEntry(_, resolved, inserter, subtreeAcc))
+      // flatMap, not map: an oversized blob resolves to no entry at all, so the
+      // rewritten tree simply does not contain that path.
+      val resolvedEntries = entries.flatMap(resolveEntry(_, resolved, inserter, subtreeAcc))
       // jgit requires sorted entries (git tree order). The TreeWalk visited
       // them in tree order already, so we keep that order.
       resolvedEntries.foreach { e =>
@@ -1085,19 +1156,30 @@ final class Walker(
       resolved: IMap[(String, String), ObjectId],
       inserter: ObjectInserter,
       subtreeAcc: scala.collection.mutable.Map[String, String]
-  ): ResolvedEntry = entry match {
+  ): Option[ResolvedEntry] = entry match {
     case EntryUnchanged(name, mode, id, copyBytes) =>
-      ResolvedEntry(name, mode, id, copyBytes)
+      Some(ResolvedEntry(name, mode, id, copyBytes))
     case EntrySubtree(name, mode, sub) =>
       val subId = assemble(sub, resolved, inserter, subtreeAcc)
-      ResolvedEntry(name, mode, subId, copyBytes = false)
+      Some(ResolvedEntry(name, mode, subId, copyBytes = false))
     case EntryBlobHit(name, mode, newId) =>
       // The new blob was inserted in a prior run; verify-or-copy is unneeded
       // because dst is the only consumer and we always insert before mapping.
-      ResolvedEntry(name, mode, newId, copyBytes = false)
+      Some(ResolvedEntry(name, mode, newId, copyBytes = false))
     case EntryBlobMiss(name, mode, origId, fullPath) =>
-      val newId = resolved((origId.name, fullPath))
-      ResolvedEntry(name, mode, newId, copyBytes = false)
+      val key = (origId.name, fullPath)
+      resolved.get(key) match {
+        case Some(newId) => Some(ResolvedEntry(name, mode, newId, copyBytes = false))
+        // Excluded as oversized (see readBlob): drop the entry, so the file is
+        // absent from the rewritten tree rather than present as raw source.
+        case None if oversizedKeys.contains(key) => None
+        // Anything else missing is a bug, and used to surface as a bare
+        // NoSuchElementException. Keep it fatal and say which blob it was.
+        case None =>
+          throw new IllegalStateException(
+            s"blob ${origId.name} ($fullPath) is a mask-matched miss with no resolution " +
+              "and was not excluded as oversized")
+      }
   }
 
   /** Make sure dst holds the original blob, inserting it at most once.
@@ -1379,6 +1461,31 @@ final class Walker(
 
 object Walker {
 
+  /** Size at which a mask-matched blob stops being tokenizable and is excluded.
+    *
+    * Deliberately not a number of our own choosing. It is read from JGit, which
+    * refuses to materialise any object at or above its stream-file threshold
+    * (`core.streamFileThreshold`, default 50 MiB) — `ObjectLoader.getBytes`
+    * throws `LargeObjectException` instead. Picking a larger constant, as an
+    * earlier draft of this fix did with 64 MiB, leaves a band (50-64 MiB) in
+    * which the size check passes and `getBytes` then throws anyway; picking a
+    * smaller one would silently drop files JGit could have handled.
+    *
+    * Reading a *fresh* `WindowCacheConfig` gives JGit's default rather than
+    * whatever is currently installed, which cannot be read back through public
+    * API. That is why this is only a fast path and [[Walker#readBlob]] also
+    * catches `LargeObjectException`: with the threshold lowered below the
+    * default, the catch is what handles the band.
+    *
+    * `>=`, not `>`, because that is JGit's own comparison: `Pack.load` returns a
+    * streaming (non-materialisable) loader once `size >= streamFileThreshold`.
+    */
+  private[blobexec] val MaxBlobBytes: Long =
+    new org.eclipse.jgit.storage.file.WindowCacheConfig().getStreamFileThreshold.toLong
+
+  /** Pure form of the exclusion decision, so it can be checked without a repo. */
+  private[blobexec] def isOversized(sizeBytes: Long): Boolean = sizeBytes >= MaxBlobBytes
+
   private val OriginalBlobCacheSize = 1 << 16
   private val OriginalBlobCopyLockCount = 256
 
@@ -1514,6 +1621,11 @@ object Walker {
       * a `Resolved`: nothing about this blob, the trees containing it, or its
       * commit may be persisted, or a re-run would treat raw source as done. */
     final case class TimedOut(origId: ObjectId) extends BlobResult
+    /** Too large for JGit to materialise, so excluded from the rewrite. It is
+      * deliberately neither `Resolved` nor `TimedOut`: it contributes no id, so
+      * every `collect` that builds a tree/blob_map map drops it, `resolveEntry`
+      * omits the path, and the run is still publishable. */
+    final case class Oversized(origId: ObjectId) extends BlobResult
   }
 
   /** Items flowing producer -> consumer across the bounded queue. */
