@@ -314,8 +314,23 @@ object Main {
         s"refsProjected=${stats.refsProjected} " +
         s"blobsTimedOut=${stats.blobsTimedOut} " +
         s"blobsTimedOutEver=$timedOutEver " +
+        s"blobsOversized=${stats.blobsOversized} " +
         s"aborted=${stats.aborted}"
     )
+
+    if (stats.blobsOversized > 0) {
+      // Reported, never fatal. An oversized blob is deterministic and fully
+      // explained by the EXCLUDED lines above, so gating publication on it would
+      // only mean this project could never publish while telling us nothing new.
+      System.err.println(
+        s"blobExec: ${stats.blobsOversized} blob(s) were excluded as oversized (>= " +
+          s"${Walker.MaxBlobBytes} bytes, JGit's stream-file threshold). Each one is named with " +
+          "its sha, path and size on an 'EXCLUDED oversized blob' line above; those lines are the " +
+          "record of what this project's dataset does not contain. The files are absent from the " +
+          "tokenized repository, not present as raw source, so they produce no blame and no " +
+          "dataset row. This is not a failure and does not affect the exit status."
+      )
+    }
 
     if (stats.blobsTimedOut > 0) {
       System.err.println(
