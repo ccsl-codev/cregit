@@ -24,10 +24,19 @@ import scala.sys.process.{Process, ProcessIO}
  *   - stdin              = original blob bytes
  *   - stdout             = replacement blob bytes
  *   - exit != 0          → `Skip` (or `Abort` if `abortOnError`)
+ *   - timeout            → child killed, `Skip` (never `Abort`, never `Replace`)
  *   - stdout == stdin    → `Skip` (no inserter activity)
  *   - otherwise          → `Replace(newBlob)`
  */
 object BlobExec {
+
+  /** Per-blob wall-clock budget for the external command, in seconds. */
+  val DefaultTimeoutSeconds: Int = 600
+
+  /** Synthetic exit code reported by [[invoke]] when the child was killed for
+    * exceeding its budget. A real child can never produce it: on Unix a waited
+    * status is 0..255 (128+signal when killed), so negative values are free. */
+  val TimeoutExitCode: Int = -1
 
   sealed trait Outcome
   object Outcome {
@@ -48,11 +57,22 @@ object BlobExec {
       fullPath: String,
       command: String,
       abortOnError: Boolean,
-      inserter: ObjectInserter
+      inserter: ObjectInserter,
+      timeoutSeconds: Int = DefaultTimeoutSeconds
   ): Outcome = {
-    val (exitCode, stdout, stderr) = invoke(bytes, origSha, filename, fullPath, command)
+    val (exitCode, stdout, stderr) = invoke(bytes, origSha, filename, fullPath, command, timeoutSeconds)
 
-    if (exitCode != 0) {
+    if (exitCode == TimeoutExitCode) {
+      // A timed-out child skips exactly one blob. Deliberately *not* routed
+      // through `abortOnError`: one wedged tokenizer must never take down a
+      // run that has already folded thousands of commits, and its (discarded,
+      // possibly truncated) stdout must never be mistaken for a tokenization.
+      System.err.println(
+        s"Warning: command [$command] timed out after ${timeoutSeconds}s on blob $origSha " +
+          s"at path [$fullPath]: child killed, blob left untokenized"
+      )
+      Outcome.Skip
+    } else if (exitCode != 0) {
       logError(command, origSha, fullPath, exitCode, stderr)
       if (abortOnError) Outcome.Abort(stderr, exitCode) else Outcome.Skip
     } else if (JavaArrays.equals(bytes, stdout)) {
@@ -62,13 +82,17 @@ object BlobExec {
     }
   }
 
-  /** Visible for testing. Runs the process and returns (exit, stdout, stderr). */
+  /** Visible for testing. Runs the process and returns (exit, stdout, stderr).
+    *
+    * The child is bounded by `timeoutSeconds`; on expiry it is killed and
+    * [[TimeoutExitCode]] is returned with empty stdout/stderr. */
   private[blobexec] def invoke(
       bytes: Array[Byte],
       origSha: String,
       filename: String,
       fullPath: String,
-      command: String
+      command: String,
+      timeoutSeconds: Int = DefaultTimeoutSeconds
   ): (Int, Array[Byte], String) = {
     val stdoutBuilder = new java.io.ByteArrayOutputStream(math.max(bytes.length, 1024))
     val stderrBuilder = new StringBuilder
@@ -93,8 +117,41 @@ object BlobExec {
       "BFG_PATH"     -> fullPath
     )
     val proc = pb.run(io)
-    val exit = proc.exitValue()
-    (exit, stdoutBuilder.toByteArray, stderrBuilder.toString)
+
+    // A stuck srcml/ctags used to park the caller forever: the child stops
+    // producing output but holds its stdout open, the reader thread blocks in
+    // pipe_read, `exitValue()` (which joins the io threads) never returns, and
+    // the whole project goes silent. Bound the child instead of trusting it to
+    // exit. `exitValue()` is moved onto a daemon thread so the timeout can be
+    // observed even when that join is the thing that is wedged.
+    val finished   = new java.util.concurrent.CountDownLatch(1)
+    val exitHolder = new java.util.concurrent.atomic.AtomicInteger(TimeoutExitCode)
+    val waiter = new Thread(
+      () => {
+        try exitHolder.set(proc.exitValue())
+        catch { case _: InterruptedException => Thread.currentThread().interrupt() }
+        finally finished.countDown()
+      },
+      s"blobexec-wait-$origSha"
+    )
+    waiter.setDaemon(true)
+    waiter.start()
+
+    val budget = math.max(1, timeoutSeconds).toLong
+    if (finished.await(budget, java.util.concurrent.TimeUnit.SECONDS)) {
+      (exitHolder.get(), stdoutBuilder.toByteArray, stderrBuilder.toString)
+    } else {
+      System.err.println(
+        s"blobExec: timeout after ${timeoutSeconds}s on blob $origSha ($fullPath); killing child"
+      )
+      proc.destroy()
+      // The io threads are abandoned rather than joined: if a surviving
+      // grandchild still holds the pipe, joining them is exactly the hang we
+      // are escaping. That makes `stdoutBuilder`/`stderrBuilder` live, racy
+      // state, so neither is read here — the caller discards a timed-out
+      // blob's output anyway.
+      (TimeoutExitCode, Array.emptyByteArray, "")
+    }
   }
 
   private def transfer(in: InputStream, out: java.io.OutputStream): Unit = {

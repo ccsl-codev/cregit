@@ -116,6 +116,35 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     }
   }
 
+  test("a child that never exits is killed at the timeout, not awaited forever") {
+    // `sleep 30` stands in for the wedged srcml chain: it reads nothing and
+    // writes nothing, and it holds its stdout open so the reader thread parks
+    // in pipe_read. With a 1 second budget the call must return quickly.
+    val cmd     = shellScript("sleep 30")
+    val started = System.currentTimeMillis()
+    val (exit, _, _) = BlobExec.invoke(
+      "irrelevant".getBytes(UTF_8),
+      "0" * 40,
+      "input.java",
+      "input.java",
+      cmd,
+      timeoutSeconds = 1
+    )
+    val elapsed = System.currentTimeMillis() - started
+    assert(elapsed < 10000, s"invoke took ${elapsed}ms; the timeout did not fire")
+    exit shouldEqual BlobExec.TimeoutExitCode
+  }
+
+  test("a timed-out blob is skipped, never tokenized and never an abort") {
+    // abortOnError=true is the hostile case: a timeout must still skip exactly
+    // one blob rather than taking the whole run down, and it must never be
+    // mistaken for a successful tokenization (Replace).
+    val cmd = shellScript("sleep 30")
+    val out = BlobExec.run("anything".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                           abortOnError = true, inserter, timeoutSeconds = 1)
+    out shouldBe BlobExec.Outcome.Skip
+  }
+
   // tiny `inside` helper to keep the test bodies readable
   private def inside[T](v: T)(pf: PartialFunction[T, Unit]): Unit =
     if (pf.isDefinedAt(v)) pf(v) else fail(s"value did not match: $v")
