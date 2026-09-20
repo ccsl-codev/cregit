@@ -21,6 +21,7 @@ BLOB_TIMEOUT=""; STALL_TIMEOUT=""
 
 TIMEOUT_RC=4
 STALL_RC=5
+PARSER_CRASH_RC=6
 
 usage() {
   cat >&2 <<EOF
@@ -39,8 +40,9 @@ usage: shard_build.sh --src <bare.git> --out <dir> [options]
   --stall-timeout N no-progress watchdog window, seconds        [blobExec default]
 
 exit status: 0 = ok, 2 = usage, $TIMEOUT_RC = a shard or the re-fold left blobs
-untokenized, $STALL_RC = a shard or the re-fold stalled and was killed, 1 = other
-failure. $TIMEOUT_RC and $STALL_RC are propagated deliberately: the caller uses
+untokenized, $STALL_RC = a shard or the re-fold stalled and was killed,
+$PARSER_CRASH_RC = a shard or the re-fold hit a parser crash, 1 = other
+failure. $TIMEOUT_RC, $STALL_RC and $PARSER_CRASH_RC are propagated deliberately: the caller uses
 them to keep the work directory for a step-2 resume.
 EOF
 }
@@ -131,6 +133,9 @@ for i in "${!pids[@]}"; do
     "$STALL_RC")
       log "SHARD ${ks[$i]} stalled and was killed by the watchdog (exit $rc, see $OUT/shard-${ks[$i]}/run.log)"
       escalate_resumable "$STALL_RC" ;;
+    "$PARSER_CRASH_RC")
+      log "SHARD ${ks[$i]} hit a parser crash (exit $rc, see $OUT/shard-${ks[$i]}/run.log)"
+      escalate_resumable "$PARSER_CRASH_RC" ;;
     *) log "SHARD ${ks[$i]} FAILED (see $OUT/shard-${ks[$i]}/run.log)"; fail=1 ;;
   esac
 done
@@ -156,7 +161,7 @@ python3 "$HERE/shard_merge.py" "${MERGE[@]}" 2>&1 | tee -a "$LOG"
 mrc=${PIPESTATUS[0]}
 case "$mrc" in
   0) ;;
-  "$TIMEOUT_RC"|"$STALL_RC")
+  "$TIMEOUT_RC"|"$STALL_RC"|"$PARSER_CRASH_RC")
     log "ABORT: re-fold reported incomplete-but-resumable work (exit $mrc)"
     exit "$mrc" ;;
   *) log "ABORT: merge failed (exit $mrc)"; exit 1 ;;

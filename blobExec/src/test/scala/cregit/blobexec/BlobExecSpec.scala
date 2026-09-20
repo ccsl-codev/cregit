@@ -101,19 +101,80 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     }
   }
 
-  test("zero exit, empty stdout against non-empty input → Replace with empty blob") {
+  // CHANGED ASSERTION. This test used to be "zero exit, empty stdout against
+  // non-empty input → Replace with empty blob", and it pinned the defect: a
+  // crashed srcML exits 0 through the wrapper with empty stdout, and that empty
+  // stdout was inserted as the file's tokenization. 36 files across 19 projects
+  // were published as 0-byte blobs that way, with nothing counting them. Zero
+  // output from non-empty input is now a counted failure, never a blob.
+  test("zero exit, empty stdout against non-empty input → Skip, counted, no blob") {
+    val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
     val cmd = shellScript("cat > /dev/null; true")
-    val outcome = BlobExec.run("x".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
-                               abortOnError = false, inserter)
-    inside(outcome) {
-      case BlobExec.Outcome.Replace(newId) =>
-        val r = repo.newObjectReader()
-        try {
-          r.open(newId).getBytes.length shouldEqual 0
-        } finally r.close()
-      case other =>
-        fail(s"expected Replace, got $other")
-    }
+    BlobExec.run("x".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                 abortOnError = false, inserter,
+                 onParserCrash = () => { crashes.incrementAndGet(); () }
+    ) shouldBe BlobExec.Outcome.Skip
+    crashes.get shouldEqual 1
+  }
+
+  // The other half of the distinction the fix has to make: an input that is
+  // genuinely empty may legitimately produce empty output, and must stay a plain
+  // Skip that is NOT counted as a crash.
+  test("zero exit, empty stdout against empty input → Skip, not counted a crash") {
+    val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
+    val cmd = shellScript("cat > /dev/null; true")
+    BlobExec.run(Array.emptyByteArray, sampleSha, "x.c", "src/x.c", cmd,
+                 abortOnError = false, inserter,
+                 onParserCrash = () => { crashes.incrementAndGet(); () }
+    ) shouldBe BlobExec.Outcome.Skip
+    crashes.get shouldEqual 0
+  }
+
+  test("the parser-crash exit status is Skip, counted, and never a Replace") {
+    val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
+    // Writes plausible-looking output first, so the test proves the status is what
+    // rejects it rather than the emptiness check: a crashed srcML can emit a
+    // truncated prefix before dying, and that prefix must never become a blob.
+    val cmd = shellScript(s"echo 'partial tokens'; exit ${BlobExec.ParserCrashExitCode}")
+    BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                 abortOnError = false, inserter,
+                 onParserCrash = () => { crashes.incrementAndGet(); () }
+    ) shouldBe BlobExec.Outcome.Skip
+    crashes.get shouldEqual 1
+  }
+
+  test("a parser crash skips one blob even with abortOnError, like a timeout") {
+    // The hostile case: one crashing blob must not take down a run that has
+    // already folded thousands of commits. It gates publication through the exit
+    // status instead (Main.exitStatus), which is where a timeout gates it too.
+    val cmd = shellScript(s"exit ${BlobExec.ParserCrashExitCode}")
+    BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                 abortOnError = true, inserter) shouldBe BlobExec.Outcome.Skip
+  }
+
+  test("a parser crash is counted separately from a timeout, and only when it happens") {
+    val crashes  = new java.util.concurrent.atomic.AtomicInteger(0)
+    val timeouts = new java.util.concurrent.atomic.AtomicInteger(0)
+    def run(cmd: String, secs: Int = 30): BlobExec.Outcome =
+      BlobExec.run("hello".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                   abortOnError = false, inserter, timeoutSeconds = secs,
+                   onTimeout     = () => { timeouts.incrementAndGet(); () },
+                   onParserCrash = () => { crashes.incrementAndGet(); () })
+
+    run(shellScript(s"exit ${BlobExec.ParserCrashExitCode}"))
+    crashes.get  shouldEqual 1
+    timeouts.get shouldEqual 0   // a crash is not a timeout: different remedy
+
+    run(shellScript("sleep 30"), secs = 1)
+    timeouts.get shouldEqual 1
+    crashes.get  shouldEqual 1   // a timeout is not a crash
+
+    // A healthy blob and an ordinary failure must leave both counts alone, or a
+    // project would be held back from publication for nothing.
+    run(shellScript("tr a-z A-Z"))
+    run(shellScript("exit 7"))
+    crashes.get  shouldEqual 1
+    timeouts.get shouldEqual 1
   }
 
   test("a child that never exits is killed at its budget, not awaited forever") {
