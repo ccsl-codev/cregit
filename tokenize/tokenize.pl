@@ -150,7 +150,26 @@ sub Tokenize {
     }
 
     my $status = execute_command(@command);
-    die "Unable to execute command @command" if $status != 0;
+    return if $status == 0;
+
+    # Propagate the parser's own exit status instead of die-ing, which would
+    # collapse every failure onto 255. tokenizeSrcMl.pl signals "srcML died / the
+    # tokenization is unusable" with a specific status, and blobExec counts that
+    # status separately from an ordinary error -- so flattening it here would put
+    # the crash back into the untraceable bucket it came from.
+    if ($status == -1) {
+        die "Unable to execute command @command: $!";
+    }
+    my $signal = $status & 127;
+    if ($signal) {
+        die "command @command was killed by signal $signal";
+    }
+    my $exitCode = $status >> 8;
+    print STDERR "cregit: [@command] exited $exitCode; propagating that status\n";
+    if ($output) {
+        close(OUT);
+    }
+    exit($exitCode);
 }
 
 sub execute_command {
