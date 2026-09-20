@@ -114,13 +114,51 @@ for rc in 4 5; do
     rm -rf "$O" "$S"
 done
 
+echo "case 5bis: serial branch, blobExec exits 6 - parser-crash marker written"
+# The silent-empty defect: srcML dies on a signal, the wrapper used to report
+# success with zero bytes, and a 0-byte tokenization was published. Exit 6 is that
+# failure made visible, and it must keep the work rather than wipe it: the fix is a
+# denylist entry or a fixed srcML, not a re-run, so the memo has to survive.
+W=$(fixture)
+OUT=$(STUB_RC=6 run_step2 "$W"); RC=$?
+[ "$RC" -ne 0 ]; check "step 2 refuses to continue (exit $RC)" $?
+[ -f "$W/TOKENIZE-PARSER-CRASHES" ]; check "TOKENIZE-PARSER-CRASHES written" $?
+[ -f "$W/proj-blobmap.db" ]; check "the work is still there" $?
+grep -q "denylist" <<<"$OUT"; check "names the denylist as the remedy" $?
+grep -qi "not.*slowness\|blob-timeout will not help" <<<"$OUT"; check "says --blob-timeout will not help" $?
+rm -rf "$W"
+
+echo "case 5ter: sharded branch, a shard exits 6 - same marker"
+W=$(fixture)
+OUT=$(STUB_RC=6 run_step2 "$W" --mode sharded --shards 2); RC=$?
+[ "$RC" -ne 0 ]; check "step 2 refuses to continue (exit $RC)" $?
+[ -f "$W/TOKENIZE-PARSER-CRASHES" ]; check "TOKENIZE-PARSER-CRASHES written for a sharded build" $?
+rm -rf "$W"
+
+echo "case 5quater: shard_build.sh propagates 6 rather than collapsing to 1"
+# Without this a parser crash in a sharded build exits 1, the marker is never
+# written, and a later step-1 run deletes a days-long build to rediscover it.
+O=$(mktemp -d "${TMPDIR:-/tmp}/shardout-XXXXXX")
+S=$(mktemp -d "${TMPDIR:-/tmp}/shardsrc-XXXXXX")
+PATH="$BIN:$PATH" STUB_RC=6 timeout 300 "$SHARD_BUILD" \
+    --src "$S" --out "$O" --shards 2 \
+    --jar "$ROOT/blobExec/target/scala-2.13/blobExec-0.1.0-assembly.jar" \
+    --command "$ROOT/tokenizeByBlobId/tokenBySha.pl" \
+    --mask '\.c$' --tok-cmd "true" > "$O/out.log" 2>&1
+GOT=$?
+[ "$GOT" -eq 6 ]; check "a shard exiting 6 makes shard_build.sh exit 6 (got $GOT)" $?
+! grep -q "merge + serial re-fold" "$O/out.log"; check "it does not merge a knowingly incomplete build (6)" $?
+rm -rf "$O" "$S"
+
 echo "case 6: a completed step 2 clears the markers"
 W=$(fixture)
 : > "$W/TOKENIZE-TIMEOUTS"
 : > "$W/TOKENIZE-STALLED"
+: > "$W/TOKENIZE-PARSER-CRASHES"
 OUT=$(STUB_RC=0 run_step2 "$W")  # fails later, at a step this test does not stub
 [ ! -f "$W/TOKENIZE-TIMEOUTS" ]; check "TOKENIZE-TIMEOUTS cleared" $?
 [ ! -f "$W/TOKENIZE-STALLED" ]; check "TOKENIZE-STALLED cleared" $?
+[ ! -f "$W/TOKENIZE-PARSER-CRASHES" ]; check "TOKENIZE-PARSER-CRASHES cleared" $?
 [ -d "$W/proj-cregit.git" ]; check "step 2 did produce its output" $?
 grep -q "clearing" <<<"$OUT"; check "says so in the log" $?
 rm -rf "$W"

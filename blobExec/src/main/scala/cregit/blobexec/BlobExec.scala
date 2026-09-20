@@ -23,6 +23,10 @@ object BlobExec {
   /** Per-blob wall-clock budget for the external command, in seconds. */
   val DefaultTimeoutSeconds: Int = 600
 
+  /** Tokenizer status meaning "no usable tokenization": srcML died on a signal, or
+    * produced no tokens. Must match `$PARSER_CRASH_EXIT` in tokenize/tokenizeSrcMl.pl. */
+  val ParserCrashExitCode: Int = 33
+
   sealed trait Outcome
   object Outcome {
     case object Skip                                      extends Outcome
@@ -43,20 +47,29 @@ object BlobExec {
       abortOnError: Boolean,
       inserter: ObjectInserter,
       timeoutSeconds: Int = DefaultTimeoutSeconds,
-      onTimeout: () => Unit = () => ()
+      onTimeout: () => Unit = () => (),
+      onParserCrash: () => Unit = () => ()
   ): Outcome = {
     val env = Seq("BFG_BLOB" -> origSha, "BFG_FILENAME" -> filename, "BFG_PATH" -> fullPath)
 
     new ChildRunner(timeoutSeconds).run(command, bytes, env) match {
       case ChildRunner.Outcome.Killed(why) =>
-        // Skips one blob and bypasses `abortOnError`: one wedged tokenizer must
-        // not end a run that has folded thousands of commits. `onTimeout` is the
-        // only trace left, because the child's output is discarded.
         System.err.println(
           s"Warning: command [$command] on blob $origSha at path [$fullPath] gave no usable " +
             s"result ($why): blob left untokenized"
         )
         onTimeout()
+        Outcome.Skip
+
+      case ChildRunner.Outcome.Exited(ParserCrashExitCode, _, stderr) =>
+        reportParserCrash(command, origSha, fullPath, s"reported a parser crash (exit $ParserCrashExitCode)", stderr)
+        onParserCrash()
+        Outcome.Skip
+
+      case ChildRunner.Outcome.Exited(0, stdout, stderr) if stdout.isEmpty && bytes.nonEmpty =>
+        reportParserCrash(command, origSha, fullPath,
+          s"reported a parser crash: exited 0 with no output for a ${bytes.length}-byte blob", stderr)
+        onParserCrash()
         Outcome.Skip
 
       case ChildRunner.Outcome.Exited(status, _, stderr) if status != 0 =>
@@ -71,6 +84,20 @@ object BlobExec {
     }
   }
 
+  private def reportParserCrash(
+      command: String,
+      origSha: String,
+      fullPath: String,
+      what: String,
+      stderr: String
+  ): Unit = {
+    System.err.println(
+      s"Warning: command [$command] $what on blob $origSha at path [$fullPath]: " +
+        "blob left untokenized rather than written as an empty tokenization"
+    )
+    printStderr(command, origSha, fullPath, stderr)
+  }
+
   private def logError(
       command: String,
       origSha: String,
@@ -81,11 +108,14 @@ object BlobExec {
     System.err.println(
       s"Warning: error executing command [$command] on blob $origSha at path [$fullPath]: exit code $exitCode"
     )
+    printStderr(command, origSha, fullPath, stderr)
+  }
+
+  private def printStderr(command: String, origSha: String, fullPath: String, stderr: String): Unit =
     if (stderr.nonEmpty) {
       System.err.println(s"--- stderr from $command on $origSha ($fullPath) ---")
       System.err.print(stderr)
       if (!stderr.endsWith("\n")) System.err.println()
       System.err.println("--- end stderr ---")
     }
-  }
 }

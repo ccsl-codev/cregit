@@ -37,6 +37,10 @@ object Main {
     * succeeded, but the output is incomplete and must not be validated. */
   private[blobexec] val TimedOutExitStatus = 4
 
+  /** srcML died on a signal, or produced no tokens. Distinct from
+    * [[TimedOutExitStatus]] because --blob-timeout does nothing for a segfault. */
+  private[blobexec] val ParserCrashedExitStatus = 6
+
   /** Upper bound on either timeout flag. A week is already far past any real
     * budget, and bounding the input here is what keeps every window derived from
     * it inside `Int`. */
@@ -47,11 +51,12 @@ object Main {
     * as "no limit". */
 
   /** The process exit status for a finished walk.
-    * Only an abort and a killed tokenizer gate publication; blobsOversized and
-    * blobsDenylisted do not. */
+    * Only an abort, a killed tokenizer and a parser crash gate publication;
+    * blobsOversized and blobsDenylisted do not. */
   private[blobexec] def exitStatus(stats: WalkStats): Int =
     if (stats.aborted) 2
     else if (stats.blobsTimedOut > 0) TimedOutExitStatus
+    else if (stats.blobsParserCrashed > 0) ParserCrashedExitStatus
     else 0
 
   /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
@@ -299,6 +304,7 @@ object Main {
         s"blobsTimedOutEver=$timedOutEver " +
         s"blobsOversized=${stats.blobsOversized} " +
         s"blobsDenylisted=${stats.blobsDenylisted} " +
+        s"blobsParserCrashed=${stats.blobsParserCrashed} " +
         s"aborted=${stats.aborted}"
     )
 
@@ -343,8 +349,29 @@ object Main {
       )
     }
 
+    if (stats.blobsParserCrashed > 0) {
+      System.err.println(
+        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsParserCrashed} blob(s) had their " +
+          "tokenizer report a parser crash this run. Each one is named on a 'reported a parser " +
+          "crash' line above, with the failing stage and signal. This is srcML dying on a signal " +
+          "(SIGSEGV or SIGABRT) on a C/C++ input, or returning no tokens at all; before this was " +
+          "detected such a blob became a silent 0-byte tokenization and the file simply vanished " +
+          "from the dataset with nothing counting it. Nothing was recorded for the containing " +
+          "commit: no blob row, no tree row, no commit row. " +
+          "Unlike a timeout this is deterministic, so re-running alone will NOT clear it and " +
+          "--blob-timeout is irrelevant — more time does not help a segfault. The two real " +
+          "remedies are: fix or upgrade srcML (1.1.0 faults in its C/C++ position tracking, and " +
+          "tokenizeSrcMl.pl cannot drop --position: it parses srcml2token's line:col prefix), or, once a " +
+          "specific blob is diagnosed, add it to the blob denylist with its reason and citation " +
+          s"(${BlobDenylist.ResourcePath}) so it is excluded deterministically and reported " +
+          "without blocking publication."
+      )
+    }
+
+    val status = exitStatus(stats)
+    if (status != 0) System.err.println(s"blobExec: exiting $status")
     // Exit explicitly: abandoned daemon readers must not decide JVM exit.
-    sys.exit(exitStatus(stats))
+    sys.exit(status)
   }
 
   private def openSrc(path: java.nio.file.Path): FileRepository = {

@@ -29,6 +29,16 @@ final case class WalkStats(
     /** Distinct mask-matched blobs excluded because they are on the shipped blob
       * denylist. Reported, not gating. */
     blobsDenylisted: Long,
+    /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]: srcML died
+      * on a signal, or the token stream came back empty. Like [[blobsTimedOut]]
+      * and unlike [[blobsOversized]]/[[blobsDenylisted]] this DOES block
+      * publication, because an unexplained parser death is exactly the defect that
+      * used to be written out as a silent 0-byte tokenization. It is a separate
+      * counter rather than more timeouts because the two need different fixes: a
+      * timeout wants --blob-timeout, a crash wants the blob denylisting or srcML
+      * fixing. Defaulted so that adding it did not have to touch callers that
+      * construct [[WalkStats]] for other reasons. */
+    blobsParserCrashed: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
     originalBlobCopies: Long,
@@ -69,6 +79,7 @@ final class Walker(
   private val blobsTimedOut                  = new LongAdder
   private val blobsOversized                 = new LongAdder
   private val blobsDenylisted                = new LongAdder
+  private val blobsParserCrashed             = new LongAdder
   private val originalBlobCopyRequests       = new LongAdder
   private val originalBlobCopies             = new LongAdder
   private val originalBlobAlreadyPresent     = new LongAdder
@@ -207,7 +218,8 @@ final class Walker(
         aborted                = aborted,
         blobsTimedOut          = blobsTimedOut.sum(),
         blobsOversized         = blobsOversized.sum(),
-      blobsDenylisted        = blobsDenylisted.sum(),
+        blobsDenylisted        = blobsDenylisted.sum(),
+        blobsParserCrashed     = blobsParserCrashed.sum(),
         blobCommandExecutions       = blobCommandExecutions.sum(),
         originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
         originalBlobCopies          = originalBlobCopies.sum(),
@@ -246,6 +258,7 @@ final class Walker(
       blobsTimedOut          = blobsTimedOut.sum(),
       blobsOversized         = blobsOversized.sum(),
       blobsDenylisted        = blobsDenylisted.sum(),
+      blobsParserCrashed     = blobsParserCrashed.sum(),
       blobCommandExecutions       = blobCommandExecutions.sum(),
       originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
       originalBlobCopies          = originalBlobCopies.sum(),
@@ -837,7 +850,9 @@ final class Walker(
     inFlightBlobs.put(label, System.nanoTime())
     try {
       blobCommandExecutions.increment()
-      val timedOut = new AtomicBoolean(false)
+      // Set by either callback below: both mean "this blob's tokenization is
+      // unusable, so nothing about it may be persisted".
+      val unusable = new AtomicBoolean(false)
       val outcome = BlobExec.run(
         bytes        = bytes,
         origSha      = task.origId.name,
@@ -847,12 +862,15 @@ final class Walker(
         abortOnError = abortOnError,
         inserter     = workerInserter,
         timeoutSeconds = blobTimeoutSeconds,
-        onTimeout      = () => { blobsTimedOut.increment(); timedOut.set(true) }
+        onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
+        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
       )
       val res = outcome match {
-        case BlobExec.Outcome.Skip if timedOut.get() =>
+        case BlobExec.Outcome.Skip if unusable.get() =>
           // The tree must still reference something, so keep the original bytes
-          // available — but report it as TimedOut so nothing gets persisted.
+          // available — but report it as TimedOut so nothing gets persisted. A
+          // parser crash takes this same branch: the name is now narrower than the
+          // meaning, which is "unusable, persist nothing".
           ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
           BlobResult.TimedOut(task.origId)
         case BlobExec.Outcome.Skip =>
@@ -989,7 +1007,9 @@ final class Walker(
           inFlightBlobs.put(label, System.nanoTime())
           try {
             blobCommandExecutions.increment()
-            val timedOut = new AtomicBoolean(false)
+            // Set by either callback below: both mean "this blob's tokenization is
+      // unusable, so nothing about it may be persisted".
+      val unusable = new AtomicBoolean(false)
             val outcome = BlobExec.run(
               bytes        = bytes,
               origSha      = task.origId.name,
@@ -999,7 +1019,8 @@ final class Walker(
               abortOnError = abortOnError,
               inserter     = workerInserter,
               timeoutSeconds = blobTimeoutSeconds,
-              onTimeout      = () => { blobsTimedOut.increment(); timedOut.set(true) }
+              onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
+              onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
             )
             // A Skip keeps the original id, so those bytes must exist in dst.
             outcome match {
@@ -1008,7 +1029,7 @@ final class Walker(
             }
             workerInserter.flush()
             progress(s"blob $label")
-            (task, outcome, timedOut.get())
+            (task, outcome, unusable.get())
           } finally {
             inFlightBlobs.remove(label)
             workerInserter.close()
