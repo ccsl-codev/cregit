@@ -71,7 +71,7 @@ my $count = 0;
 my $alreadyDone = 0;
 my $errorCount = 0;
 my %running;
-my @todo;
+my @filesToBlame;
 
 foreach (@trackedFiles) {
 #    next unless /^kernel/;
@@ -80,8 +80,6 @@ foreach (@trackedFiles) {
     if ($fileRegExpr ne "") {
         next unless /$fileRegExpr/;
     }
-
-
 
     my $name = $_;
 
@@ -100,12 +98,13 @@ foreach (@trackedFiles) {
         $alreadyDone ++;
         next;
     }
-    push @todo, $name;
+    push @filesToBlame, $name;
 }
 
-make_output_dirs($outputDir, $blameExtension, \@todo);
+# Before the first fork, so two workers cannot race to create the same directory.
+make_output_dirs($outputDir, $blameExtension, \@filesToBlame);
 
-foreach my $name (@todo) {
+foreach my $name (@filesToBlame) {
     $count++;
     print STDERR ("$count: $name\n");
 
@@ -118,9 +117,9 @@ print "Newly processed [$count] Already done [$alreadyDone] files Error [$errorC
 exit($errorCount == 0 ? 0 : 1);
 
 sub make_output_dirs {
-    my ($outputDir, $blameExtension, $todo) = @_;
+    my ($outputDir, $blameExtension, $files) = @_;
     my %seen;
-    foreach my $name (@$todo) {
+    foreach my $name (@$files) {
         my $dir = dirname("$outputDir/$name$blameExtension");
         next if $seen{$dir}++;
         next if -d $dir;

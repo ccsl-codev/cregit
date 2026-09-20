@@ -2,12 +2,8 @@
 
 These three functions walk a token stream and the original source side by side.
 They must agree, and when the source runs out first they must stop rather than
-crash: the dataset step runs last, after tokenising and blaming, so a crash here
-throws away the whole project's work. microsoft/terminal died in skip_literal
-after 2,204 seconds:
-
-    TypeError: can only concatenate str (not "NoneType") to str
-      at generate_dataset.py:145 in skip_literal
+crash: the dataset step runs last, so a crash here throws away the whole
+project's work.
 
 Run with:  python3 -m pytest generate_dataset/test_generate_dataset.py
 """
@@ -40,9 +36,7 @@ def test_stops_instead_of_crashing_when_the_source_runs_out(fn):
 
 
 def test_skip_literal_survives_source_ending_in_whitespace():
-    """The exact shape that killed microsoft/terminal.
-
-    The token is non-whitespace while the source is whitespace, so skip_literal
+    """The token is non-whitespace while the source is whitespace, so skip_literal
     enters its inner loop, consumes to end-of-source, and comes back with
     ch = None. The guard at the top of the iteration cannot see that.
     """
@@ -164,10 +158,7 @@ def test_output_directory_is_created_when_absent(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# the DuckDB heap cap. DuckDB's default limit is 80% of *total* RAM, so on a
-# shared box it sits above what is free and the kernel kills the process before
-# DuckDB spills. That killed the Linux run at step 10 on 2026-09-14, at 17.5 GB
-# resident on a 30 GB host, after tokenising and blaming had both succeeded.
+# the DuckDB heap cap
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("text", ["8GB", "512MB", "1.5GiB", "8 GB", "8gb", "64KB"])

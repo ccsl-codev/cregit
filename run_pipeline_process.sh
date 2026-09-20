@@ -29,34 +29,33 @@ Target repository:
 
 Output:
   --skip-html       do not generate the HTML views (step 9). The views cost
-                    94-255 MB per project and step 10 does not read them, so a
-                    corpus run that only wants the Parquet dataset should skip
-                    them. NOTE: the HTML views are the fallback output when
-                    python3+duckdb is missing, so --skip-html without duckdb
-                    leaves the run with no final artifact.
+                    94-255 MB per project and the dataset generator does not
+                    read them, so a run that only wants the Parquet dataset
+                    should skip them. NOTE: the HTML views are the fallback
+                    output when python3+duckdb is missing, so --skip-html
+                    without duckdb leaves the run with no final artifact.
   --gc MODE         how to pack the generated cregit repo after tokenizing
                     (default: plain)
                       none        do not pack at all. Fastest, but every later
                                   step then reads loose objects.
                       plain       git gc --prune=now
-                      aggressive  git gc --prune=now --aggressive. Measured on
-                                  Linux (22 M loose objects) this failed with
-                                  "failed to run repack" after hours of work.
+                      aggressive  git gc --prune=now --aggressive. Slowest, and
+                                  its delta search can fail outright on a repo
+                                  with millions of loose objects.
                     A failed pack never aborts the run: the Parquet dataset is
                     the product, and packing only makes later steps faster.
   --memory-limit SIZE
-                    forward --memory-limit to step 10 (the DuckDB generator).
+                    cap the DuckDB heap in the dataset generator (step 10).
                     Omit to accept that script's own default of 8GB. Takes an
                     absolute size such as 3GB, never a percentage.
-                    Measured: the limit bounds DuckDB's buffers, not the
-                    process, which settles at about 1.4x the limit. A corpus run
-                    with N concurrent projects must therefore budget
-                    1.4 x N x SIZE of RAM. Two projects at 8GB need 22 GB and
-                    will exhaust a 30 GB box that already runs other software.
+                    The limit bounds DuckDB's buffers, not the process, which
+                    settles at about 1.4x the limit. A run with N projects in
+                    parallel must therefore budget 1.4 x N x SIZE of RAM.
   --duckdb-threads N
-                    forward --duckdb-threads to step 10. Each sorting thread
-                    holds its own buffers, so fewer threads lower the peak.
-                    Omit to accept the generator's default.
+                    cap DuckDB's worker threads in the dataset generator. Each
+                    sorting thread holds its own buffers, so fewer threads lower
+                    the peak. Omit to accept the generator's default of 0, which
+                    lets DuckDB choose.
 
 Tokenizer:
   --mode MODE   tokenizer walk mode (default: pipeline)
@@ -69,10 +68,9 @@ Tokenizer:
   --shards N    shard count for --mode sharded (default: 4)
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
-                bottleneck: measured on Linux the serial step managed 8 files
-                per minute against 64,536 files, which is 5.6 days. Each
-                file is independent, so the output does not depend on N. The
-                step is resumable, so N can change between runs.
+                bottleneck. Each file is independent, so the output does not
+                depend on N. The step is resumable, so N can change between
+                runs.
   FROM_STEP     resume from this step number (default: 1). A full run (step 1)
                 starts clean; resuming keeps existing work.
 
@@ -90,21 +88,8 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-# pack_cregit_repo: pack the generated repo, honouring --gc, and never abort.
-#
-# The repack is an optimisation, not a product. The keeper is the Parquet
-# dataset. So a repack failure must not end the run.
-#
-# Measured on Linux, 2026-09-14: `gc --prune=now --aggressive` on 22,258,632
-# loose objects printed "cannot be read" for four objects and then "failed to
-# run repack", exit 128. All four objects read fine with `git cat-file -t`
-# afterwards, so repack exhausted a resource rather than finding damage.
-# Because `set -euo pipefail` is on and the old call was unguarded, that exit
-# aborted the script and fired the EXIT trap, which deletes $WORK. One optional
-# optimisation was able to destroy 15.2 h of finished tokenizing.
-#
-# Default is `plain`: it packs the loose objects, which every later step reads
-# back, without the --window=250 --depth=50 delta search that failed.
+# The pack is an optimisation, not the product. A failed pack must not abort the
+# run: under `set -euo pipefail` that fires the EXIT trap, which deletes $WORK.
 pack_cregit_repo() {
     case "$GC_MODE" in
         none)
@@ -116,8 +101,6 @@ pack_cregit_repo() {
         *) die "--gc takes none, plain or aggressive (got '$GC_MODE')" ;;
     esac
 
-    git --git-dir="$REPO_PATH_CREGIT_BARE" reflog expire --expire=now --all \
-        || log "warning: reflog expire failed; continuing"
     # shellcheck disable=SC2086
     if git --git-dir="$REPO_PATH_CREGIT_BARE" gc $gc_args; then
         log "gc ($GC_MODE) done"
@@ -126,6 +109,21 @@ pack_cregit_repo() {
         log "warning: later steps run unpacked, so they read more slowly"
     fi
     return 0
+}
+
+build_dataset_argv() {
+    DATASET_ARGV=(
+        --blame-dir  "$WORK/blame"
+        --source-dir "$REPO_PATH_ORIGINAL"
+        --cregit-db  "$DB_PATH_CREGIT"
+        --persons-db "$DB_PATH_PERSONS"
+        --output     "$DATASET_PATH"
+        --repo-name  "$REPO_NAME"
+        --verbose
+    )
+    [ -n "$MEMORY_LIMIT" ]   && DATASET_ARGV+=(--memory-limit "$MEMORY_LIMIT")
+    [ -n "$DUCKDB_THREADS" ] && DATASET_ARGV+=(--duckdb-threads "$DUCKDB_THREADS")
+    return 0   # a false test above must not fail the function under `set -e`
 }
 
 MODE="pipeline"
@@ -146,9 +144,6 @@ MASK='\.[ch]$'
 WORK="../cregit-files"
 SKIP_HTML=0
 GC_MODE="plain"
-# Empty means "do not pass the flag", so generate_dataset.py keeps its own
-# default. Step 10 settles at about 1.4x the limit, so a corpus run with N
-# concurrent projects must budget 1.4 x N x limit of RAM.
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
 
@@ -178,17 +173,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# Reject a bad --gc value now, not after tokenizing. pack_cregit_repo runs at the
-# end of step 2, so a typo caught there costs the whole tokenize first.
+# Validate early: pack_cregit_repo runs only once tokenizing has finished.
 case "$GC_MODE" in
     none|plain|aggressive) ;;
     *) echo "invalid --gc: '$GC_MODE' (want none, plain or aggressive)" >&2; exit 2 ;;
 esac
 
-# Step 10 is the LAST step, so a typo here costs the whole run. Reject it now.
-# The rule mirrors parse_memory_limit() in generate_dataset.py: an absolute
-# size, never a percentage, because a percentage measures total RAM and only the
-# free part is usable.
+# Validate early: the dataset generator is the last step. Mirrors
+# parse_memory_limit() in generate_dataset.py, which refuses a percentage
+# because a percentage measures total RAM, not the free part.
 if [ -n "$MEMORY_LIMIT" ]; then
     case "$MEMORY_LIMIT" in
         *%) echo "invalid --memory-limit: '$MEMORY_LIMIT' takes an absolute size, not a percentage (example: 3GB)" >&2; exit 2 ;;
@@ -310,14 +303,30 @@ build_all() {
     log "build complete"
 }
 
-# Build only what is missing, so an already-built checkout starts instantly.
+# needs_build <artifact> <source path>...: true when the artifact is missing, or
+# when any source is newer than it. Staleness has to count, not just absence: a
+# jar left behind by another branch's checkout is reused otherwise, and the
+# pipeline then runs that branch's code without saying so.
+needs_build() {
+    artifact=$1
+    shift
+    [ -e "$artifact" ] || return 0
+    [ -n "$(find "$@" -type f -newer "$artifact" -print -quit 2>/dev/null)" ]
+}
+
+# Build only what is missing or out of date, so an up-to-date checkout starts
+# instantly. Each list names sources only, never a target/ directory: build
+# output is newer than the artifact by definition and would always look stale.
 ensure_artifacts() {
-    [ -x "$SRCML2TOKEN" ]      || build_srcml2token
-    [ -x "$RUST_TOKENIZER" ]   || build_rust_tokenizer
-    [ -f "$BFG" ]              || build_blobexec
-    [ -f "$SLICKGITLOG_JAR" ]  || build_legacy_jar slickGitLog
-    [ -f "$PERSONS_JAR" ]      || build_legacy_jar persons
-    [ -f "$REMAPCOMMITS_JAR" ] || build_legacy_jar remapCommits
+    S="$CREGIT/tokenize/srcMLtoken"
+    R="$CREGIT/tokenize/rustTokenizer"
+    needs_build "$SRCML2TOKEN"      "$S"/*.cpp "$S"/*.hpp "$S/Makefile"          && build_srcml2token
+    needs_build "$RUST_TOKENIZER"   "$R/src" "$R/Cargo.toml" "$R/Cargo.lock"     && build_rust_tokenizer
+    needs_build "$BFG"              "$CREGIT/blobExec/src" "$CREGIT/blobExec/build.sbt" "$CREGIT/blobExec/project" && build_blobexec
+    needs_build "$SLICKGITLOG_JAR"  "$CREGIT/slickGitLog/src" "$CREGIT/slickGitLog/build.sbt"   && build_legacy_jar slickGitLog
+    needs_build "$PERSONS_JAR"      "$CREGIT/persons/src" "$CREGIT/persons/build.sbt"           && build_legacy_jar persons
+    needs_build "$REMAPCOMMITS_JAR" "$CREGIT/remapCommits/src" "$CREGIT/remapCommits/build.sbt" && build_legacy_jar remapCommits
+    return 0   # a false needs_build above must not fail the function under `set -e`
 }
 
 if [ "$BUILD_ONLY" = 1 ]; then
@@ -368,8 +377,6 @@ fi
 
 LOG_FILE="${WORK}/pipeline.log"
 mkdir -p $WORK/memo $WORK/blame
-# memo/ is mandatory: tokenizeByBlobId/tokenBySha.pl dies without BFG_MEMO_DIR.
-# html/ is only created when step 9 will actually write into it.
 [ "$SKIP_HTML" = 1 ] || mkdir -p $WORK/html
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -508,9 +515,7 @@ fi
 end_step
 
 # ---------------------------------------------------------------------------
-# Step 9 — generate HTML views
-#          Skippable: nothing downstream reads $WORK/html. Step 10 builds the
-#          Parquet dataset from the blame dir and the DBs only.
+# Step 9 — generate HTML views (skippable: nothing downstream reads $WORK/html)
 # ---------------------------------------------------------------------------
 step "generate HTML views"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
@@ -539,26 +544,8 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 DATASET_SCRIPT="$CREGIT/generate_dataset/generate_dataset.py"
 [ -f "$DATASET_SCRIPT" ] || die "dataset generator not found: $DATASET_SCRIPT"
 if [ -n "$PYTHON" ] && "$PYTHON" -c 'import duckdb' 2>/dev/null; then
-# Collect the optional flags, so an empty value passes nothing and the generator
-# keeps its own default. An array, not "$@": overwriting the positional
-# parameters here would be a side effect on the whole script.
-DATASET_OPTS=()
-if [ -n "$MEMORY_LIMIT" ]; then
-    DATASET_OPTS+=(--memory-limit "$MEMORY_LIMIT")
-fi
-if [ -n "$DUCKDB_THREADS" ]; then
-    DATASET_OPTS+=(--duckdb-threads "$DUCKDB_THREADS")
-fi
-# ${a[@]+"${a[@]}"} keeps an empty array safe under `set -u`.
-"$PYTHON" "$DATASET_SCRIPT" \
-  --blame-dir  "$WORK/blame" \
-  --source-dir "$REPO_PATH_ORIGINAL" \
-  --cregit-db  "$DB_PATH_CREGIT" \
-  --persons-db "$DB_PATH_PERSONS" \
-  --output     "$DATASET_PATH" \
-  --repo-name  "$REPO_NAME" \
-  ${DATASET_OPTS[@]+"${DATASET_OPTS[@]}"} \
-  --verbose
+build_dataset_argv
+"$PYTHON" "$DATASET_SCRIPT" "${DATASET_ARGV[@]}"
 log "dataset written: $DATASET_PATH"
 elif [ "$SKIP_HTML" = 1 ]; then
 die "python3 with the duckdb module is unavailable (provided by devenv shell) and --skip-html suppressed the HTML views — this run produced no final artifact"
