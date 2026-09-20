@@ -82,6 +82,7 @@ in
     pkgs.gcc
     pkgs.sqlite
     pkgs.git-filter-repo
+    pkgs.shellcheck
 
     srcml
     pkgs.universal-ctags
@@ -99,4 +100,12 @@ in
   languages.rust.enable = true;
 
   env.LEGACY_JAVA_HOME = "${legacyJdk}";
+
+  # `devenv test` gates every tracked shell script. The threshold is `error`
+  # because the two scripts already carry 31 lower findings; raise it to
+  # `warning` once those are fixed.
+  enterTest = ''
+    git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -S error
+    echo "shellcheck: no errors"
+  '';
 }
