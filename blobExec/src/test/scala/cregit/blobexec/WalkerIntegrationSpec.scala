@@ -635,20 +635,10 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
 
   // -- shared dir helpers ----------------------------------------------------
 
-
   // -- large pass-through blob (regression) ----------------------------------
   //
-  // redis/redis failed after 1,684s of real work with:
-  //   org.eclipse.jgit.errors.LargeObjectException: 12e1ac54... exceeds size limit
-  //     at cregit.blobexec.Walker.ensureOriginalBlobAvailable
-  //
-  // A blob that does not match the mask is copied verbatim, so its size is
-  // whatever the project committed, not the size of a source file.
-  // ObjectLoader.getBytes refuses anything above JGit's stream threshold, so the
-  // copy path must stream instead of materialising.
-  //
-  // The threshold is lowered here so a small blob reproduces it in milliseconds
-  // rather than needing a 50 MB fixture.
+  // Lowering the threshold lets a small blob cross it, so the regression
+  // reproduces in milliseconds instead of needing a 50 MB fixture.
   private def withStreamFileThreshold[T](bytes: Int)(body: => T): T = {
     val lowered = new WindowCacheConfig
     lowered.setStreamFileThreshold(bytes)

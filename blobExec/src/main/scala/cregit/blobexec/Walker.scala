@@ -821,20 +821,12 @@ final class Walker(
 
   /** Copy one original blob from src into dst by streaming it. Returns (id, size).
     *
-    * Replaces readBlob on the pass-through path. `ObjectLoader.getBytes` throws
-    * LargeObjectException above JGit's stream threshold, and a blob that does not
-    * match the mask is copied verbatim, so its size is whatever the project
-    * committed rather than the size of a source file. redis/redis failed this way
-    * after 1,684s of work:
+    * Used instead of readBlob on the pass-through path, where a blob keeps the
+    * size the project committed: `ObjectLoader.getBytes` throws
+    * LargeObjectException above JGit's stream threshold, and raising the
+    * threshold would still hold the whole blob in the heap.
     *
-    *   org.eclipse.jgit.errors.LargeObjectException: 12e1ac54... exceeds size limit
-    *     at cregit.blobexec.Walker.ensureOriginalBlobAvailable(Walker.scala:912)
-    *
-    * Streaming also removes the memory spike. Raising the threshold instead would
-    * still hold the whole blob, and three concurrent projects on a 30 GiB box
-    * cannot each afford a large fixture.
-    *
-    * The reader stays open for the whole copy: closing it before the stream is
+    * The reader stays open for the whole copy. Closing it before the stream is
     * consumed would invalidate the stream.
     */
   private def streamBlobInto(id: ObjectId, inserter: ObjectInserter): (ObjectId, Long) = {

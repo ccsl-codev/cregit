@@ -139,12 +139,8 @@ def skip_literal(token_value: str, reader: SourceReader) -> str:
             while ch is not None and is_ws(ch):
                 text += ch
                 ch = reader.read_char()
-        # The loop above consumes to end-of-source, so `ch` may be None again.
-        # The guard at the top of the iteration cannot cover that, and without
-        # this one `text += ch` below raises:
-        #   TypeError: can only concatenate str (not "NoneType") to str
-        # microsoft/terminal died that way after 2,204s of work. skip_comment
-        # already re-checks in the same place; skip_literal did not.
+        # The loop above can consume to end-of-source, so `ch` may be None again.
+        # The guard at the top of the iteration cannot cover that.
         if ch is None:
             break
         if not is_ws(ch) and is_ws(cT):
@@ -306,9 +302,8 @@ def process_blame_file(
     counted = [0]
 
     def rows():
-        # Order matters. classify_and_skip advances `reader`, so the tokens have
-        # to be consumed in file order. executemany walks this generator
-        # sequentially, which keeps that order.
+        # classify_and_skip advances `reader`, so the tokens must be consumed in
+        # file order. executemany walks this generator sequentially.
         for token_index, bline in enumerate(blame_lines):
             parsed = parse_blame_line(bline)
             if parsed is None:
@@ -330,10 +325,9 @@ def process_blame_file(
                 info["func_name"],
             )
 
-    # executemany over a generator, not one execute per token. Linux reaches
-    # this step with hundreds of millions of tokens, and at that scale the
-    # per-call Python overhead dominates. A generator keeps the memory bounded,
-    # so a single large file cannot be held in a list.
+    # executemany over a generator, not one execute per token: at hundreds of
+    # millions of tokens the per-call overhead dominates, and a generator keeps
+    # the memory bounded.
     db_cursor.executemany(
         """INSERT INTO token_map
            (file_path, token_index, commit_sha, token_type, token_value,
@@ -349,11 +343,8 @@ def process_blame_file(
 # Main
 # ===================================================================
 
-# DuckDB's own default memory limit is 80% of *total* RAM. On a shared box the
-# rest of that RAM is already taken, so 80% is more than what is free: the
-# kernel kills the process before DuckDB decides to spill. The Linux run died
-# that way on 2026-09-14, at 17.5 GB resident on a 30 GB host, in step 10.
-# So the limit is explicit here.
+# DuckDB defaults to 80% of *total* RAM. On a shared box that exceeds what is
+# free, so the kernel kills the process before DuckDB decides to spill.
 DEFAULT_MEMORY_LIMIT = "8GB"
 
 _MEMORY_LIMIT_RE = re.compile(
