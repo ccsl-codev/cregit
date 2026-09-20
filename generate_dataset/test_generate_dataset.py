@@ -361,11 +361,17 @@ def build_tiny_project(tmp_path):
     return blame, src, cregit_db, persons_db
 
 
-def generate(monkeypatch, tmp_path, repo_name="proj", argv_extra=()):
-    """Run main() for real and return the Parquet path."""
+def generate(monkeypatch, tmp_path, repo_name="proj", argv_extra=(), seed=None):
+    """Run main() for real and return the Parquet path.
+
+    `seed(cregit_db, persons_db)` runs after the tiny project is built and
+    before main(), for tests that need trailers or people in it.
+    """
     import generate_dataset as gd
 
     blame, src, cregit_db, persons_db = build_tiny_project(tmp_path)
+    if seed is not None:
+        seed(cregit_db, persons_db)
     out = tmp_path / "out" / "proj-dataset.parquet"
     monkeypatch.setattr(gd.sys, "argv", [
         "generate_dataset.py",
@@ -453,6 +459,84 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
         generate(monkeypatch, tmp_path,
                  argv_extra=("--project-meta", str(meta)))
     assert not (tmp_path / "out" / "proj-dataset.parquet").exists()
+
+
+# --------------------------------------------------------------------------- #
+# footer trailers -> personids. The join key is extracted from the trailer text
+# with a regex, and regexp_extract returns '' rather than NULL when it does not
+# match. That made the coalesce fallback dead code and turned a trailer with no
+# address at all into a join on '', which matches every `Name <>` row in emails.
+# --------------------------------------------------------------------------- #
+
+
+def seed_footers(*trailers, people=()):
+    """Return a `seed` for generate(): trailers into footers, people into
+    emails/persons. `people` is (personid, emailaddr, personname)."""
+    def seed(cregit_db, persons_db):
+        con = sqlite3.connect(cregit_db)
+        for idx, (key, value) in enumerate(trailers):
+            con.execute("INSERT INTO footers VALUES (?,?,?,?)",
+                        (SHA, idx, key, value))
+        con.commit()
+        con.close()
+        con = sqlite3.connect(persons_db)
+        for i, (pid, addr, pname) in enumerate(people, start=1):
+            con.execute("INSERT INTO emails (recordid, personid, fullemail, "
+                        "emailaddr, emailname) VALUES (?,?,?,?,?)",
+                        (i, pid, f"{pname} <{addr}>", addr, pname))
+            con.execute("INSERT OR IGNORE INTO persons VALUES (?,?)", (pid, pname))
+        con.commit()
+        con.close()
+    return seed
+
+
+def footers_of(duckdb, path):
+    return duckdb.sql("select footer_personids, footer_person_names, "
+                      f"footer_reviewed_by from read_parquet('{path}')").fetchone()
+
+
+def test_a_bare_address_trailer_resolves_to_a_personid(monkeypatch, tmp_path):
+    """`Reviewed-by: bob@example.com`, no angle brackets. The trailer text
+    reached footer_reviewed_by while footer_personids stayed empty, because the
+    coalesce never reached the bare-address pattern and that pattern had no
+    capture group anyway."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reviewed-by", "bob@example.com"),
+        people=[("bob", "bob@example.com", "Bob B")]))
+
+    ids, names, reviewed = footers_of(duckdb, out)
+    assert list(reviewed) == ["bob@example.com"]
+    assert list(ids) == ["bob"]
+    assert list(names) == ["Bob B"]
+
+
+def test_the_angle_bracket_form_still_wins_over_a_second_address(monkeypatch, tmp_path):
+    """Precedence, which the nullif must not disturb: a trailer holding both
+    forms resolves to the bracketed one."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reviewed-by", "noreply@example.com writing for Bob B <bob@example.com>"),
+        people=[("bob", "bob@example.com", "Bob B"),
+                ("noreply", "noreply@example.com", "No Reply")]))
+
+    ids, _names, _reviewed = footers_of(duckdb, out)
+    assert list(ids) == ["bob"]
+
+
+def test_a_trailer_with_no_address_attributes_nobody(monkeypatch, tmp_path):
+    """`Former-commit-id: <sha>` carries no address, so it must contribute no
+    person. It used to join on '', which matches an emails row for an author
+    committing as `Name <>` — 27 of 199 corpus persons DBs hold one, so this
+    published a wrong personid on every commit carrying such a trailer."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Former-commit-id", "6a32a91a877bc2341810ef674dfdc3be21c500bc"),
+        people=[("ghost", "", "A Ghost")]))
+
+    ids, names, _reviewed = footers_of(duckdb, out)
+    assert list(ids) == []
+    assert list(names) == []
 
 
 # --------------------------------------------------------------------------- #
