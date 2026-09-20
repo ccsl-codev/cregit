@@ -95,7 +95,43 @@ numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
 | `person_name` | `TEXT` | persons | Canonical display name for this person. Derived via `coalesce(p.personname, e.personid)`. If neither is available, this is `NULL`. |
 | `person_email` | `TEXT` | emails | Email address that matched this commit's author name/email pair. |
 | `person_domain` | `TEXT` | emails | Domain part of the email address. |
+| `firm_raw` | `TEXT` | `--firm-map` | The map's `company` string for `person_domain`, exactly as the map gives it. `''` when the domain is not in the map. |
+| `firm` | `TEXT` | `--firm-canonical` | The canonical firm name. Equals `firm_raw` unless the reviewed canonical table renames it. Never overwrites `firm_raw`. |
+| `firm_source` | `TEXT` | `--firm-map` | The map's `source` for that domain: `patch`, `gitdm`, `rich`, `builtin`, `correction` (all hand-curated), `cncf-gitdm`, `cncf-gitdm-single` (a single-person inference, 2,771 of 4,049 rows), `spinellis[-sec]`. `''` means the domain is not in the map, so this is the column to filter on for "attributed at all". |
 | `repo_tag` | `TEXT` | commitmap | Repository tag indicating the origin repository. Values: `'p'` (pre-history), `'b'` (BitKeeper), `'l'` (Linux), or `''` (unknown/single repo). |
+
+### Firm attribution
+
+Three columns, added 2026-09-20, and they differ in kind from the 29 provenance
+columns above: those are **per-project constants** injected as SQL literals,
+while firm is resolved **per row** from `person_domain` by a real join against
+`--firm-map` (`cregit-token-pipeline/data/affiliation.merged.csv`, 4,049 rows).
+The map stays a file on disk, read with DuckDB's `read_csv_auto`, so every
+attribution is reviewable; baking it into the query would make it invisible.
+
+`firm` comes from a second file, `--firm-canonical`
+(`cregit-token-pipeline/data/firm_canonical.csv`), which is a **reviewed table,
+not a rule**. The map spells one firm several ways — `IBM` against
+`International Business Machines`, `NVIDIA` against `NVidia`, `Salesforce`
+against `Salesforce.com` — so 48 firms were being counted as 100 separate
+entities. Every line of that table was read by hand and carries its reason, and
+11 candidate merges were rejected and recorded in the same file. Normalising
+automatically would eventually merge two genuinely different companies, and
+nobody would notice.
+
+`firm_raw` is never overwritten. Carry more, cut at publication.
+
+```sql
+-- Firm-level token counts, excluding single-person inferences
+SELECT firm, COUNT(*) AS tokens
+FROM 'dataset.parquet'
+WHERE is_structural = 0 AND firm <> '' AND firm_source <> 'cncf-gitdm-single'
+GROUP BY firm ORDER BY tokens DESC;
+```
+
+Both files must have a unique key. A repeated `domain` or `firm_raw` multiplies
+token rows through the LEFT JOIN, the schema still validates and only the row
+count betrays it, so the generator refuses such a file before Phase 1.
 
 ## token_type domain
 
@@ -283,6 +319,8 @@ uv run python generate_dataset/generate_dataset.py \
 | `--repo-name` | no | Repository name. Default: inferred from output filename. |
 | `--project-meta` | no | JSON sidecar of per-project provenance, from `project_meta.py`. Omit and those columns are written empty. |
 | `--project-key` | no | Which key of the sidecar this project is. Default: `--repo-name`. A key the sidecar does not hold is an error, not a blank row. |
+| `--firm-map` | no | CSV of `domain,company,kind,source`, joined per row against `person_domain`. Omit and `firm_raw`, `firm` and `firm_source` are written empty. A repeated `domain` is an error. |
+| `--firm-canonical` | no | CSV of `firm_raw,firm,…`, the reviewed canonical-name table that fills `firm`. Needs `--firm-map`. Omit and `firm` repeats `firm_raw`, so split spellings stay split. |
 | `--verbose` | no | Enable info-level logging to stderr. |
 
 ## Cross-reference: Perl ↔ Python

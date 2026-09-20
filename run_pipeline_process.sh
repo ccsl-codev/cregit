@@ -101,6 +101,16 @@ Output:
   --project-key NAME
                     which key of the sidecar holds this project. Omit to use
                     --repo-name. A key the sidecar does not hold fails the run.
+  --firm-map PATH   the domain->firm CSV
+                    (cregit-token-pipeline/data/affiliation.merged.csv). The
+                    dataset generator joins it per row against person_domain, so
+                    it fills firm_raw and firm_source. Omit and those columns are
+                    empty strings, so the schema is unchanged either way.
+  --firm-canonical PATH
+                    the reviewed canonical-name table (data/firm_canonical.csv)
+                    that fills the `firm` column. Needs --firm-map. Omit and
+                    `firm` repeats `firm_raw`, so split spellings of one firm
+                    stay split.
 
 Tokenizer:
   --mode MODE   tokenizer walk mode (default: pipeline)
@@ -175,6 +185,8 @@ build_dataset_argv() {
     [ -n "$DUCKDB_THREADS" ] && DATASET_ARGV+=(--duckdb-threads "$DUCKDB_THREADS")
     [ -n "$PROJECT_META" ]   && DATASET_ARGV+=(--project-meta "$PROJECT_META")
     [ -n "$PROJECT_KEY" ]    && DATASET_ARGV+=(--project-key "$PROJECT_KEY")
+    [ -n "$FIRM_MAP" ]       && DATASET_ARGV+=(--firm-map "$FIRM_MAP")
+    [ -n "$FIRM_CANONICAL" ] && DATASET_ARGV+=(--firm-canonical "$FIRM_CANONICAL")
     return 0   # a false test above must not fail the function under `set -e`
 }
 
@@ -205,6 +217,11 @@ DUCKDB_THREADS=""
 # on whether the caller knows about the sidecar.
 PROJECT_META=""
 PROJECT_KEY=""
+# Empty means "do not pass the flag", as above. The difference from the sidecar is
+# that these two are joined per row rather than injected as constants, so they
+# change what every row says rather than what every row repeats.
+FIRM_MAP=""
+FIRM_CANONICAL=""
 FORCE_CLEAN=0
 # Empty means "do not pass the flag". The CREGIT_* fallbacks are how ctp.py,
 # which has no passthrough of its own, reaches these values.
@@ -373,6 +390,8 @@ while [ $# -gt 0 ]; do
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --project-meta)   need_val "$@"; PROJECT_META="$2"; shift 2 ;;
         --project-key)    need_val "$@"; PROJECT_KEY="$2"; shift 2 ;;
+        --firm-map)       need_val "$@"; FIRM_MAP="$2"; shift 2 ;;
+        --firm-canonical) need_val "$@"; FIRM_CANONICAL="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
         --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
@@ -429,6 +448,20 @@ if [ -n "$PROJECT_META" ] && [ ! -f "$PROJECT_META" ]; then
 fi
 if [ -n "$PROJECT_KEY" ] && [ -z "$PROJECT_META" ]; then
     echo "--project-key without --project-meta has nothing to key into" >&2
+    exit 2
+fi
+
+# Validate early, as for the sidecar.
+if [ -n "$FIRM_MAP" ] && [ ! -f "$FIRM_MAP" ]; then
+    echo "invalid --firm-map: '$FIRM_MAP' is not a file (build it with build_domain_map.py)" >&2
+    exit 2
+fi
+if [ -n "$FIRM_CANONICAL" ] && [ ! -f "$FIRM_CANONICAL" ]; then
+    echo "invalid --firm-canonical: '$FIRM_CANONICAL' is not a file" >&2
+    exit 2
+fi
+if [ -n "$FIRM_CANONICAL" ] && [ -z "$FIRM_MAP" ]; then
+    echo "--firm-canonical without --firm-map has no firm_raw to canonicalise" >&2
     exit 2
 fi
 

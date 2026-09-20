@@ -14,11 +14,12 @@ import sqlite3
 
 import pytest
 
-from generate_dataset import (DEFAULT_MEMORY_LIMIT, PROJECT_META_FIELDS,
-                              SourceReader, is_ws, load_project_meta,
-                              parse_memory_limit, project_meta_sql,
-                              skip_comment, skip_literal, skip_token,
-                              sql_literal)
+from generate_dataset import (DEFAULT_MEMORY_LIMIT, FIRM_FIELDS,
+                              PROJECT_META_FIELDS, SourceReader,
+                              check_key_is_unique, firm_sql, is_ws,
+                              load_project_meta, parse_memory_limit,
+                              project_meta_sql, skip_comment, skip_literal,
+                              skip_token, sql_literal)
 
 
 def reader(text: str) -> SourceReader:
@@ -305,7 +306,7 @@ def test_a_key_absent_from_the_sidecar_fails_loudly(tmp_path):
 # cregit-token-pipeline/validate_schema.py gates the corpus with.
 # --------------------------------------------------------------------------- #
 
-TOTAL_COLUMNS = 67                      # 38 token/commit columns + 29 metadata
+TOTAL_COLUMNS = 70     # 38 token/commit + 29 metadata + 3 firm (2026-09-20)
 SHA = "a" * 40
 
 
@@ -440,3 +441,260 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
         generate(monkeypatch, tmp_path,
                  argv_extra=("--project-meta", str(meta)))
     assert not (tmp_path / "out" / "proj-dataset.parquet").exists()
+
+
+# --------------------------------------------------------------------------- #
+# firm attribution. The shape is different from everything above: the 29
+# metadata columns are per-project CONSTANTS injected as SQL literals, while
+# firm is PER ROW and comes from a real join against an external CSV. So the
+# failure modes are different too — a duplicate key in either lookup table
+# multiplies token rows through the LEFT JOIN, and nothing downstream notices.
+# --------------------------------------------------------------------------- #
+
+FIRM_MAP_HEADER = "domain,company,kind,source\n"
+
+
+def write_map(tmp_path, *lines, name="firm.csv"):
+    path = tmp_path / name
+    path.write_text(FIRM_MAP_HEADER + "".join(f"{l}\n" for l in lines))
+    return path
+
+
+def write_canonical(tmp_path, *lines, name="canon.csv"):
+    path = tmp_path / name
+    path.write_text("firm_raw,firm,decision,note\n"
+                    + "".join(f"{l}\n" for l in lines))
+    return path
+
+
+def generate_with_domain(monkeypatch, tmp_path, domain, argv_extra=()):
+    """The tiny project, plus one identified person on `domain`.
+
+    build_tiny_project leaves emails and persons empty, so person_domain is NULL
+    there and every firm column is blank whatever the map says. A positive test
+    needs a person the commit actually joins to.
+    """
+    import generate_dataset as gd
+
+    blame, src, cregit_db, persons_db = build_tiny_project(tmp_path)
+    con = sqlite3.connect(persons_db)
+    con.execute(
+        "INSERT INTO emails (personid, fullemail, emailaddr, emailname, "
+        "lcemail, userid, domain) VALUES (?,?,?,?,?,?,?)",
+        ("p1", "A Dev <a@example.com>", "a@example.com", "A Dev",
+         "a@example.com", "a", domain))
+    con.execute("INSERT INTO persons VALUES ('p1', 'A Dev')")
+    con.commit()
+    con.close()
+
+    out = tmp_path / "out" / "proj-dataset.parquet"
+    monkeypatch.setattr(gd.sys, "argv", [
+        "generate_dataset.py",
+        "--blame-dir", str(blame),
+        "--source-dir", str(src),
+        "--cregit-db", str(cregit_db),
+        "--persons-db", str(persons_db),
+        "--output", str(out),
+        "--repo-name", "proj",
+        *argv_extra,
+    ])
+    gd.main()
+    return out
+
+
+def firm_of(duckdb, path):
+    return duckdb.sql("select person_domain, firm_raw, firm, firm_source "
+                      f"from read_parquet('{path}')").fetchall()
+
+
+def test_the_firm_field_list_is_three_names_in_dataset_order():
+    assert FIRM_FIELDS == ("firm_raw", "firm", "firm_source")
+
+
+def test_no_firm_map_emits_no_join_and_three_empty_literals():
+    """An older caller must still produce a schema-valid file, the same bargain
+    --project-meta makes. So the columns exist and the join does not."""
+    select, join = firm_sql("", "")
+    assert join == ""
+    assert select.count("'' AS") == 3
+
+
+def test_a_map_without_a_canonical_table_makes_firm_repeat_firm_raw():
+    """Honest rather than clever: without a reviewed table the split spellings
+    stay split, and `firm` says the same thing `firm_raw` does."""
+    select, join = firm_sql("/m.csv", "")
+    assert "read_csv_auto('/m.csv'" in join
+    assert "fc" not in join
+    assert "coalesce(fm.company, '') AS firm," in select
+
+
+def test_the_map_path_is_escaped_like_every_other_literal():
+    """The query is one f-string and the path comes from the command line."""
+    _select, join = firm_sql("/o'brien/m.csv", "")
+    assert "'/o''brien/m.csv'" in join
+
+
+def test_the_three_firm_columns_sit_between_person_domain_and_repo_tag(
+        monkeypatch, tmp_path):
+    """Position is a claim, not a convenience: firm is resolved FROM
+    person_domain, so the key and its answers are adjacent."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path)
+    names = [n for n, _ in schema_of(duckdb, out)]
+    i = names.index("person_domain")
+    assert names[i:i + 5] == ["person_domain", "firm_raw", "firm",
+                              "firm_source", "repo_tag"]
+    assert len(names) == TOTAL_COLUMNS
+
+
+def test_a_call_with_no_firm_flags_writes_three_empty_strings(
+        monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path)
+    assert duckdb.sql("select firm_raw, firm, firm_source "
+                      f"from read_parquet('{out}')").fetchone() == ("", "", "")
+
+
+def test_a_domain_in_the_map_gets_its_firm_and_its_source(monkeypatch, tmp_path):
+    """The headline case, in miniature: the map says who, and firm_source says on
+    what evidence. `correction` is this repository's reviewed overlay."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "qti.qualcomm.com,Qualcomm,company,correction")
+    out = generate_with_domain(monkeypatch, tmp_path, "qti.qualcomm.com",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [
+        ("qti.qualcomm.com", "Qualcomm", "Qualcomm", "correction")]
+
+
+def test_the_canonical_table_fills_firm_and_never_touches_firm_raw(
+        monkeypatch, tmp_path):
+    """The partner's standing preference: carry more, cut at publication. The raw
+    string is evidence and must survive beside the canonical name."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(
+        tmp_path, "au1.ibm.com,International Business Machines,company,cncf-gitdm")
+    canon = write_canonical(
+        tmp_path, "International Business Machines,IBM,merge,one firm spelled two ways")
+    out = generate_with_domain(monkeypatch, tmp_path, "au1.ibm.com",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    assert firm_of(duckdb, out) == [
+        ("au1.ibm.com", "International Business Machines", "IBM", "cncf-gitdm")]
+
+
+def test_a_name_the_canonical_table_does_not_mention_passes_through(
+        monkeypatch, tmp_path):
+    """The table lists only the names that change. Everything else is already
+    canonical, and a missing row must not blank the column."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    canon = write_canonical(tmp_path, "NVidia,NVIDIA,merge,case only")
+    out = generate_with_domain(monkeypatch, tmp_path, "google.com",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    assert firm_of(duckdb, out) == [
+        ("google.com", "Google", "Google", "gitdm")]
+
+
+def test_a_domain_absent_from_the_map_gets_three_empty_strings(
+        monkeypatch, tmp_path):
+    """An empty firm_source is the filter for 'not attributed at all', so it must
+    mean exactly that rather than 'the map had no source column'."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    out = generate_with_domain(monkeypatch, tmp_path, "nowhere.example",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [("nowhere.example", "", "", "")]
+
+
+def test_the_domain_match_ignores_case(monkeypatch, tmp_path):
+    """build_domain_map writes lower-cased domains, but persons.db carries
+    whatever the commit's e-mail header held."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "redhat.com,Red Hat,company,gitdm")
+    out = generate_with_domain(monkeypatch, tmp_path, "RedHat.COM",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [("RedHat.COM", "Red Hat", "Red Hat", "gitdm")]
+
+
+def test_a_company_spelled_like_a_number_stays_a_string(monkeypatch, tmp_path):
+    """all_varchar=true on the read. Without it DuckDB sniffs `360` as a number,
+    the firm columns change type, and validate_schema.py fails the whole corpus
+    on one project's map hit."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "360.cn,360,company,gitdm")
+    out = generate_with_domain(monkeypatch, tmp_path, "360.cn",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [("360.cn", "360", "360", "gitdm")]
+    assert dict(schema_of(duckdb, out))["firm_raw"] == "VARCHAR"
+
+
+def test_one_token_stays_one_row_when_the_map_matches(monkeypatch, tmp_path):
+    """The join must not fan out. This is the assertion that would catch a future
+    map keyed on something less unique than a domain."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    canon = write_canonical(tmp_path, "Google,Google LLC,merge,irrelevant here")
+    out = generate_with_domain(monkeypatch, tmp_path, "google.com",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    assert duckdb.sql(f"select count(*) from read_parquet('{out}')").fetchone() == (1,)
+
+
+def test_a_repeated_domain_in_the_map_stops_the_run_before_phase_1(
+        monkeypatch, tmp_path):
+    """The one failure mode of this join that would be invisible. Two rows for one
+    domain duplicate every token row of every person on it: the file still
+    validates, the schema still matches, and only the row count betrays it."""
+    pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm",
+                         "Google.com,Alphabet,company,gitdm")
+    with pytest.raises(SystemExit, match="multiplies token rows"):
+        generate_with_domain(monkeypatch, tmp_path, "google.com",
+                             argv_extra=("--firm-map", str(firm_map)))
+    assert not (tmp_path / "out" / "proj-dataset.parquet").exists()
+
+
+def test_a_repeated_name_in_the_canonical_table_stops_the_run(
+        monkeypatch, tmp_path):
+    """Two canonical names for one raw string is an unresolved review, not a
+    default to pick from."""
+    pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    canon = write_canonical(tmp_path, "Google,Alphabet,merge,one reviewer",
+                            "Google,Google LLC,merge,another reviewer")
+    with pytest.raises(SystemExit, match="multiplies token rows"):
+        generate_with_domain(monkeypatch, tmp_path, "google.com",
+                             argv_extra=("--firm-map", str(firm_map),
+                                         "--firm-canonical", str(canon)))
+
+
+def test_check_key_is_unique_returns_the_row_count(tmp_path):
+    path = write_map(tmp_path, "a.example,A,company,gitdm",
+                     "b.example,B,company,gitdm")
+    assert check_key_is_unique(path, "domain", "the firm map") == 2
+
+
+def test_a_canonical_table_without_a_map_is_refused(monkeypatch, tmp_path):
+    """argparse exits 2. There is no firm_raw to canonicalise without a map, and
+    accepting the pair would write `firm` out of nothing."""
+    canon = write_canonical(tmp_path, "NVidia,NVIDIA,merge,case only")
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path,
+                 argv_extra=("--firm-canonical", str(canon)))
+
+
+def test_a_missing_firm_map_stops_the_run_before_phase_1(monkeypatch, tmp_path):
+    """A typo in the path must not produce a corpus of blank firm columns."""
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path,
+                 argv_extra=("--firm-map", str(tmp_path / "absent.csv")))
+
+
+def test_a_missing_canonical_table_stops_the_run_before_phase_1(
+        monkeypatch, tmp_path):
+    firm_map = write_map(tmp_path, "a.example,A,company,gitdm")
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path,
+                 argv_extra=("--firm-map", str(firm_map),
+                             "--firm-canonical", str(tmp_path / "absent.csv")))
