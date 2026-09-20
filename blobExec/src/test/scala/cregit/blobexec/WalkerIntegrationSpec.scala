@@ -85,11 +85,21 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       // Empty by default: a fixture blob must never be excluded because it happens
       // to collide with the shipped list, and the shipped list must never be
       // exercised by accident. The denylist tests pass their own.
-      denylist: BlobDenylist = BlobDenylist.empty
+      denylist: BlobDenylist = BlobDenylist.empty,
+      maskWidened: Boolean = false
   ): WalkStats = {
     val destinationMayContainObjects = Files.isDirectory(dstPath)
     val dst = openBare(dstPath)
-    val mapping = Mapping.open(dbPath, command, mask)
+    val widening =
+      if (!maskWidened) None
+      else Some(Mapping.MaskWidening(
+        newBlobResolves = id => {
+          val r = dst.newObjectReader()
+          try r.has(ObjectId.fromString(id)) finally r.close()
+        },
+        report = _ => ()
+      ))
+    val mapping = Mapping.open(dbPath, command, mask, None, widening)
     try {
       val walker = new Walker(
         srcRepo, dst, mapping, mask.r, command, abortOnError, parallelism,
@@ -922,6 +932,84 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     val dst = openBare(dir.resolve("dst.git"))
     try fileAtHead(dst, "master", "keep.c") shouldBe Some("int main(){}\n")
     finally dst.close()
+  }
+
+  // -- --mask-widened, end to end ---------------------------------------------
+  //
+  // The one test that matters for the mask widening, because it is the only one
+  // that asks what ends up in dst. Reusing blob_map has to do two things at once:
+  // skip the work already done, AND tokenize the files the wider mask newly
+  // selects. The second is the trap. Those files already have an identity row
+  // from the first run, saying "not selected, bytes pass through", and a naive
+  // reuse serves that row as a cache hit — so the file lands in the TOKENIZED
+  // repository holding RAW SOURCE, and nothing downstream can tell.
+
+  test("a widened mask reuses the tokenized rows and still tokenizes the newly selected ones") {
+    val w = freshWorkDir("mask-widened")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val cmd    = shellScript(w, "tr a-z A-Z")
+    val narrow = """\.[ch]$"""
+    val wide   = """\.(c|cpp|h)$"""
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map(
+      "a.c"       -> "int a;\n",
+      "b.h"       -> "int b;\n",
+      "c.cpp"     -> "int c;\n",
+      "README.md" -> "leave-me-alone\n"
+    ), "only commit")
+
+    // Run 1, narrow mask: two files tokenized, c.cpp merely passed through.
+    val first = runWalker(git.getRepository, dstDir, db, cmd, narrow)
+    first.blobCommandExecutions shouldEqual 2L
+    locally {
+      val dst = openBare(dstDir)
+      try {
+        fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+        // Raw, and correctly so: the narrow mask did not select it.
+        fileAtHead(dst, "master", "c.cpp") shouldBe Some("int c;\n")
+      } finally dst.close()
+    }
+
+    // Run 2, wider mask, same dst and same db, with the opt-in.
+    val second = runWalker(git.getRepository, dstDir, db, cmd, wide, maskWidened = true)
+
+    // Exactly ONE tokenizer invocation: a.c and b.h came from blob_map, c.cpp is
+    // new. That ratio is the entire point of reusing the map.
+    second.blobCommandExecutions shouldEqual 1L
+    second.blobsCacheHit shouldEqual 2
+
+    val dst = openBare(dstDir)
+    try {
+      fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+      fileAtHead(dst, "master", "b.h") shouldBe Some("INT B;\n")
+      // The assertion this whole task turns on. Under a reused blob_map without
+      // the identity-row purge this reads "int c;\n" — raw source, in the
+      // tokenized repository, invisibly.
+      fileAtHead(dst, "master", "c.cpp") shouldBe Some("INT C;\n")
+      fileAtHead(dst, "master", "README.md") shouldBe Some("leave-me-alone\n")
+    } finally dst.close()
+  }
+
+  test("without the opt-in the same second run refuses, and dst is left alone") {
+    val w = freshWorkDir("mask-widened-refused")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val cmd    = shellScript(w, "tr a-z A-Z")
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map("a.c" -> "int a;\n", "c.cpp" -> "int c;\n"), "only commit")
+    runWalker(git.getRepository, dstDir, db, cmd, """\.[ch]$""")
+
+    intercept[Mapping.MetaMismatchException] {
+      runWalker(git.getRepository, dstDir, db, cmd, """\.(c|cpp|h)$""")
+    }
+
+    val dst = openBare(dstDir)
+    try fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n") finally dst.close()
   }
 
   private def deleteRecursive(p: Path): Unit = {

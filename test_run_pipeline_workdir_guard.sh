@@ -185,6 +185,96 @@ grep -q 'MEMO_KEEP_THRESHOLD="${CREGIT_MEMO_KEEP_THRESHOLD:-10000}"' "$RUNNER"
 check "MEMO_KEEP_THRESHOLD defaults to 10000" $?
 
 # ---------------------------------------------------------------------------
+# --mask-widened belongs in THIS file rather than the tokenize gate, because the
+# thing it can get wrong is the same thing every case above is about: work in
+# $WORK that a step-1 run deletes. The flag reuses the blob map and the cregit
+# bare repo, and both live in $WORK, so combining it with step 1 would run
+# happily and preserve nothing — a success message over a full cold rebuild.
+echo "case 12: --mask-widened with FROM_STEP=1 must refuse before touching anything"
+W=$(fixture none)
+OUT=$(run_runner "$W" --mask-widened); RC=$?
+[ "$RC" -eq 2 ]; check "refuses with exit 2 (got $RC)" $?
+grep -q "needs FROM_STEP>=2" <<<"$OUT"; check "says which step it needs" $?
+grep -q -- "--from-step 2" <<<"$OUT"; check "gives the ctp.py resume form" $?
+[ -f "$W/proj-blobmap.db" ]; check "the blob map it would have reused is untouched" $?
+[ ! -f "$W/pipeline.log" ]; check "and it refused before opening the log, so nothing ran" $?
+rm -rf "$W"
+
+echo "case 13: --mask-widened with FROM_STEP=2 reaches blobExec and is accepted there"
+# Asserted against blobExec's OWN banner rather than the runner's argv, because
+# the shipped assembly jar is a separate artifact from the source: the first run
+# of this case printed blobExec's usage and exited 1, on a stale jar built before
+# the flag existed. A grep of the shell script would not have caught that.
+W=$(fixture none)
+OUT=$(run_runner "$W" --mask-widened 2); RC=$?
+! grep -q "needs FROM_STEP>=2" <<<"$OUT"; check "no refusal from the step guard" $?
+grep -q "maskWidened=true" <<<"$OUT"; check "blobExec reports the flag as set" $?
+! grep -q "unknown flag" <<<"$OUT"; check "the shipped jar understands it" $?
+[ -f "$W/proj-blobmap.db" ]; check "and the work dir was kept, as a resume does" $?
+rm -rf "$W"
+
+echo "case 14: --mask-widened with --mode sharded must refuse: shards have no mask to widen"
+W=$(fixture none)
+OUT=$(run_runner "$W" --mask-widened --mode sharded 2); RC=$?
+[ "$RC" -eq 2 ]; check "refuses with exit 2 (got $RC)" $?
+grep -q "not available with --mode sharded" <<<"$OUT"; check "says why" $?
+grep -q -- "--warm-db" <<<"$OUT"; check "names the sharded equivalent" $?
+rm -rf "$W"
+
+echo "case 15: --mask-widened drops what the re-fold invalidates and keeps what it reuses"
+# The two that make this mandatory rather than tidy: step 6's `git clone` is fatal
+# into a non-empty directory, and step 7 SKIPS a file whose .blame already exists —
+# and those .blame files name cregit commit shas from before the re-fold.
+W=$(fixture none)
+mkdir -p "$W/blame/src" "$W/proj-cregit" "$W/proj-original" "$W/proj-cregit.git"
+echo stale > "$W/blame/src/a.c.blame"
+echo stale > "$W/proj-cregit/keepout"
+echo stale > "$W/proj-cregit.db"
+echo stale > "$W/proj-original.db"
+echo stale > "$W/proj-persons.db"
+echo stale > "$W/proj-persons.xls"
+echo stale > "$W/proj-dataset.parquet"
+echo stale > "$W/proj.validated"
+plant_memo "$W/memo" 3
+OUT=$(run_runner "$W" --mask-widened 2); RC=$?
+# Dropped: everything derived from the tokenized repo.
+[ ! -f "$W/blame/src/a.c.blame" ]; check "stale blame is gone (step 7 would have skipped it)" $?
+[ ! -e "$W/proj-cregit/keepout" ]; check "the non-bare cregit clone is gone (step 6 clones into it)" $?
+[ ! -e "$W/proj-original" ];      check "the non-bare original clone is gone (step 6 clones into it too)" $?
+[ ! -f "$W/proj-cregit.db" ];     check "the cregit log DB is gone" $?
+[ ! -f "$W/proj-original.db" ];   check "the original log DB is gone" $?
+[ ! -f "$W/proj-persons.db" ];    check "the persons DB is gone" $?
+[ ! -f "$W/proj-persons.xls" ];   check "the persons sheet is gone" $?
+[ ! -f "$W/proj-dataset.parquet" ]; check "the old Parquet is gone" $?
+[ ! -f "$W/proj.validated" ];     check "the stale validated stamp is gone" $?
+[ -d "$W/blame" ];                check "but blame/ itself is recreated for step 7" $?
+# Kept: step 2's input, step 2's output, the map and the memo. The whole point.
+[ -f "$W/proj-blobmap.db" ];      check "the blob map is KEPT" $?
+[ -d "$W/proj-cregit.git" ];      check "the cregit bare repo is KEPT (new_blob ids live there)" $?
+[ -d "$W/proj-original.git" ];    check "the original bare repo is KEPT" $?
+[ "$(count_memo "$W/memo")" -eq 3 ]; check "every memo entry is KEPT" $?
+grep -q "KEEPING" <<<"$OUT"; check "and the log says what it kept" $?
+rm -rf "$W"
+
+echo "case 16: without --mask-widened a resume touches none of that"
+W=$(fixture none)
+mkdir -p "$W/blame/src"
+echo keepme > "$W/blame/src/a.c.blame"
+echo keepme > "$W/proj-cregit.db"
+OUT=$(run_runner "$W" 2); RC=$?
+[ -f "$W/blame/src/a.c.blame" ]; check "blame is untouched" $?
+[ -f "$W/proj-cregit.db" ];      check "the cregit log DB is untouched" $?
+! grep -q "KEEPING" <<<"$OUT";   check "and the widening block did not run" $?
+rm -rf "$W"
+
+echo "case 17: without the flag nothing changes, and the flag is what reaches blobExec"
+grep -q 'WIDENED_FLAG=""' "$RUNNER"; check "the flag defaults to absent" $?
+grep -q '\[ "\$MASK_WIDENED" = 1 \] && WIDENED_FLAG="--mask-widened"' "$RUNNER"
+check "and is only added when asked for" $?
+grep -q 'java -jar "\$BFG" \$MODE_FLAG \$WIDENED_FLAG' "$RUNNER"
+check "so it reaches blobExec's argv" $?
+
+# ---------------------------------------------------------------------------
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

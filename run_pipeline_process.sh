@@ -31,7 +31,29 @@ Target repository:
                     Changing the mask forces a full rebuild: blobExec records the
                     mask in its blob map and refuses to resume against a
                     different one, because the old tree_map entries would omit
-                    the newly selected files.
+                    the newly selected files. See --mask-widened for the one
+                    verified way past that.
+  --mask-widened    resume across a mask change instead of rebuilding, keeping
+                    the tokenizations already in blob_map. REQUIRES FROM_STEP>=2,
+                    because a step-1 run deletes $WORK — blob map, cregit.git and
+                    all — and there is then nothing to reuse.
+                    Only the mask is relaxed. The tokenizer command is still
+                    checked, and blobExec still verifies, against the rows
+                    themselves, that (1) every already-tokenized path is still
+                    selected by the new mask, and (2) the retained new_blob ids
+                    actually exist in the cregit bare repo. Either check failing
+                    refuses the run (exit 3) and changes nothing.
+                    Safe because the mask decides WHICH files are tokenized and
+                    never HOW: the language comes from the file's extension, per
+                    file (tokenize/CregitLanguages.pm), so the same blob at the
+                    same path yields the same tokens under any mask selecting it.
+                    tree_map, commit_map and ref_map are discarded (trees gain
+                    entries, commits name trees, refs name commits), and so are
+                    blob_map's identity rows — those say "not selected, bytes pass
+                    through", and a wider mask selects some of those paths, where
+                    reusing the row would leave RAW SOURCE in the tokenized repo.
+                    Not available with --mode sharded: each shard builds a fresh
+                    blob map, so there is no recorded mask to widen.
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
@@ -240,6 +262,11 @@ PROJECT_KEY=""
 FIRM_MAP=""
 FIRM_CANONICAL=""
 FORCE_CLEAN=0
+# 1 means "pass --mask-widened to blobExec", which is the ONLY way a mask change
+# resumes instead of rebuilding. Off by default and it must stay that way: the
+# refusal is correct for every case except a verified widening, and blobExec does
+# the verifying against the rows rather than trusting this flag.
+MASK_WIDENED=0
 # Empty means "do not pass the flag", so blobExec keeps its own defaults (600s
 # per blob, 1800s stall window). The CREGIT_* environment fallbacks exist so the
 # values are reachable through ctp.py, which has no passthrough of its own but
@@ -409,6 +436,7 @@ while [ $# -gt 0 ]; do
         --memo-dir)   need_val "$@"; MEMO_DIR="$2"; shift 2 ;;
         --skip-html)  SKIP_HTML=1; shift ;;
         --force-clean) FORCE_CLEAN=1; shift ;;
+        --mask-widened) MASK_WIDENED=1; shift ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
@@ -438,6 +466,32 @@ if [ -z "$MASK" ]; then
         exit 2
     }
     [ -n "$MASK" ] || { echo "${SELF_DIR}/tokenize/fileMask.pl printed nothing" >&2; exit 2; }
+fi
+
+# --mask-widened only means anything on a resume that KEEPS the work directory.
+# A step-1 run deletes $WORK first, taking the blob map and the cregit bare repo
+# with it, so the flag would silently do nothing while the operator believed days
+# of tokenizing were being reused. Refuse instead of being a quiet no-op: the
+# whole value of the flag is the work it preserves, and "it ran and preserved
+# nothing" is indistinguishable from success in the log.
+if [ "$MASK_WIDENED" = 1 ] && [ "$FROM_STEP" = "1" ]; then
+    echo "--mask-widened needs FROM_STEP>=2. A step-1 run starts by deleting $WORK, so the
+     blob map it would reuse and the cregit.git its new_blob ids live in are both
+     gone before blobExec starts, and the flag would preserve nothing.
+     Resume instead:
+       runner:  $0 --repo-url <url> --work $WORK --mask-widened [same flags] 2
+       ctp.py:  python3 ./ctp.py run [same flags] --mask-widened --from-step 2" >&2
+    exit 2
+fi
+
+# Each shard builds its own fresh dst.git and blobmap.db, so there is never a
+# recorded mask for --mask-widened to widen. blobExec refuses the combination too;
+# catching it here means the operator hears about it before the clone.
+if [ "$MASK_WIDENED" = 1 ] && [ "$MODE" = "sharded" ]; then
+    echo "--mask-widened is not available with --mode sharded: every shard builds a fresh
+     blob map, so no recorded mask exists to widen. Reuse a prior run's
+     tokenizations with shard_build.sh --warm-db instead." >&2
+    exit 2
 fi
 
 # Reject a bad --gc value now, not after tokenizing. pack_cregit_repo runs at the
@@ -754,6 +808,63 @@ echo "████████████████████████�
 echo ""
 
 # ---------------------------------------------------------------------------
+# --mask-widened: drop what a re-fold invalidates, keep what it reuses
+# ---------------------------------------------------------------------------
+#
+# A widening re-folds the whole history: every tree gains entries, so every
+# rewritten commit gets a new sha. Steps 3-10 are all derived from those shas,
+# and two of them do NOT rebuild themselves, which makes this mandatory rather
+# than tidy:
+#
+#   step 6  `git clone` into a directory that already exists is `fatal:
+#           destination path already exists and is not an empty directory`.
+#           Verified. Any resume over a project that once completed dies here.
+#   step 7  blameRepoFiles.pl skips a file whose .blame output already exists
+#           (--overwrite is off by default). Those files name cregit commit shas
+#           from BEFORE the re-fold, so keeping them means step 10 joins blame
+#           against commits that no longer exist. That failure is quiet, which
+#           makes it worse than step 6's.
+#
+# Steps 3, 4 and 5 rebuild cleanly on their own (slickGitLog drops and recreates
+# its schema), but their outputs are deleted anyway: "everything derived from the
+# tokenized repository" is a rule someone can check, and "these three are
+# self-cleaning and those two are not" is a rule that rots.
+#
+# KEPT, deliberately and by name: the original bare clone (step 2's input), the
+# cregit bare repo (where blob_map's new_blob ids live), the blob map itself, and
+# the memo. Those four are the entire point of the flag.
+#
+# Named paths only. No globs, and never $WORK itself — the wipe of $WORK is the
+# expensive mistake this whole script is defended against.
+if [ "$MASK_WIDENED" = 1 ]; then
+    log "--mask-widened: dropping the artifacts derived from the tokenized repo,"
+    log "  because the re-fold gives every cregit commit a new sha."
+    log "  KEEPING: $REPO_PATH_ORIGINAL_BARE, $REPO_PATH_CREGIT_BARE,"
+    log "           $DB_PATH_BLOBMAP, $MEMO_DIR"
+    for _stale in \
+        "$WORK/blame" \
+        "$WORK/html" \
+        "$REPO_PATH_ORIGINAL" \
+        "$REPO_PATH_CREGIT" \
+        "$DB_PATH_ORIGINAL" \
+        "$DB_PATH_CREGIT" \
+        "$DB_PATH_PERSONS" \
+        "$XLS_PATH_PERSONS" \
+        "$DATASET_PATH" \
+        "${WORK}/${REPO_NAME}.validated"
+    do
+        if [ -e "$_stale" ]; then
+            log "  dropping $_stale"
+            rm -rf -- "$_stale"
+        fi
+    done
+    # blame/ is recreated below for the normal case, but this runs after that
+    # mkdir, so put it back.
+    mkdir -p "$WORK/blame"
+    [ "$SKIP_HTML" = 1 ] || mkdir -p "$WORK/html"
+fi
+
+# ---------------------------------------------------------------------------
 # Step 1 — clone bare original repo
 # ---------------------------------------------------------------------------
 step "clone bare original repo"
@@ -803,7 +914,9 @@ else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
-  java -jar "$BFG" $MODE_FLAG \
+  WIDENED_FLAG=""
+  [ "$MASK_WIDENED" = 1 ] && WIDENED_FLAG="--mask-widened"
+  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
     ${STALL_TIMEOUT:+--stall-timeout=$STALL_TIMEOUT} \
     "$REPO_PATH_ORIGINAL_BARE" \

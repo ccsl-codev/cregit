@@ -103,10 +103,43 @@ object Main {
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
+      |  --mask-widened    resume against a blob map recorded under a DIFFERENT
+      |                    <fileMaskRegex>, keeping the tokenizations already in
+      |                    blob_map. Without it a mask change is refused (status
+      |                    3), which is the right default and stays the default.
+      |                    Valid only because the mask decides WHICH blobs are
+      |                    tokenized, never HOW: the language comes from the
+      |                    file's extension, per file, so the same (blob, path)
+      |                    yields the same tokens under any mask that selects it.
+      |
+      |                    It is not taken on trust. Two checks run first, and
+      |                    NOTHING is written until both pass:
+      |                      1. every path of a tokenized row (orig <> new) must
+      |                         still match the new mask. One regex test per row,
+      |                         against the data, so a narrowing mislabelled as a
+      |                         widening is caught and named. Regexes are never
+      |                         compared to each other.
+      |                      2. a spread sample of the retained new_blob ids must
+      |                         resolve in <dst.git>. Those ids exist only there,
+      |                         so the map is reusable only alongside it.
+      |
+      |                    Then: tree_map, commit_map and ref_map are emptied
+      |                    (trees gain entries, commits name trees, refs name
+      |                    commits), and so are blob_map's IDENTITY rows
+      |                    (orig == new). The identity rows are the subtle part:
+      |                    they record "this path was not selected, its bytes pass
+      |                    through", and under a wider mask some of those paths
+      |                    ARE selected. Keeping them would serve RAW SOURCE as a
+      |                    cache hit for precisely the files the widening exists
+      |                    to tokenize.
+      |
+      |                    This is a step-2 resume that KEEPS the work directory,
+      |                    never a fresh run — a fresh run deletes dst.git, and
+      |                    check 2 then refuses.
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
@@ -184,10 +217,12 @@ object Main {
     var blobTimeoutSeconds = BlobExec.DefaultTimeoutSeconds
     var stallTimeoutSeconds = Walker.DefaultStallTimeoutSeconds
     var stallExplicit = false
+    var maskWidened = false
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
       case "--pipeline"       => pipeline = true
       case "--pipeline-trees" => pipelineTrees = true
+      case "--mask-widened"   => maskWidened = true
       case s if s.startsWith("--shard=") =>
         val spec = s.stripPrefix("--shard=")
         spec.split("/", -1) match {
@@ -253,6 +288,17 @@ object Main {
       sys.exit(1)
     }
 
+    // A shard writes its own fresh dst.git and blobmap.db every run, so there is
+    // never a recorded mask for --mask-widened to widen. Refusing says so instead
+    // of letting the flag be a silent no-op; --warm is the sharded equivalent.
+    if (shard.isDefined && maskWidened) {
+      System.err.println("Error: --mask-widened has nothing to do under --shard: each shard builds a " +
+        "fresh dst.git and blobmap.db, so no mask is recorded to widen. Reuse a prior run's " +
+        "tokenizations with --warm=<db> instead.")
+      System.err.println(Usage)
+      sys.exit(1)
+    }
+
     if (shard.isDefined && (pipeline || pipelineTrees)) {
       System.err.println("Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
       System.err.println(Usage)
@@ -306,14 +352,45 @@ object Main {
         s"abortOnError=$abortOnError pipeline=$pipeline pipelineTrees=$pipelineTrees " +
         s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s " +
         s"stallTimeout=${stallTimeoutSeconds}s incremental=$incremental " +
-        s"denylistEntries=${denylist.size}"
+        s"maskWidened=$maskWidened denylistEntries=${denylist.size}"
     )
 
     val src: FileRepository = openSrc(srcPath)
     val dst: FileRepository = openOrInitDst(dstPath)
-    val mapping = try Mapping.open(dbPath, command, mask, warmPath) catch {
+
+    // The reachability probe the widening needs. It reads dst, which is why the
+    // whole decision lives here and not inside Mapping.open's signature alone:
+    // `blob_map` is only meaningful next to the repository its new_blob ids are in.
+    val widening =
+      if (!maskWidened) None
+      else Some(Mapping.MaskWidening(
+        newBlobResolves = id => {
+          val reader = dst.newObjectReader()
+          try reader.has(org.eclipse.jgit.lib.ObjectId.fromString(id))
+          catch { case _: IllegalArgumentException => false }
+          finally reader.close()
+        },
+        report = msg => println(s"blobExec: $msg")
+      ))
+
+    val mapping = try Mapping.open(dbPath, command, mask, warmPath, widening) catch {
       case m: Mapping.MetaMismatchException =>
         System.err.println(s"Error: ${m.getMessage}")
+        if (!maskWidened && m.getMessage.contains("mask"))
+          System.err.println(
+            "Hint: if the new mask is a strict superset of the recorded one, --mask-widened reuses " +
+              "the tokenizations already in blob_map instead of redoing them. It verifies that " +
+              "against the rows themselves and refuses if it is not true. It requires the work " +
+              "directory to be intact (resume at step 2), because blob_map's ids live in dst."
+          )
+        src.close(); dst.close()
+        sys.exit(3)
+      case n: Mapping.MaskNarrowedException =>
+        System.err.println(s"Error: ${n.getMessage}")
+        src.close(); dst.close()
+        sys.exit(3)
+      case d: Mapping.DanglingNewBlobException =>
+        System.err.println(s"Error: ${d.getMessage}")
         src.close(); dst.close()
         sys.exit(3)
     }
