@@ -20,50 +20,84 @@ fn run(fixture: &str) -> String {
     String::from_utf8(out.stdout).expect("stdout is not utf-8")
 }
 
+fn run_pos(fixture: &str) -> String {
+    let out = run_args(&["--position", &format!("tests/fixtures/{}", fixture)]);
+    assert!(out.status.success(), "binary exited with {}", out.status);
+    String::from_utf8(out.stdout).expect("stdout is not utf-8")
+}
+
+// Assert on WHOLE lines, not substrings. The bug this file failed to catch was an extra
+// leading `line:col<TAB>` field, and a substring assertion cannot see a line's prefix.
+#[track_caller]
+fn assert_has_line(s: &str, expected: &str) {
+    assert!(
+        s.lines().any(|l| l == expected),
+        "no line equal to {:?} in output:\n{}",
+        expected,
+        s
+    );
+}
+
 #[test]
 fn hello_has_unit_markers_and_expected_tokens() {
     let s = run("hello.rs");
-    let first = s.lines().next().unwrap();
-    let last = s.lines().last().unwrap();
-    assert!(first.starts_with("-:-\tbegin_unit|"), "got: {}", first);
-    assert_eq!(last, "-:-\tend_unit");
+    let mut lines = s.lines();
+    // No position prefix without --position: this is the format the pipeline consumes.
+    assert_eq!(
+        lines.next().unwrap(),
+        "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1"
+    );
+    // ... and it closes with `end_unit` plus the bare end-of-unit marker line.
+    let tail: Vec<&str> = s.lines().rev().take(2).collect();
+    assert_eq!(tail, vec!["", "end_unit"]);
     // values are emitted raw (no quoting), matching what prettyPrint expects
-    assert!(s.contains("\tkeyword|fn"));
-    assert!(s.contains("\tidentifier|main"));
-    assert!(s.contains("\tliteral|\"hello, world\""));
+    assert_has_line(&s, "keyword|fn");
+    assert_has_line(&s, "identifier|main");
+    assert_has_line(&s, "literal|\"hello, world\"");
+}
+
+#[test]
+fn hello_under_position_prefixes_every_line_with_pipe() {
+    let s = run_pos("hello.rs");
+    let mut lines = s.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "-:-|begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1"
+    );
+    let tail: Vec<&str> = s.lines().rev().take(2).collect();
+    assert_eq!(tail, vec!["-:-|", "-:-|end_unit"]);
+    assert_has_line(&s, "2:1|keyword|fn");
+    assert_has_line(&s, "2:4|identifier|main");
+    assert_has_line(&s, "3:15|literal|\"hello, world\"");
 }
 
 #[test]
 fn edge_cases_classify_correctly() {
     let s = run("edge_cases.rs");
     // lifetimes vs char literals
-    assert!(s.contains("\tlifetime|'a"));
-    assert!(s.contains("\tliteral|'x'"));
+    assert_has_line(&s, "lifetime|'a");
+    assert_has_line(&s, "literal|'x'");
     // raw / byte literals — all unified under `literal|` for prettyPrint
-    assert!(s.contains("\tliteral|r#\"raw \"quoted\" string\"#"));
-    assert!(s.contains("\tliteral|b'y'"));
-    assert!(s.contains("\tliteral|b\"bytes\""));
-    assert!(s.contains("\tliteral|br#\"raw bytes\"#"));
+    assert_has_line(&s, "literal|r#\"raw \"quoted\" string\"#");
+    assert_has_line(&s, "literal|b'y'");
+    assert_has_line(&s, "literal|b\"bytes\"");
+    assert_has_line(&s, "literal|br#\"raw bytes\"#");
     // raw and unicode identifiers
-    assert!(s.contains("\tidentifier|r#type"));
-    assert!(s.contains("\tidentifier|café"));
+    assert_has_line(&s, "identifier|r#type");
+    assert_has_line(&s, "identifier|café");
     // nested block comment kept as one token, raw text
-    assert!(s.contains("\tcomment|/* outer /* inner */ outer */"));
+    assert_has_line(&s, "comment|/* outer /* inner */ outer */");
     // numeric literals with suffixes/underscores
-    assert!(s.contains("\tliteral|1_000_000u64"));
-    assert!(s.contains("\tliteral|2.5f64"));
+    assert_has_line(&s, "literal|1_000_000u64");
+    assert_has_line(&s, "literal|2.5f64");
 }
 
 #[test]
 fn unicode_identifier_advances_columns_by_code_point_not_byte() {
     // `fn café()` is on line 18; `café` is 4 chars / 5 bytes. The `(` must be at col 8
     // (1 + "fn " + 4 chars), not col 9 — which is what counting bytes would give.
-    let s = run("edge_cases.rs");
-    assert!(
-        s.contains("18:8\top|("),
-        "expected `(` at col 8 after café, output was:\n{}",
-        s
-    );
+    let s = run_pos("edge_cases.rs");
+    assert_has_line(&s, "18:8|op|(");
 }
 
 // --- unhappy paths: the binary must report errors with the documented exit codes ---
@@ -98,9 +132,18 @@ fn no_path_prints_usage_and_exits_2() {
 }
 
 #[test]
-fn dispatcher_flags_are_accepted_and_ignored() {
-    // tokenize.pl passes these; the binary must accept them and still succeed
+fn dispatcher_flags_are_accepted() {
+    // tokenize.pl passes these; the binary must accept them and still succeed. Note
+    // --position is HONORED, not ignored: tokenizeSrcMl.pl gates its position prefix on
+    // the same flag, and the pipeline (run_pipeline_process.sh:891) passes neither.
     let out = run_args(&["--language=Rust", "--position", "--verbose", "tests/fixtures/hello.rs"]);
     assert!(out.status.success(), "binary exited with {}", out.status);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("\tkeyword|fn"));
+    assert_has_line(&String::from_utf8_lossy(&out.stdout), "2:1|keyword|fn");
+}
+
+#[test]
+fn language_and_verbose_alone_do_not_add_positions() {
+    let out = run_args(&["--language=Rust", "--verbose", "tests/fixtures/hello.rs"]);
+    assert!(out.status.success(), "binary exited with {}", out.status);
+    assert_has_line(&String::from_utf8_lossy(&out.stdout), "keyword|fn");
 }
