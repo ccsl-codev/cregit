@@ -375,28 +375,47 @@ produces no blame and no dataset row, rather than rows of unparsed text:
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
 | a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
 
-The denylist currently holds **twelve blob ids, and they are the historical
-revisions of three files, in two distinct defects**.  It is keyed by content
-rather than by path on purpose: one of the files moved in a repository
-reorganisation, and of another file's eight revisions only four hang.
+The denylist currently holds **209 blob ids, and they are the historical revisions
+of 39 files, in three distinct defects**.  It is keyed by content rather than by
+path on purpose: one file moved in a repository reorganisation, one blob is
+vendored byte-identically into two different projects, and in several files only
+some revisions fail — 4 of 8 in the second class, and as few as 3 of 423 in the
+third.
 
-* **Eight blobs, Java** — `TestNewCastArray.java` (4) and
+* **8 blobs, Java, non-termination** — `TestNewCastArray.java` (4) and
   `CheckErrorsForSource7.java` (4), both OpenJDK langtools regression tests in
   `tencent__tencentkona-21`.  srcML 1.1.0's Java parser does not terminate on
   type-annotated array types; upstream `srcML/srcML#2361`, open, no patch, no
   newer release.
-* **Four blobs, C** — the four revisions of `eden/fs/utils/StatTimes.h` in
-  `facebook__sapling` that return a reference.  **There is no upstream issue for
-  this one and it must not be cited as #2361**: it is a different language and a
-  different construct — C++ in a `.h`, which the extension table maps to language
-  C.  Its citation is the analysis document, and its `reason` carries the minimal
-  reproducer verbatim.
+* **4 blobs, C, non-termination** — the four revisions of
+  `eden/fs/utils/StatTimes.h` in `facebook__sapling` that return a reference.
+  **There is no upstream issue for this one and it must not be cited as #2361**:
+  it is a different language and a different construct — C++ in a `.h`, which the
+  extension table maps to language C.  Its citation is the analysis document, and
+  its `reason` carries the minimal reproducer verbatim.
+* **197 blobs, C and C++, a CRASH — not a hang** — srcML 1.1.0 is killed by
+  **SIGSEGV (159) or SIGABRT (38)** in milliseconds while parsing with
+  `--position`, which the tokenizer must pass because the token format carries
+  `line:col` positions.  No upstream issue; cited to the sweep that found it.
+  This is the whole history of **36 files across 18 projects** of ordinary
+  production source, so unlike the first two classes it does remove real
+  contributor-behaviour signal.  It is bounded and measured rather than assumed:
+  all 904 historical versions of those 36 paths were run through the tokenizer's
+  real chain and **707 parse cleanly**, so the trigger is file content, not the
+  path.  `--position` is the trigger for 132 of the 197; for 49 srcML dies either
+  way and the flag only changes which signal, and for 16 it exits 1 without the
+  flag and still yields nothing.  Java is untouched: 273,410 Java files use the
+  same flag and produce not one crash.
 
-In both cases the failure is non-termination and not slowness: 0 bytes of output,
-one core at 100% and flat resident memory, at every budget from 5 s to 600 s.
-Read the header of the denylist file; it carries the measurements, the
-reproducers and the citations, and it also records a **third** class, found on
-production source and deliberately *not* excluded pending a decision.
+For the first two classes the failure is non-termination and not slowness: 0 bytes
+of output, one core at 100% and flat resident memory, at every budget from 5 s to
+600 s.  For the third no budget is involved at all — srcml is dead with a core
+dumped, which is why the denylist and not `--blob-timeout` is the right
+instrument.  Read the header of the denylist file; it carries the measurements,
+the reproducers and the citations, it records where it **corrects** the sweep on
+the role of `--position`, it states what the third class still does **not** cover,
+and it records a further non-terminating file found on production source and
+deliberately *not* excluded pending a decision.
 
 Also outside the dataset, by mask rather than by exclusion: M4 (`.am`, `.ac`),
 whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,

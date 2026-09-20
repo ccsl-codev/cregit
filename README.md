@@ -173,16 +173,25 @@ returns without invoking `srcml` at all. Put it out of reach with `--memo-dir`,
 names neither repository nor extension). The runner refuses a step-1 wipe that
 would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 
-Twelve blobs in two corpus projects are on a **blob denylist**
-(`blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv`): srcML 1.1.0 does
-not terminate on them. Eight are Java (upstream srcML/srcML#2361, open); four are
-a C++ header that the extension table hands to srcML's **C** parser, which is a
-different defect with **no upstream issue**, so it cites the analysis document
-instead — see the file's header. They are never handed to
-the tokenizer, are dropped from the rewritten trees rather than kept as raw
-source, are counted as `blobsDenylisted` and named with a reason and a citation —
-and, unlike a tokenizer timeout, they do **not** change the exit status. Adding an
-entry means editing that file and rebuilding the jar.
+209 blobs in 20 corpus projects are on a **blob denylist**
+(`blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv`), in **three
+distinct srcML 1.1.0 defects** that the file's header keeps apart:
+
+* **8 blobs, Java, srcML does not terminate** — upstream srcML/srcML#2361, open.
+* **4 blobs, C, srcML does not terminate** — a C++ header that the extension table
+  hands to srcML's **C** parser. A different defect with **no upstream issue**, so
+  it cites the analysis document instead.
+* **197 blobs, C and C++, srcML CRASHES** — killed by SIGSEGV or SIGABRT in
+  milliseconds under the `--position` flag the token format requires. Not a hang,
+  no upstream issue, cited to the sweep that found it. This is the whole history
+  of 36 files in 18 projects; the other 707 historical versions of those same
+  paths parse cleanly, so the trigger is content, not the path.
+
+Denylisted blobs are never handed to the tokenizer, are dropped from the rewritten
+trees rather than kept as raw source, are counted as `blobsDenylisted` and named
+with a reason and a citation — and, unlike a tokenizer timeout or a parser crash,
+they do **not** change the exit status. Adding an entry means editing that file and
+rebuilding the jar.
 
 Example run (cregit run on itself):
 ![Example cregit run](cregit.gif)
