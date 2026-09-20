@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 18;
+use Test::More tests => 24;
 use FindBin;
 use File::Temp qw(tempdir);
 use Digest::SHA qw(sha1_hex);
@@ -145,4 +145,69 @@ my $memoFile = "$memoDir/" . substr($sha1, 0, 2) . "/" . substr($sha1, 2, 2) . "
         BFG_FILENAME     => "",
     );
     isnt($status, 0, "empty BFG_FILENAME exits non-zero");
+}
+
+# -- the parser-crash status must survive this wrapper -----------------------
+#
+# blobExec distinguishes a parser crash from an ordinary tokenizer error by the
+# exact exit status, so this wrapper must propagate it rather than flattening every
+# failure onto die's 255. That flattening is what would put a srcML crash back into
+# the untraceable bucket it came from.
+my $PARSER_CRASH_EXIT = 33;
+
+{
+    my $crashy = "$workdir/crashy-tokenizer.sh";
+    open(my $fh, '>', $crashy) or die $!;
+    # Emits a truncated prefix before failing, like a srcML that died part-way.
+    print $fh "#!/bin/sh\necho 'partial'\nexit $PARSER_CRASH_EXIT\n";
+    close $fh;
+    chmod 0755, $crashy or die $!;
+
+    my $crashContent = "int crashed;\n";
+    my $crashSha1 = sha1_hex($crashContent);
+    my $crashMemo = "$memoDir/" . substr($crashSha1, 0, 2) . "/" .
+                    substr($crashSha1, 2, 2) . "/$crashSha1";
+
+    my ($status, $out, $err) = run_tokenbysha($crashContent,
+        BFG_MEMO_DIR     => $memoDir,
+        BFG_TOKENIZE_CMD => $crashy,
+        BFG_BLOB         => "6" x 40,
+        BFG_FILENAME     => "crashed.c",
+    );
+    isnt($status, 0, "a parser crash in the tokenizer exits non-zero");
+    is($status >> 8, $PARSER_CRASH_EXIT,
+       "the exact parser-crash status is propagated, not flattened to die's 255");
+    ok(!-e $crashMemo,
+       "a crashed tokenization is NOT memoized: no 0-byte entry to replay forever");
+
+    # And the blob is still retryable once the parser is fixed, exactly as for an
+    # ordinary failure -- a crash must not poison the memo.
+    ($status, $out, $err) = run_tokenbysha($crashContent,
+        BFG_MEMO_DIR     => $memoDir,
+        BFG_TOKENIZE_CMD => $stub,
+        BFG_BLOB         => "6" x 40,
+        BFG_FILENAME     => "crashed.c",
+    );
+    is($status, 0, "the same blob tokenizes once the parser works");
+    is($out, "STUB-TOKENIZER\n--language=C\n$crashContent",
+       "and the retry produces real tokens rather than replaying an empty cache entry");
+}
+
+# An ordinary (non-crash) tokenizer status is propagated too, so blobExec can still
+# tell the two apart downstream.
+{
+    my $seven = "$workdir/exit7-tokenizer.sh";
+    open(my $fh, '>', $seven) or die $!;
+    print $fh "#!/bin/sh\nexit 7\n";
+    close $fh;
+    chmod 0755, $seven or die $!;
+
+    my ($status, $out, $err) = run_tokenbysha("int seven;\n",
+        BFG_MEMO_DIR     => $memoDir,
+        BFG_TOKENIZE_CMD => $seven,
+        BFG_BLOB         => "7" x 40,
+        BFG_FILENAME     => "seven.c",
+    );
+    is($status >> 8, 7,
+       "an ordinary tokenizer status is propagated unchanged, and is not 33");
 }
