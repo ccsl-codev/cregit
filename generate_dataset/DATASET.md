@@ -375,13 +375,28 @@ produces no blame and no dataset row, rather than rows of unparsed text:
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
 | a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
 
-The denylist currently holds **four blob ids, and they are four blobs of one
-file** — `TestNewCastArray.java`, an OpenJDK langtools regression test, at two
-paths (the path moved in a repository reorganisation) across four revisions.  It
-is keyed by content rather than by path on purpose.  srcML 1.1.0 does not
-terminate on it: 0 bytes of output at every budget from 5 s to 600 s, upstream
-`srcML/srcML#2361`, open, no patch, no newer release.  Read the header of the
-denylist file; it carries the measurements and the citation.
+The denylist currently holds **twelve blob ids, and they are the historical
+revisions of three files, in two distinct defects**.  It is keyed by content
+rather than by path on purpose: one of the files moved in a repository
+reorganisation, and of another file's eight revisions only four hang.
+
+* **Eight blobs, Java** — `TestNewCastArray.java` (4) and
+  `CheckErrorsForSource7.java` (4), both OpenJDK langtools regression tests in
+  `tencent__tencentkona-21`.  srcML 1.1.0's Java parser does not terminate on
+  type-annotated array types; upstream `srcML/srcML#2361`, open, no patch, no
+  newer release.
+* **Four blobs, C** — the four revisions of `eden/fs/utils/StatTimes.h` in
+  `facebook__sapling` that return a reference.  **There is no upstream issue for
+  this one and it must not be cited as #2361**: it is a different language and a
+  different construct — C++ in a `.h`, which the extension table maps to language
+  C.  Its citation is the analysis document, and its `reason` carries the minimal
+  reproducer verbatim.
+
+In both cases the failure is non-termination and not slowness: 0 bytes of output,
+one core at 100% and flat resident memory, at every budget from 5 s to 600 s.
+Read the header of the denylist file; it carries the measurements, the
+reproducers and the citations, and it also records a **third** class, found on
+production source and deliberately *not* excluded pending a decision.
 
 Also outside the dataset, by mask rather than by exclusion: M4 (`.am`, `.ac`),
 whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,

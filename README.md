@@ -173,9 +173,12 @@ returns without invoking `srcml` at all. Put it out of reach with `--memo-dir`,
 names neither repository nor extension). The runner refuses a step-1 wipe that
 would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 
-Four blobs in one corpus project are on a **blob denylist**
+Twelve blobs in two corpus projects are on a **blob denylist**
 (`blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv`): srcML 1.1.0 does
-not terminate on them (upstream srcML/srcML#2361, open). They are never handed to
+not terminate on them. Eight are Java (upstream srcML/srcML#2361, open); four are
+a C++ header that the extension table hands to srcML's **C** parser, which is a
+different defect with **no upstream issue**, so it cites the analysis document
+instead — see the file's header. They are never handed to
 the tokenizer, are dropped from the rewritten trees rather than kept as raw
 source, are counted as `blobsDenylisted` and named with a reason and a citation —
 and, unlike a tokenizer timeout, they do **not** change the exit status. Adding an

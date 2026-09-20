@@ -26,44 +26,171 @@
 # not the memo's key: tokenizeByBlobId/tokenBySha.pl hashes the file contents
 # alone, with no git object header.
 #
-# The key is deliberately NOT the path. One of the entries below is the same
-# source file at two different paths, moved by an OpenJDK repository
-# reorganisation, and a path-keyed list would have to be updated every time a
-# project moves a file. Content is the stable identity. The paths are recorded
-# here for a reader rather than matched on:
+# The key is deliberately NOT the path. Every entry below is one of THREE source
+# files, at several historical versions and in one case at two paths after an
+# OpenJDK repository reorganisation. A path-keyed list would have to be updated
+# every time a project moves a file, and would not distinguish the versions of a
+# file that hang from the versions that parse — which here is a 4/4 split on one
+# of them. Content is the stable identity. The paths are recorded for a reader
+# rather than matched on.
 #
-#   test/langtools/tools/javac/annotations/typeAnnotations/classfile/TestNewCastArray.java
+# ===========================================================================
+# EVERY entry is srcML 1.1.0 non-termination. But they are TWO DISTINCT
+# DEFECTS, in TWO DIFFERENT LANGUAGES, with only one upstream issue between
+# them. Do not read this list as one defect, and do not cite #2361 for class 2.
+# ===========================================================================
+#
+# ---------------------------------------------------------------------------
+# CLASS 1 — the JAVA parser, on type-annotated array types.
+#   Upstream: srcML/srcML#2361, open, no patch.
+#   8 blobs, TWO files, both in tencent__tencentkona-21 (OpenJDK-derived,
+#   50,663 .java files at HEAD, 147,265 blobs recorded). Both are OpenJDK
+#   langtools regression tests whose stated purpose is to stress exactly the
+#   grammar that breaks the parser: not production source, and carrying no
+#   contributor-behaviour signal. That is what makes excluding them cheap.
+# ---------------------------------------------------------------------------
+#
+#   TestNewCastArray.java  — @bug 8005681 "Repeated annotations on new,array,cast"
+#     test/langtools/tools/javac/annotations/typeAnnotations/classfile/
 #       2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65   14,503 B
-#   langtools/test/tools/javac/annotations/typeAnnotations/classfile/TestNewCastArray.java
+#     langtools/test/tools/javac/annotations/typeAnnotations/classfile/
 #       303c1a109f1fdc4b9d84e15111c56931202844ac   14,506 B
 #       504aaf9109fc01d6d62d99ac529ded99a8dfa8ca   14,451 B
 #       c91924d1e87cb82d372a73b24579ccc34609efaa   14,450 B
 #
-# All four are historical versions of ONE file in tencent__tencentkona-21
-# (OpenJDK-derived, 50,663 .java files at HEAD, 147,265 blobs recorded). It is a
-# compiler regression test, @bug 8005681 "Repeated annotations on new,array,cast",
-# whose stated purpose is to stress exactly the grammar that breaks the parser. It
-# is not production source and carries no contributor-behaviour signal.
+#   CheckErrorsForSource7.java  — @run main CheckErrorsForSource7
+#     langtools/test/tools/javac/annotations/typeAnnotations/failures/
+#       56c8adf588e697a3e42b600b2e5ec54710592c61    8,388 B   trigger at line 178
+#       5e9c9138ed9c43c20591d1814cb72ad014d1a9e5    8,750 B   trigger at line 181
+#       6bf666550f6cba72f1602ce1b7a6b0c9025fc8c7    8,645 B   trigger at line 179
+#     test/langtools/tools/javac/annotations/typeAnnotations/failures/
+#       afbd81e5789ba060147b0de3be4f01759963299d    8,617 B   trigger at line 178
+#       (5e9c9138… lives at both paths; all four versions of the file hang)
 #
-# The root cause is written up, with measurements and the upstream citation, in
-# cregit-token-pipeline/.superpowers/sdd/peppy-pondering-music/
-# srcml-nontermination-analysis.md. In short: srcML 1.1.0 does not terminate on a
-# local variable declaration whose declared type is a multi-dimensional array
-# carrying a type annotation on its first dimension when the initializer is an
-# array-creation expression that also carries one — minimal reproducer
-# `String @A [] [] s = new String @A [2] [2];`. It is non-termination, not
-# slowness: 0 bytes of output, one core at 101%, resident memory flat at
-# 10,544 kB, at every budget from 5 s to 600 s. Upstream srcML/srcML#2361 is open
-# with no patch, and v1.1.0 (2025-08-14) is the latest release, so there is
-# nothing to upgrade to. A working patch was built and validated at 12,016/12,016
-# byte-identical blobs, and was deliberately NOT adopted, on provenance grounds:
-# see srcml-upstream-fix-adjudication.md.
+# TestNewCastArray's trigger, minimised in srcml-nontermination-analysis.md, is a
+# declaration whose declared type is a multi-dimensional array carrying a type
+# annotation on its first dimension WHEN the initializer is an array-creation
+# expression that also carries one:
 #
-# Re-verified against the pinned binary on 2026-09-19: each of the four blobs
-# produced 0 bytes and was killed at a 15 s budget.
+#     String @A [] [] s = new String @A [2] [2];
+#
+# CheckErrorsForSource7 is a DIFFERENT FILE with a SECOND, DISTINCT sufficient
+# construct in the same #2361 family, minimised here on 2026-09-20. It needs no
+# initializer at all:
+#
+#     Object [] @TA [] arr @TA[];          // the real line
+#     class C { int @A [] a @A []; }       // minimal reproducer, 31 B
+#
+# BOTH an annotated dimension in the declared type AND an annotated trailing
+# C-style array dimension on the declarator are required; either one alone parses
+# in under 90 ms, and it makes no difference whether the declaration is a field or
+# a local, or whether an initializer is present. The neighbouring line 179,
+# `<T> @TA int @TA[] ret(Object obj) @TA[]`, was measured and is NOT a trigger: on
+# its own it parses in 8 ms. Offer this reproducer upstream on #2361 alongside the
+# first one — it is a second sufficient condition the issue does not record.
+#
+# ---------------------------------------------------------------------------
+# CLASS 2 — the C parser, on C++ inside a `.h`.
+#   NO UPSTREAM ISSUE EXISTS. This is NOT #2361: different language, different
+#   construct, separately minimised. The citation is the analysis document.
+#   4 blobs, ONE file, in facebook__sapling. Unlike class 1 this is ordinary
+#   production source, so the exclusion does cost real signal — 4 blobs of a
+#   1.9-2.6 kB header, bounded below.
+# ---------------------------------------------------------------------------
+#
+#   eden/fs/utils/StatTimes.h   (historical only; NOT present at HEAD)
+#       5460d43f1884e3be230e02215151b9b963844a48    1,861 B
+#       720914b27e170b73b38ef662fb04239273dd0a34    2,580 B
+#       99c191e9a208547f5c9b1224c290f106a640de59    2,443 B
+#       dbb885e0bf046755c4fcfbddfc2454f90c550c62    2,442 B
+#
+# CregitLanguages.pm maps the `.h` extension to language C, so tokenBySha.pl runs
+# `srcml -l C` over a header whose contents are C++. The C parser then does not
+# terminate. Minimised on 2026-09-20 from 1,861 bytes to 41:
+#
+#     namespace n{struct T&f(const struct S);}
+#
+# Necessary and sufficient, each condition measured. Remove any one and the input
+# parses in under 12 ms:
+#
+#   - an enclosing NAMED `namespace X {` or `class X {` block. An anonymous
+#     `namespace {` does NOT trigger it.
+#   - a return type that is a REFERENCE to an ELABORATED struct type, `struct T&`.
+#     `struct T*` parses; `T&` without the `struct` keyword parses.
+#   - a parameter of CV-QUALIFIED ELABORATED struct type, `const struct S`
+#     (`volatile` does it too). The parameter need not be a reference and need not
+#     be named. `const S` without `struct`, and `struct S` without the qualifier,
+#     both parse.
+#
+# THE THREE BACKSLASH-CONTINUED `#elif defined(…) || \` CONDITIONALS AT LINES 24,
+# 37 AND 50 ARE NOT THE TRIGGER. They are the file's most conspicuous feature and
+# the obvious suspect, and they are innocent: extracted on their own they parse in
+# 8 ms, and — the decisive evidence — this file has EIGHT historical versions, ALL
+# EIGHT carry three or four such continued `#elif` conditionals, and only FOUR
+# hang. The split is exactly the reference return type: the four that hang all
+# declare `inline const struct timespec& stAtime(const struct stat& st)`, and the
+# four that parse in milliseconds all return `struct timespec` BY VALUE. A natural
+# experiment in the corpus's own history, 4/4, agreeing with the minimisation.
+#
+# The same 1,861 bytes parse as C++ in 9 ms and produce 14,125 bytes of srcML, so
+# a `.hpp` name would never have hit this. That narrowness — C++ declared in a
+# `.h`, named namespace, reference to an elaborated struct, cv-qualified
+# elaborated struct parameter — is why 188 C and C++ projects produced ONE
+# instance of this class rather than thousands.
+#
+# Blast radius, measured rather than assumed: a bounded probe of ALL 29,100
+# mask-selected C/C++/Java blobs in facebook__sapling's whole history found these
+# 4 and no others. 4 of 29,100 is 0.014%.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS NON-TERMINATION AND NOT SLOWNESS, for every entry
+# ---------------------------------------------------------------------------
+# Zero bytes of output, one core at 100%, and resident memory FLAT, at every
+# budget tried. Flat memory with a saturated core rules out backtracking that
+# would eventually finish and rules out memory exhaustion. Measured 2026-09-20
+# against the pinned binary, reading the counters from the srcml CHILD and not
+# from the `timeout` supervisor, which blocks in wait4 at 0% CPU and would look
+# idle:
+#
+#   StatTimes.h    as C     5 s / 15 s / 60 s / 300 s   0 B out, 100%, RSS 9.2-9.4 MB
+#   the other 3 .h as C    15 s / 60 s                  0 B out, 100%, RSS 9.3-9.4 MB
+#   CheckErrors…   as Java 15 s / 60 s                  0 B out, 100%, RSS 10.1 MB
+#   all 6 newly listed here                             also killed at 600 s in the
+#                                                       pipeline, status 124 from
+#                                                       `timeout` — not 137, not OOM
+#
+# srcML v1.1.0 (2025-08-14) is the latest release, so there is nothing to upgrade
+# to. A working patch for class 1 was built and validated at 12,016/12,016
+# byte-identical blobs and deliberately NOT adopted, on provenance grounds. Both
+# write-ups, and the minimisation behind class 2, live in
+# cregit-token-pipeline/.superpowers/sdd/peppy-pondering-music/ —
+# srcml-nontermination-analysis.md, srcml-upstream-fix-adjudication.md and
+# task-8c-finish-report.md.
+#
+# ---------------------------------------------------------------------------
+# THIS LIST IS NOT THE COMPLETE SET OF NON-TERMINATING BLOBS IN THE CORPUS
+# ---------------------------------------------------------------------------
+# A THIRD class exists and is deliberately NOT listed here, because excluding it
+# is a decision about the dataset's content rather than about a stress test: the
+# C++ parser also fails to terminate on `src/hotspot/share/runtime/
+# continuationFreezeThaw.cpp` in tencent__tencentkona-21 — ~105 kB of ORDINARY
+# PRODUCTION SOURCE in the JVM runtime, 0 bytes out at 15 s and 120 s with the
+# same flat-memory, one-core signature. Denylisting production source removes real
+# contributor-behaviour signal, so it is escalated in task-8c-finish-report.md
+# rather than decided in this file. Until that decision is taken,
+# tencent__tencentkona-21 cannot complete step 2, and the timeout — which DOES
+# block publication — is the correct thing to be stopping it.
 #
 # sha	citation	reason
 2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar
 303c1a109f1fdc4b9d84e15111c56931202844ac	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar
 504aaf9109fc01d6d62d99ac529ded99a8dfa8ca	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar
 c91924d1e87cb82d372a73b24579ccc34609efaa	srcML/srcML#2361	srcML 1.1.0 does not terminate on this file's annotated multi-dimensional array declarations (0 bytes out, killed at every budget from 5s to 600s); OpenJDK langtools regression test @bug 8005681, written to stress this grammar
+56c8adf588e697a3e42b600b2e5ec54710592c61	srcML/srcML#2361	srcML 1.1.0 does not terminate on line 178, `Object [] @TA [] arr @TA[];` — an annotated array dimension in the declared type together with an annotated trailing C-style dimension on the declarator, needing no initializer; minimal reproducer `class C { int @A [] a @A []; }` (0 bytes out, 100% of one core, RSS flat at 10,108 kB, at 15s and 60s here and at 600s twice in the pipeline); line 179 is not a trigger; OpenJDK langtools regression test CheckErrorsForSource7, 8,388 B
+5e9c9138ed9c43c20591d1814cb72ad014d1a9e5	srcML/srcML#2361	srcML 1.1.0 does not terminate on line 181, `Object [] @TA [] arr @TA[];` — same construct and same minimal reproducer `class C { int @A [] a @A []; }` as 56c8adf5 (0 bytes out at 15s, 100% of one core, RSS flat); a second historical version of CheckErrorsForSource7.java, 8,750 B, recorded at both of the file's two paths
+6bf666550f6cba72f1602ce1b7a6b0c9025fc8c7	srcML/srcML#2361	srcML 1.1.0 does not terminate on line 179, `Object [] @TA [] arr @TA[];` — same construct and same minimal reproducer `class C { int @A [] a @A []; }` as 56c8adf5 (0 bytes out at 15s, 100% of one core, RSS flat); a third historical version of CheckErrorsForSource7.java, 8,645 B
+afbd81e5789ba060147b0de3be4f01759963299d	srcML/srcML#2361	srcML 1.1.0 does not terminate on line 178, `Object [] @TA [] arr @TA[];` — same construct and same minimal reproducer `class C { int @A [] a @A []; }` as 56c8adf5 (0 bytes out at 15s, 100% of one core, RSS flat); the fourth historical version of CheckErrorsForSource7.java, 8,617 B, after the OpenJDK path move
+5460d43f1884e3be230e02215151b9b963844a48	srcml-nontermination-analysis.md#class-2-the-c-parser-on-c-inside-a-h	NOT srcML/srcML#2361, and no upstream issue exists: srcML 1.1.0's C parser does not terminate on this C++ header, which CregitLanguages.pm maps to language C; minimal reproducer `namespace n{struct T&f(const struct S);}` — a named namespace or class block containing a function returning a reference to an elaborated struct type and taking a cv-qualified elaborated struct parameter (0 bytes out, 100% of one core, RSS flat at ~9,300 kB, at 5s/15s/60s/300s here and at 600s twice in the pipeline); the continued `#elif` conditionals are NOT the trigger and the same bytes parse as C++ in 9 ms; eden/fs/utils/StatTimes.h, 1,861 B
+720914b27e170b73b38ef662fb04239273dd0a34	srcml-nontermination-analysis.md#class-2-the-c-parser-on-c-inside-a-h	NOT srcML/srcML#2361, and no upstream issue exists: same C-parser non-termination and same minimal reproducer `namespace n{struct T&f(const struct S);}` as 5460d43f, and the same `const struct timespec&` reference return type (0 bytes out at 15s and 60s, 100% of one core, RSS flat); a second historical version of eden/fs/utils/StatTimes.h, 2,580 B
+99c191e9a208547f5c9b1224c290f106a640de59	srcml-nontermination-analysis.md#class-2-the-c-parser-on-c-inside-a-h	NOT srcML/srcML#2361, and no upstream issue exists: same C-parser non-termination and same minimal reproducer `namespace n{struct T&f(const struct S);}` as 5460d43f, and the same `const struct timespec&` reference return type (0 bytes out at 15s and 60s, 100% of one core, RSS flat); a third historical version of eden/fs/utils/StatTimes.h, 2,443 B
+dbb885e0bf046755c4fcfbddfc2454f90c550c62	srcml-nontermination-analysis.md#class-2-the-c-parser-on-c-inside-a-h	NOT srcML/srcML#2361, and no upstream issue exists: same C-parser non-termination and same minimal reproducer `namespace n{struct T&f(const struct S);}` as 5460d43f, and the same `const struct timespec&` reference return type (0 bytes out at 15s and 60s, 100% of one core, RSS flat); the fourth historical version of eden/fs/utils/StatTimes.h, 2,442 B
