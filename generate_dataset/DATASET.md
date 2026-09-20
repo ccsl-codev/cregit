@@ -3,8 +3,30 @@
 ## Overview
 
 `generate_dataset.py` produces a unified Parquet dataset containing every token from a
-tokenized git repository, annotated with commit metadata, authorship information, and
-person identity.  It is the final output of the CreGit pipeline (Step 11).
+tokenized git repository, annotated with commit metadata, authorship information,
+person identity, firm attribution, and the commit's git trailers.  It is the final
+output of the CreGit pipeline (Step 10).
+
+**The schema is 70 columns**, in this order:
+
+| Block | Columns | # |
+|-------|---------|---|
+| [Token data](#token-data) | `repo_name`, then `file_path` … `is_structural` | 1 + 8 |
+| [Per-project provenance](#per-project-provenance) | `clone_url` … `file_mask` | 29 |
+| [Git commit metadata](#git-commit-metadata) | `cregit_commit_sha` … `commit_summary` | 9 |
+| [Person identity](#person-identity) | `personid` … `repo_tag`, including the three [firm](#firm-attribution) columns | 8 |
+| [Commit trailers](#commit-trailers-footers) | `footer_*` | 15 |
+| | **total** | **70** |
+
+`repo_name` is column 1 and the 29 provenance columns are 2-30, so `file_path` is
+column 31.
+
+The contract is **not this document**: it is `EXPECTED_COLUMNS` in
+`cregit-token-pipeline/validate_schema.py`, which every project's Parquet is
+checked against by name, by type and in order, and a drift is a non-zero exit.
+If you change the generator's output, change that file in the same commit and
+this one immediately after.  `cregit-token-pipeline/docs/DATASET-SCHEMA.md` draws
+the same 70 columns beside the on-disk schema they collapse from.
 
 ## Quick start
 
@@ -64,7 +86,7 @@ second join against `candidates.csv`.
 | `license`, `owner_type`, `archived`, `fork` | Repository attributes at selection time. |
 | `history_cluster`, `history_shared_with`, `history_relation`, `history_includes`, `history_first`, `history_created` | Shared-history analysis: projects that share commit history are not independent observations. |
 | `manifest_category` | The category column of the corpus manifest row. |
-| `file_mask` | The regex this project was tokenized with. Without it nobody can tell which rows came from which mask after a mask widening. |
+| `file_mask` | The regex this project was tokenized with. Without it nobody can tell which rows came from which mask after a mask widening. One universal mask is used for every project since 2026-09-19 — `(?i)\.(c\|c\+\+\|cc\|cp\|cpp\|cxx\|h\|h\+\+\|hh\|hpp\|hxx\|java\|rs\|tcc)$` — so it no longer discriminates between projects, only between runs. |
 
 ### Git commit metadata
 
@@ -125,6 +147,79 @@ GROUP BY firm ORDER BY tokens DESC;
 Both files must have a unique key. A repeated `domain` or `firm_raw` multiplies
 token rows through the LEFT JOIN, the schema still validates and only the row
 count betrays it, so the generator refuses such a file before Phase 1.
+
+### Commit trailers (footers)
+
+Fifteen columns, all `LIST(TEXT)` — `VARCHAR[]` as DuckDB and the Parquet report
+them.  They are **never NULL**: a commit with no trailer of that key gets an
+empty list, through `coalesce(…, [])`, so `len(footer_reviewed_by) = 0` is the
+test for absence and a NULL check is not needed.
+
+Source: the `footers` table of `cregit.db` (one row per trailer occurrence, with
+`cid`, `idx`, `key`, `value`), grouped by commit.  Keys are matched
+**case-insensitively** (`LOWER(f.key) = 'signed-off-by'`), and each list keeps the
+order the trailers appeared in the message, by `footers.idx`.
+
+| Column | Trailer key |
+|--------|-------------|
+| `footer_signed_off_by` | `Signed-off-by` |
+| `footer_co_authored_by` | `Co-authored-by` |
+| `footer_co_developed_by` | `Co-developed-by` |
+| `footer_reviewed_by` | `Reviewed-by` |
+| `footer_acked_by` | `Acked-by` |
+| `footer_tested_by` | `Tested-by` |
+| `footer_reported_by` | `Reported-by` |
+| `footer_suggested_by` | `Suggested-by` |
+| `footer_based_on_patch_by` | `Based-on-patch-by` |
+| `footer_helped_by` | `Helped-by` |
+| `footer_mentored_by` | `Mentored-by` |
+| `footer_assisted_by` | `Assisted-by` |
+| `footer_thanks_to` | `Thanks-to` |
+
+Each value is the raw trailer text as the commit wrote it — typically
+`Name <email>` — not a resolved identity.  Two further columns resolve them:
+
+| Column | Meaning |
+|--------|---------|
+| `footer_personids` | the distinct `personid`s behind **every** trailer on the commit: the address inside `<…>` is pulled out of the trailer text with `regexp_extract` and matched against `emails.emailaddr` |
+| `footer_person_names` | the resolved names for those ids, `coalesce(personname, personid)` |
+
+Those two are `DISTINCT` and sorted: they are a **set over all trailers**, not a
+list aligned with the 13 typed columns, and they cannot be zipped with them.  A
+trailer whose address matches no `emails` row contributes nothing to either, so
+`footer_signed_off_by` can be non-empty while `footer_personids` is empty.
+
+**Known limitation: a trailer with no angle brackets never resolves.**  The
+generator tries `<([^>]+)>` first and a bare-address pattern second, through a
+`coalesce`, but DuckDB's `regexp_extract` returns the **empty string** on no match
+rather than NULL, so the `coalesce` never reaches the second pattern — and that
+second pattern has no capture group, so asking it for group 1 would also return
+`''`.  Measured:
+
+```sql
+SELECT regexp_extract('Bob <b@x.com>', '<([^>]+)>', 1),        -- 'b@x.com'
+       regexp_extract('Bob b@x.com',   '<([^>]+)>', 1);        -- ''
+```
+
+So `Reviewed-by: bob@example.com` (a real, if less common, spelling) lands in
+`footer_reviewed_by` but contributes nothing to `footer_personids`.  Use the 13
+raw columns, not the resolved pair, if you need every named contributor.
+
+These columns are why the dataset can say anything about contribution that is not
+authorship.  `Signed-off-by`, `Reviewed-by` and `Co-authored-by` carry attribution
+that the author fields do not, and in a mailing-list project they carry most of it.
+
+```sql
+-- Reviewers by review count, independent of who authored the code
+SELECT r AS reviewer, COUNT(*) AS reviews
+FROM (SELECT DISTINCT original_commit_sha, unnest(footer_reviewed_by) AS r
+      FROM 'dataset.parquet' WHERE len(footer_reviewed_by) > 0)
+GROUP BY r ORDER BY reviews DESC;
+```
+
+Note the `DISTINCT original_commit_sha` in that query: the grain of this table is
+the **token**, so a commit's trailers repeat on every token it touched.  Any
+commit-level count over `footer_*` must deduplicate by commit first.
 
 ## token_type domain
 
@@ -247,6 +342,62 @@ GROUP BY person_name, personid
 ORDER BY tokens DESC;
 -- Gabriel R.  | person_abc123 | 1800  ← all 1800 tokens unified
 ```
+
+## What is not in the dataset
+
+### `person_email` is published, and there is no anonymiser — an open decision
+
+`person_email` and `person_domain` are real columns of the output, so **writing a
+Parquet and publishing it publishes contributors' e-mail addresses.**  The design
+for this corpus names a weak anonymiser for exactly this purpose
+(`cregit-token-pipeline/docs/DESIGN.md` §7, stage 2: `anonymize.py`, a salted
+stable hash with the salt and the reverse mapping kept local) and **it has not
+been written.**  Nothing in this generator drops, hashes or redacts the column,
+and there is no flag that does.
+
+Recorded here as an **open decision that blocks publication, not the pipeline.**
+Drop the column, hash it, or publish it deliberately with an ethics statement —
+those are three different positions and none of them is the default.  Note that
+`person_domain` is the key the firm attribution resolves through, so removing
+`person_email` alone does not remove domain-level identifiability.
+
+### Files that produce no rows at all
+
+The generator writes a row for every token it is given, so what is missing from
+the Parquet is whatever never reached the tokenizer.  Three mechanisms upstream
+(in `blobExec`, step 2) exclude a blob, and in all three cases the file is
+**absent from the tokenized repository rather than present as raw source** — so it
+produces no blame and no dataset row, rather than rows of unparsed text:
+
+| Mechanism | Recorded as | Effect here |
+|---|---|---|
+| the **blob denylist**, `blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list is a data file so a paper can cite it; nothing at run time can extend or override it |
+| **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
+| a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
+
+The denylist currently holds **four blob ids, and they are four blobs of one
+file** — `TestNewCastArray.java`, an OpenJDK langtools regression test, at two
+paths (the path moved in a repository reorganisation) across four revisions.  It
+is keyed by content rather than by path on purpose.  srcML 1.1.0 does not
+terminate on it: 0 bytes of output at every budget from 5 s to 600 s, upstream
+`srcML/srcML#2361`, open, no patch, no newer release.  Read the header of the
+denylist file; it carries the measurements and the citation.
+
+Also outside the dataset, by mask rather than by exclusion: M4 (`.am`, `.ac`),
+whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,
+`.cppm`, `.cxxm`, `.ipp`, for which srcML emits **zero tokens and exits 0**.
+`file_mask` on every row records the mask that decided this.
+
+### Computed and then dropped, or never typed
+
+- `func_name` is computed in Phase 1 for `DECL` tokens and is **not** carried into
+  the Parquet.  Function-level attribution is not in the published columns.
+- `author_date` and `committer_date` are git strings, not timestamps.  Cast before
+  comparing.
+- `JOIN commits` is an **inner** join, so a blamed commit missing from
+  `cregit.db :: commits` drops its tokens with no report; and `emails` is matched
+  on the exact pair `(autname, autemail)`, so `personid` and the three columns
+  after it can be NULL for a commit whose author spelling matches no `emails` row.
 
 ## How the dataset is built
 
