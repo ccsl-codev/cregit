@@ -37,6 +37,17 @@ object Main {
     * succeeded, but the output is incomplete and must not be validated. */
   private[blobexec] val TimedOutExitStatus = 4
 
+  /** Exit status when any blob's tokenizer reported a parser crash: srcML died on
+    * a signal, or produced no tokens. Distinct from [[TimedOutExitStatus]] on
+    * purpose — both block publication, but they need different remedies, and an
+    * operator who cannot tell them apart will reach for --blob-timeout, which does
+    * nothing whatsoever for a segfault.
+    *
+    * 6, not 5: 5 is already [[Walker.StalledExitStatus]]. The statuses in use are
+    * 1 (usage), 2 (abort), 3 (mask changed), 4 (timed out), 5 (stalled), so 6 is
+    * the next free one. `parserCrashStatusIsUnique` in MainOptionsSpec pins that. */
+  private[blobexec] val ParserCrashedExitStatus = 6
+
   /** The process exit status for a finished walk.
     *
     * A function, and taking the whole [[WalkStats]], so that "which counters gate
@@ -53,10 +64,21 @@ object Main {
     *
     * The distinction is the whole point of the denylist: a timeout is a hang
     * nobody has explained yet, and that must keep blocking publication.
+    *
+    * `blobsParserCrashed` joins the gating set for exactly that reason. A srcML
+    * signal death is, today, a defect nobody has explained — so it belongs with a
+    * timeout, not with the denylist. Once a specific crashing blob is diagnosed and
+    * cited it can be moved onto the denylist, which is the documented way for a
+    * known third-party parser bug to stop blocking publication. Until then, failing
+    * closed is the point: the alternative is the 0-byte tokenization that shipped.
+    *
+    * A timeout is checked first only because it is the older and broader signal;
+    * when both fire, either status correctly means "do not publish".
     */
   private[blobexec] def exitStatus(stats: WalkStats): Int =
     if (stats.aborted) 2
     else if (stats.blobsTimedOut > 0) TimedOutExitStatus
+    else if (stats.blobsParserCrashed > 0) ParserCrashedExitStatus
     else 0
 
   /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
@@ -436,6 +458,7 @@ object Main {
         s"blobsTimedOutEver=$timedOutEver " +
         s"blobsOversized=${stats.blobsOversized} " +
         s"blobsDenylisted=${stats.blobsDenylisted} " +
+        s"blobsParserCrashed=${stats.blobsParserCrashed} " +
         s"aborted=${stats.aborted}"
     )
 
@@ -486,6 +509,25 @@ object Main {
           "A child reporting status 137 was SIGKILLed, which on a memory-tight host usually means " +
           "the kernel's OOM killer took it — more time will not help; give the run more memory or " +
           "exclude that blob via the mask."
+      )
+    }
+
+    if (stats.blobsParserCrashed > 0) {
+      System.err.println(
+        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsParserCrashed} blob(s) had their " +
+          "tokenizer report a parser crash this run. Each one is named on a 'reported a parser " +
+          "crash' line above, with the failing stage and signal. This is srcML dying on a signal " +
+          "(SIGSEGV or SIGABRT) on a C/C++ input, or returning no tokens at all; before this was " +
+          "detected such a blob became a silent 0-byte tokenization and the file simply vanished " +
+          "from the dataset with nothing counting it. Nothing was recorded for the containing " +
+          s"commit: no blob row, no tree row, no commit row. Exiting $ParserCrashedExitStatus. " +
+          "Unlike a timeout this is deterministic, so re-running alone will NOT clear it and " +
+          "--blob-timeout is irrelevant — more time does not help a segfault. The two real " +
+          "remedies are: fix or upgrade srcML (1.1.0 faults in its C/C++ position tracking, and " +
+          "--position cannot be dropped because the token format depends on it), or, once a " +
+          "specific blob is diagnosed, add it to the blob denylist with its reason and citation " +
+          s"(${BlobDenylist.ResourcePath}) so it is excluded deterministically and reported " +
+          "without blocking publication."
       )
     }
 

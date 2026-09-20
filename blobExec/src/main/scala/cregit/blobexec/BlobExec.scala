@@ -38,6 +38,17 @@ object BlobExec {
     * status is 0..255 (128+signal when killed), so negative values are free. */
   val TimeoutExitCode: Int = -1
 
+  /** Exit status by which the tokenizer reports "srcML died on a signal, or this
+    * tokenization is otherwise unusable" — the defect that used to arrive here as
+    * a zero exit with empty stdout and become a silent 0-byte blob.
+    *
+    * Emitted by `tokenize/tokenizeSrcMl.pl` (`$PARSER_CRASH_EXIT` there) and
+    * propagated unchanged by `tokenize.pl` and `tokenizeByBlobId/tokenBySha.pl`.
+    * The two constants must stay in step; 33 is below 128 so it cannot collide
+    * with a shell's 128+signal encoding, and is clear of GNU `timeout`'s 124/137
+    * and of blobExec's own 2/3/4 exit statuses. */
+  val ParserCrashExitCode: Int = 33
+
   /** "the waiter never observed an exit status" — distinct from
     * [[TimeoutExitCode]] so an interrupted wait can never be mistaken for a
     * completed one, nor a completed one for a timeout. */
@@ -103,7 +114,8 @@ object BlobExec {
       abortOnError: Boolean,
       inserter: ObjectInserter,
       timeoutSeconds: Int = DefaultTimeoutSeconds,
-      onTimeout: () => Unit = () => ()
+      onTimeout: () => Unit = () => (),
+      onParserCrash: () => Unit = () => ()
   ): Outcome = {
     val (exitCode, stdout, stderr) = invoke(bytes, origSha, filename, fullPath, command, timeoutSeconds)
 
@@ -120,9 +132,51 @@ object BlobExec {
       )
       onTimeout()
       Outcome.Skip
+    } else if (exitCode == ParserCrashExitCode) {
+      // srcML died on a signal (SIGSEGV on 32 of the 36 known corpus files,
+      // SIGABRT on the other 4), or the token stream came back empty, which a
+      // healthy srcML parse never is. Treated exactly like a timeout in flow, and
+      // deliberately so: Skip rather than Replace, so the (empty or truncated)
+      // stdout can never become a blob; and NOT routed through `abortOnError`, so
+      // one crashing blob cannot take down a run that has folded thousands of
+      // commits. Counted separately from a timeout via `onParserCrash` because it
+      // is a different defect with a different fix — more time never helps a
+      // segfault — and because the operator needs to know which one happened.
+      System.err.println(
+        s"Warning: command [$command] reported a parser crash (exit $exitCode) on blob $origSha " +
+          s"at path [$fullPath]: srcML died or produced no tokens, so this blob is left " +
+          "untokenized rather than written as an empty tokenization"
+      )
+      if (stderr.nonEmpty) {
+        System.err.println(s"--- stderr from $command on $origSha ($fullPath) ---")
+        System.err.print(stderr)
+        if (!stderr.endsWith("\n")) System.err.println()
+        System.err.println("--- end stderr ---")
+      }
+      onParserCrash()
+      Outcome.Skip
     } else if (exitCode != 0) {
       logError(command, origSha, fullPath, exitCode, stderr)
       if (abortOnError) Outcome.Abort(stderr, exitCode) else Outcome.Skip
+    } else if (stdout.isEmpty && bytes.nonEmpty) {
+      // Defence in depth, and the other half of "zero output is never success".
+      // The tokenizer now detects its own empty stream and exits
+      // ParserCrashExitCode, but this is the backstop for every way that could be
+      // bypassed — a wrapper that swallows the status, a different tokenizer, a
+      // future parser. Consuming real source and emitting nothing is a failure
+      // whatever the exit code says, and inserting it is precisely how a 1,263-byte
+      // C file became a 0-byte blob in a published dataset.
+      //
+      // The two cases the brief asks to be told apart are told apart here by
+      // `bytes.nonEmpty`: a genuinely empty input producing empty output is
+      // untouched and falls through to the `equals` branch below as a plain Skip.
+      System.err.println(
+        s"Warning: command [$command] exited 0 but produced no output for the ${bytes.length}-byte " +
+          s"blob $origSha at path [$fullPath]. Refusing to write an empty tokenization: counting " +
+          "this as a parser crash and leaving the blob untokenized."
+      )
+      onParserCrash()
+      Outcome.Skip
     } else if (JavaArrays.equals(bytes, stdout)) {
       Outcome.Skip
     } else {

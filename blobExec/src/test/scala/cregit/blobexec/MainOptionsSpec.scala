@@ -101,12 +101,14 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
       aborted: Boolean = false,
       blobsTimedOut: Long = 0L,
       blobsOversized: Long = 0L,
-      blobsDenylisted: Long = 0L
+      blobsDenylisted: Long = 0L,
+      blobsParserCrashed: Long = 0L
   ) = WalkStats(
     commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = 1,
     blobsCacheHit = 0, refsProjected = 1, aborted = aborted,
     blobsTimedOut = blobsTimedOut, blobsOversized = blobsOversized,
-    blobsDenylisted = blobsDenylisted, blobCommandExecutions = 1,
+    blobsDenylisted = blobsDenylisted, blobsParserCrashed = blobsParserCrashed,
+    blobCommandExecutions = 1,
     originalBlobCopyRequests = 0, originalBlobCopies = 0,
     originalBlobAlreadyPresent = 0, originalBlobCacheHits = 0,
     originalBlobDestinationLookups = 0, originalBlobBytesCopied = 0,
@@ -136,6 +138,43 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   test("an abort still wins over everything") {
     Main.exitStatus(stats(aborted = true)) shouldEqual 2
     Main.exitStatus(stats(aborted = true, blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual 2
+    Main.exitStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
+  }
+
+  // A parser crash is a defect nobody has explained — srcML 1.1.0 dying on a
+  // signal — so it gates publication the way a timeout does, and unlike an
+  // oversized or denylisted blob. It gets its OWN status because the remedies
+  // differ: --blob-timeout does nothing for a segfault.
+
+  test("a parser crash blocks publication, with its own status") {
+    Main.exitStatus(stats(blobsParserCrashed = 1)) shouldEqual Main.ParserCrashedExitStatus
+    Main.exitStatus(stats(blobsParserCrashed = 36)) shouldEqual Main.ParserCrashedExitStatus
+  }
+
+  test("a parser crash still blocks alongside explained exclusions") {
+    Main.exitStatus(stats(blobsParserCrashed = 1, blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
+      Main.ParserCrashedExitStatus
+  }
+
+  // Regression: this status was first written as 5, which is already
+  // Walker.StalledExitStatus — so a parser crash would have been reported to
+  // run_pipeline_process.sh as a stall, sending the operator to --blob-timeout for
+  // a segfault and writing the wrong marker file. Every status blobExec can exit
+  // with must be distinct, so assert the whole set rather than just one pair.
+  test("the parser-crash status collides with no other blobExec exit status") {
+    val others = Map(
+      "clean"       -> 0,
+      "usage"       -> 1,
+      "aborted"     -> 2,
+      "maskChanged" -> 3,
+      "timedOut"    -> Main.TimedOutExitStatus,
+      "stalled"     -> Walker.StalledExitStatus
+    )
+    others.foreach { case (name, status) =>
+      withClue(s"parser-crash status must differ from $name ($status): ") {
+        Main.ParserCrashedExitStatus should not equal status
+      }
+    }
   }
 
   // -- the watchdog's decision ------------------------------------------------

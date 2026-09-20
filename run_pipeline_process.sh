@@ -276,9 +276,9 @@ STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
 
 # Markers meaning "the work in $WORK is incomplete but recoverable, and a
 # FROM_STEP=1 wipe would throw away days of tokenizing to redo it". Written by
-# step 2 when blobExec reports a timed-out blob (exit 4) or a stall (exit 5);
-# see keep_markers_present and --force-clean.
-KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED"
+# step 2 when blobExec reports a timed-out blob (exit 4), a stall (exit 5), or a
+# parser crash (exit 6); see keep_markers_present and --force-clean.
+KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED TOKENIZE-PARSER-CRASHES"
 
 # Prints the first marker found in $WORK and returns 0; returns 1 if none.
 keep_markers_present() {
@@ -415,6 +415,28 @@ $resume_lines
 $resume_lines
      The STALLED line in this step's log names the blobs that were in flight.
      If one of them is pathological: $timeout_knob"
+    elif [ "$rc" -eq 6 ]; then
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-PARSER-CRASHES"
+        echo "$what exited 6: at least one blob's tokenizer reported a parser" \
+             "crash (srcML died on a signal, or produced no tokens). See the" \
+             "blobsParserCrashed count and the 'reported a parser crash' lines in" \
+             "this step's log. Nothing was recorded for the containing commit." \
+             "This is deterministic: re-running alone will NOT clear it." \
+             >> "${WORK}/TOKENIZE-PARSER-CRASHES"
+        die "$what hit a parser crash (exit 6). Refusing to continue: before this
+     was detected, such a blob became a silent 0-byte tokenization and the file
+     vanished from the dataset with nothing counting it. Marker written to
+     ${WORK}/TOKENIZE-PARSER-CRASHES.
+     This is NOT slowness and --blob-timeout will not help: srcML 1.1.0 faults in
+     its C/C++ position tracking, and --position cannot be dropped because the
+     token format depends on it. Re-running alone will not clear it either,
+     because the crash is deterministic.
+     The 'reported a parser crash' lines in this step's log name each blob with
+     its path and signal. Either fix/upgrade srcML, or add those blobs to the
+     blob denylist with a reason and citation so they are excluded explicitly
+     and reported without blocking publication.
+     If you do denylist them, resume at step 2 to keep the memo:
+$resume_lines"
     else
         die "$what failed (exit $rc)"
     fi
