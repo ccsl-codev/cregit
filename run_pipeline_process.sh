@@ -115,6 +115,16 @@ Output:
                     this project is (the corpus manifest name). Omit to let the
                     generator use --repo-name. The generator fails loudly on a
                     key the sidecar does not hold.
+  --firm-map PATH   forward --firm-map to step 10: the domain->firm CSV
+                    (cregit-token-pipeline/data/affiliation.merged.csv). Unlike
+                    the sidecar this is joined PER ROW against person_domain, so
+                    it fills firm_raw and firm_source. Omit and those columns are
+                    empty strings, so the schema is unchanged either way.
+  --firm-canonical PATH
+                    forward --firm-canonical to step 10: the reviewed
+                    canonical-name table (data/firm_canonical.csv) that fills the
+                    `firm` column. Needs --firm-map. Omit and `firm` repeats
+                    `firm_raw`, so split spellings of one firm stay split.
 
 Tokenizer:
   --mode MODE   tokenizer walk mode (default: pipeline)
@@ -224,6 +234,11 @@ DUCKDB_THREADS=""
 # on whether the caller knows about the sidecar.
 PROJECT_META=""
 PROJECT_KEY=""
+# Empty means "do not pass the flag", as above. The difference from the sidecar is
+# that these two are joined per row rather than injected as constants, so they
+# change what every row says rather than what every row repeats.
+FIRM_MAP=""
+FIRM_CANONICAL=""
 FORCE_CLEAN=0
 # Empty means "do not pass the flag", so blobExec keeps its own defaults (600s
 # per blob, 1800s stall window). The CREGIT_* environment fallbacks exist so the
@@ -401,6 +416,8 @@ while [ $# -gt 0 ]; do
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --project-meta)   need_val "$@"; PROJECT_META="$2"; shift 2 ;;
         --project-key)    need_val "$@"; PROJECT_KEY="$2"; shift 2 ;;
+        --firm-map)       need_val "$@"; FIRM_MAP="$2"; shift 2 ;;
+        --firm-canonical) need_val "$@"; FIRM_CANONICAL="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
         --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
@@ -460,6 +477,22 @@ if [ -n "$PROJECT_META" ] && [ ! -f "$PROJECT_META" ]; then
 fi
 if [ -n "$PROJECT_KEY" ] && [ -z "$PROJECT_META" ]; then
     echo "--project-key without --project-meta has nothing to key into" >&2
+    exit 2
+fi
+
+# Same again for the firm map. Worse than the sidecar if it slips through: a
+# missing map does not fail, it silently publishes blank firm columns, and firm
+# attribution is what this corpus is built to measure.
+if [ -n "$FIRM_MAP" ] && [ ! -f "$FIRM_MAP" ]; then
+    echo "invalid --firm-map: '$FIRM_MAP' is not a file (build it with build_domain_map.py)" >&2
+    exit 2
+fi
+if [ -n "$FIRM_CANONICAL" ] && [ ! -f "$FIRM_CANONICAL" ]; then
+    echo "invalid --firm-canonical: '$FIRM_CANONICAL' is not a file" >&2
+    exit 2
+fi
+if [ -n "$FIRM_CANONICAL" ] && [ -z "$FIRM_MAP" ]; then
+    echo "--firm-canonical without --firm-map has no firm_raw to canonicalise" >&2
     exit 2
 fi
 
@@ -916,6 +949,12 @@ if [ -n "$PROJECT_META" ]; then
 fi
 if [ -n "$PROJECT_KEY" ]; then
     DATASET_OPTS+=(--project-key "$PROJECT_KEY")
+fi
+if [ -n "$FIRM_MAP" ]; then
+    DATASET_OPTS+=(--firm-map "$FIRM_MAP")
+fi
+if [ -n "$FIRM_CANONICAL" ]; then
+    DATASET_OPTS+=(--firm-canonical "$FIRM_CANONICAL")
 fi
 # ${a[@]+"${a[@]}"} keeps an empty array safe under `set -u`.
 "$PYTHON" "$DATASET_SCRIPT" \
