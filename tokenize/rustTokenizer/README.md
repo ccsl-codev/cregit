@@ -20,23 +20,65 @@ A Rust toolchain (`cargo`).
 rust_tokenizer <source.rs>
 ```
 
-The flags `--language=Rust`, `--position`, and `--verbose` are accepted (and ignored)
-so the `tokenize.pl` dispatcher can call it the same way as the other tokenizers.
+The flags `--language=Rust` and `--verbose` are accepted and ignored, so the
+`tokenize.pl` dispatcher can call it the same way as the other tokenizers. `--position`
+is **honored**: it adds the position prefix described below.
 
 ## Output format
 
+Without `--position` — this is what the pipeline uses
+(`run_pipeline_process.sh` builds `BFG_TOKENIZE_CMD` without the flag):
+
 ```
--:-	begin_unit|revision:...;language:Rust;cregit-version:...
-LINE:COL	kind|value
+begin_unit|revision:...;language:Rust;cregit-version:...
+kind|value
 ...
--:-	end_unit
+end_unit
+<blank line>
 ```
 
-One token per line, prefixed with its `line:column` position (columns count code points,
-not bytes). `kind` is one of `keyword`, `identifier`, `lifetime`, `literal`, `comment`,
-`op`, or `unknown`. The `value` is emitted verbatim, with embedded newlines in literals
-and block comments folded to spaces so each token stays on one line. Whitespace produces
-no line.
+With `--position`:
+
+```
+-:-|begin_unit|revision:...;language:Rust;cregit-version:...
+LINE:COL|kind|value
+...
+-:-|end_unit
+-:-|
+```
+
+One token per line. `kind` is one of `keyword`, `identifier`, `lifetime`, `literal`,
+`comment`, `op`, or `unknown`. The `value` is emitted verbatim, with embedded newlines in
+literals and block comments folded to spaces so each token stays on one line. Whitespace
+produces no line. Columns count code points, not bytes.
+
+### The separator is `|`, and the position prefix is opt-in
+
+Both are load-bearing, and both were wrong until fixed: this tokenizer used a TAB and
+emitted the prefix unconditionally, which corrupted 36,534,136 published dataset rows
+across 44 projects.
+
+The format is defined by `tokenizeSrcMl.pl`, the only other tokenizer the pipeline routes
+to, and its committed golden output is the reference:
+
+| file | shape |
+| --- | --- |
+| `tokenize/t/expected/main.c.nopos.token` | `begin_unit\|…`, `comment\|/* … */` |
+| `tokenize/t/expected/main.c.token` | `-:-\|begin_unit\|…`, `1:1\|comment\|/* … */` |
+
+Both downstream consumers split on `|`:
+
+- `generate_dataset/generate_dataset.py:243` — `re.match(r"^(.+?)\|(.+)$", token_content)`
+- `prettyPrint/prettyPrint-author.pl:976` — `split('\|', $value)`
+
+The first capture group is **non-greedy**, so any extra leading field silently becomes
+`token_type` and shifts `token_value`, `source_text` and `is_structural` by one. Nothing
+errors; the data is just wrong.
+
+Do **not** take `tokenize/srcMLtoken/tests/expected/*.token` as the reference. It is
+TAB-separated, but it is `srcml2token`'s *intermediate* output, which `tokenizeSrcMl.pl`
+consumes with `/^([0-9]+|-):([0-9]+|-)\s+(.+)$/` and re-emits with `|`. It reaches no
+consumer. `tests/framing.rs` pins this contract across tokenizers.
 
 ## How to build
 
