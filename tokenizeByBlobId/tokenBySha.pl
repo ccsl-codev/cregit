@@ -132,8 +132,22 @@ if (-f $filename) {
   if (not $tokenizeSucceeded) {
       unlink($outfile);
       unlink($file);
-      my $exitCode = $tokenizeStatus == -1 ? -1 : $tokenizeStatus >> 8;
-      die "tokenize command failed with exit code [$exitCode] [$tokenizeCmd]";
+      if ($tokenizeStatus == -1) {
+          die "tokenize command could not be executed [$tokenizeCmd]: $!";
+      }
+      my $signal = $tokenizeStatus & 127;
+      if ($signal) {
+          die "tokenize command was killed by signal $signal [$tokenizeCmd]";
+      }
+      # Propagate rather than die: die exits 255 and would erase the distinction
+      # between an ordinary tokenizer error and the specific "srcML died, this
+      # tokenization is unusable" status that blobExec counts on its own.
+      # Nothing is memoized on this path -- $outfile is unlinked above -- so the
+      # 0-byte tokenization that used to be written and cached is simply absent.
+      my $exitCode = $tokenizeStatus >> 8;
+      print STDERR "tokenize command failed with exit code [$exitCode] "
+          . "[$tokenizeCmd]; propagating that status and memoizing nothing\n";
+      exit($exitCode);
   }
 
   if (not -d $dir) {
