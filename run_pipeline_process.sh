@@ -48,9 +48,8 @@ Output:
                     cap the DuckDB heap in the dataset generator (step 10).
                     Omit to accept that script's own default of 8GB. Takes an
                     absolute size such as 3GB, never a percentage.
-                    The limit bounds DuckDB's buffers, not the process, which
-                    settles at about 1.4x the limit. A run with N projects in
-                    parallel must therefore budget 1.4 x N x SIZE of RAM.
+                    Budget 1.4 x N x SIZE of RAM for N parallel runs: SIZE caps
+                    DuckDB's buffers, so the process settles above it.
   --duckdb-threads N
                     cap DuckDB's worker threads in the dataset generator. Each
                     sorting thread holds its own buffers, so fewer threads lower
@@ -88,8 +87,8 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-# The pack is an optimisation, not the product. A failed pack must not abort the
-# run: under `set -euo pipefail` that fires the EXIT trap, which deletes $WORK.
+# Packs the generated bare repo, as --gc selects. A gc failure only warns: under
+# `set -e` it would fire the EXIT trap, which deletes $WORK and every finished step.
 pack_cregit_repo() {
     case "$GC_MODE" in
         none)
