@@ -394,10 +394,12 @@ third.
   extension table maps to language C.  Its citation is the analysis document, and
   its `reason` carries the minimal reproducer verbatim.
 * **197 blobs, C and C++, a CRASH — not a hang** — srcML 1.1.0 is killed by
-  **SIGSEGV (159) or SIGABRT (38)** in milliseconds while parsing with
+  **SIGSEGV (153) or SIGABRT (44)** in milliseconds while parsing with
   `--position`, which the tokenizer must pass because the token format carries
   `line:col` positions.  No upstream issue; cited to the sweep that found it.
-  This is the whole history of **36 files across 18 projects** of ordinary
+  This is the whole history of **36 files across 18 named projects, 19
+  affected** — one `deflate.c` blob is vendored byte-identically into two
+  projects, so one entry covers both — of ordinary
   production source, so unlike the first two classes it does remove real
   contributor-behaviour signal.  It is bounded and measured rather than assumed:
   all 904 historical versions of those 36 paths were run through the tokenizer's

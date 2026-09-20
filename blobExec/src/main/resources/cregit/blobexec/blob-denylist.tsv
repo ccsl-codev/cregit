@@ -229,7 +229,7 @@
 # project's HEAD blob — giving 904 distinct blobs. Every one of the 904 was then
 # run through the tokenizer's real chain:
 #
-#   197 crash (159 SIGSEGV, 38 SIGABRT)      -> listed here
+#   197 crash (153 SIGSEGV, 44 SIGABRT)      -> listed here
 #   707 parse cleanly, exit 0, non-empty     -> NOT listed
 #     0 time out                             -> class 3 is disjoint from 1 and 2
 #
