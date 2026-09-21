@@ -148,6 +148,38 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     outcome shouldBe a[ChildRunner.Outcome.Killed]
   }
 
+  test("a descendant holding the pipe cannot park the call, nor forge output") {
+    // perl's fork() guarantees the child inherits fd 1. A shell's `&` does not
+    // reliably, which is why this does not use one.
+    val cmd = shellScript(
+      """exec perl -e 'if (fork() == 0) { sleep 10; exit 0 } print "partial"; exit 0'""")
+    val started = System.currentTimeMillis()
+    val outcome = new ChildRunner(30, drainGraceSeconds = 1).run(cmd, Array.emptyByteArray, Nil)
+    val elapsed = System.currentTimeMillis() - started
+
+    // The holder lives 10s. Either branch below is safe, and neither may wait for it.
+    assert(elapsed < 5000, s"run took ${elapsed}ms: it waited for the descendant")
+    outcome match {
+      // EOF was reached, so the buffer holds everything the child wrote.
+      case ChildRunner.Outcome.Exited(status, stdout, _) =>
+        status shouldEqual 0
+        new String(stdout, UTF_8) shouldEqual "partial"
+      // The reader was still blocked, so no output is offered at all.
+      case ChildRunner.Outcome.Killed(why) =>
+        why should include("still open")
+    }
+  }
+
+  test("a blob whose command leaves a descendant on the pipe is never an abort") {
+    val cmd = shellScript(
+      """exec perl -e 'if (fork() == 0) { sleep 10; exit 0 } print "partial"; exit 0'""")
+    val started = System.currentTimeMillis()
+    val outcome = BlobExec.run("original".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                               abortOnError = true, inserter, timeoutSeconds = 30)
+    assert(System.currentTimeMillis() - started < 20000, "the walk waited for the descendant")
+    outcome should not be a[BlobExec.Outcome.Abort]
+  }
+
   test("the environment reaches the child, and the exit status comes back") {
     val cmd = shellScript("""printf '%s' "$BFG_PATH"; exit 3""")
     inside(new ChildRunner(30).run(cmd, Array.emptyByteArray, Seq("BFG_PATH" -> "src/x.c"))) {

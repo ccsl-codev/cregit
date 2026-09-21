@@ -7,7 +7,7 @@ import scala.jdk.CollectionConverters._
 
 /** One run of an external command under a wall-clock budget. Owns the child's
   * environment, its pipes, its budget and its kill. */
-final class ChildRunner(budgetSeconds: Int) {
+final class ChildRunner(budgetSeconds: Int, drainGraceSeconds: Int = ChildRunner.DrainGraceSeconds) {
 
   import ChildRunner._
 
@@ -35,10 +35,10 @@ final class ChildRunner(budgetSeconds: Int) {
       }
 
     if (!exited) kill(child, s"no exit within ${budget}s")
-    else if (!readers.await(DrainGraceSeconds.toLong, TimeUnit.SECONDS))
+    else if (!readers.await(drainGraceSeconds.toLong, TimeUnit.SECONDS))
       // A surviving grandchild still holds a pipe, so the output is incomplete
       // and the buffers are not safe to read.
-      kill(child, s"output still open ${DrainGraceSeconds}s after exit")
+      kill(child, s"output still open ${drainGraceSeconds}s after exit")
     else Outcome.Exited(child.exitValue, stdout.toByteArray, stderr.toString)
   }
 
@@ -59,7 +59,7 @@ object ChildRunner {
   }
 
   /** Seconds an open pipe is waited for after the child itself has exited. */
-  private val DrainGraceSeconds: Int = 5
+  private[blobexec] val DrainGraceSeconds: Int = 5
 
   /** Seconds a forced kill needs to take effect. */
   private val KillSettleSeconds: Int = 5
