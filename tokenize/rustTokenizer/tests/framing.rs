@@ -1,29 +1,11 @@
-// Cross-tokenizer framing contract.
+// Cross-tokenizer framing contract: every tokenizer must emit the same line
+// framing, because one downstream parser reads all of their output. Consumers
+// split on `|` with a non-greedy first group, so an extra leading field silently
+// shifts every column instead of failing.
 //
-// WHY THIS FILE EXISTS
-//
-// cregit ships several tokenizers. They must all emit the same line framing, because a
-// single downstream parser reads all of their output:
-//
-//   generate_dataset/generate_dataset.py:243  re.match(r"^(.+?)\|(.+)$", token_content)
-//   prettyPrint/prettyPrint-author.pl:976     split('\|', $value)
-//
-// Both split on `|`, and the first capture group above is NON-GREEDY, so an extra leading
-// field silently becomes `token_type` and shifts `token_value`, `source_text` and
-// `is_structural` by one. Nothing crashes; the data is just wrong.
-//
-// That is exactly what happened: rust_tokenizer separated `line:col` from `type|value`
-// with a TAB and emitted the prefix unconditionally, while tokenizeSrcMl.pl uses `|` and
-// only under --position. 36,534,136 published rows across 44 projects carry the damage.
-// The per-tokenizer tests all passed throughout, because each one only ever checked its
-// own output against itself. This file checks tokenizers against EACH OTHER.
-//
-// The reference is tokenizeSrcMl.pl's own committed golden output, so these tests need
-// neither srcml nor a C compiler and therefore run in CI (.github/workflows/ci.yml:75).
-//
-// NOT the reference: tokenize/srcMLtoken/tests/expected/*.token, which is TAB-separated.
-// That is srcml2token's INTERMEDIATE output; tokenizeSrcMl.pl:120 consumes it with
-// /^([0-9]+|-):([0-9]+|-)\s+(.+)$/ and re-emits it with `|`. It reaches no consumer.
+// The reference is tokenizeSrcMl.pl's committed golden output, so these tests need
+// neither srcml nor a C compiler. srcMLtoken's expected/*.token files are NOT the
+// reference: they are srcml2token's TAB-separated intermediate output.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -60,19 +42,15 @@ enum Mode {
     Positioned,
 }
 
-/// Check one token stream against the cregit FINAL framing rules. Returns Err with a
-/// human-readable reason so the same function can be used as a negative control.
-///
-/// This is deliberately written against the FORMAT, not against any one tokenizer, so
-/// that adding a tokenizer means calling this function rather than inventing new rules.
+/// Check one token stream against the FINAL framing rules. Written against the
+/// format, not a tokenizer, so adding a tokenizer means calling this.
 fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
     let lines: Vec<&str> = stream.lines().collect();
     if lines.len() < 3 {
         return Err(format!("stream has only {} lines", lines.len()));
     }
 
-    // 1. No token line may contain a TAB. A TAB is the historic separator of the
-    //    srcml2token INTERMEDIATE format and must never reach a consumer.
+    // 1. A TAB is srcml2token's intermediate separator and must not reach a consumer.
     for (i, l) in lines.iter().enumerate() {
         if l.contains('\t') {
             return Err(format!("line {} contains a TAB: {:?}", i + 1, l));
@@ -95,7 +73,7 @@ fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
     }
 
     // 3. The stream closes with `end_unit` followed by a bare end-of-unit marker line
-    //    (tokenizeSrcMl.pl:143 prints one after every `end_*` token).
+    //    (tokenizeSrcMl.pl prints one after every `end_*` token).
     let n = lines.len();
     let (end_prefix, end_body) = split_prefix(lines[n - 2], mode)?;
     if end_body != "end_unit" {
@@ -115,9 +93,7 @@ fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
         return Err(format!("end_unit prefix is {:?}, expected \"-:-\"", end_prefix));
     }
 
-    // 4. Every line obeys the mode's prefix rule, and a positioned prefix is either
-    //    `-:-` or a real `line:col` pair — separated from the body by `|`, never anything
-    //    else. This is the assertion that fails on the defect.
+    // 4. Every line obeys the mode's prefix rule, `|`-separated from the body.
     for (i, l) in lines.iter().enumerate() {
         if l.is_empty() || *l == "-:-|" {
             continue;
@@ -128,7 +104,7 @@ fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
         }
         match mode {
             Mode::Bare => {
-                // A bare stream must NOT lead with a position field; that is the shift.
+                // A bare stream must not lead with a position field.
                 if looks_like_position(b.split('|').next().unwrap_or("")) {
                     return Err(format!(
                         "line {} leads with a position field {:?} in a bare stream: {:?}",
@@ -160,11 +136,8 @@ fn split_prefix<'a>(line: &'a str, mode: &Mode) -> Result<(&'a str, &'a str), St
     }
 }
 
-/// A position prefix is `LINE:COL` where each component is a run of digits or a literal
-/// `-` meaning "not applicable". All three shapes occur in tokenizeSrcMl.pl's output:
-///   `N:N`  an ordinary token
-///   `N:-`  a DECL line, which has a line but no column (tokenizeSrcMl.pl:130)
-///   `-:-`  a unit/structural line or the end-of-unit marker
+/// A position prefix is `LINE:COL`, each component digits or a literal `-`.
+/// All three of `N:N`, `N:-` and `-:-` occur in tokenizeSrcMl.pl's output.
 fn looks_like_position(s: &str) -> bool {
     fn component(c: &str) -> bool {
         c == "-" || (!c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
@@ -179,7 +152,6 @@ fn looks_like_position(s: &str) -> bool {
 
 #[test]
 fn srcml_golden_streams_satisfy_the_contract() {
-    // The contract is not invented here: tokenizeSrcMl.pl's committed output defines it.
     check_framing(&read(SRCML_GOLDEN_NOPOS), &Mode::Bare)
         .unwrap_or_else(|e| panic!("{} violates the contract: {}", SRCML_GOLDEN_NOPOS, e));
     check_framing(&read(SRCML_GOLDEN_POS), &Mode::Positioned)
@@ -198,8 +170,6 @@ fn rust_tokenizer_agrees_with_the_srcml_golden_framing() {
 
 #[test]
 fn the_two_tokenizers_use_the_same_separator_and_markers() {
-    // Compare the framing *tokens* directly, tokenizer against tokenizer, rather than
-    // each against a hand-written literal.
     let c = read(SRCML_GOLDEN_NOPOS);
     let r = rust_tokenize(&["tests/fixtures/hello.rs"]);
     assert_eq!(
@@ -213,7 +183,6 @@ fn the_two_tokenizers_use_the_same_separator_and_markers() {
     let cp = read(SRCML_GOLDEN_POS);
     let rp = rust_tokenize(&["--position", "tests/fixtures/hello.rs"]);
     assert_eq!(tail(&cp), tail(&rp), "end-of-unit framing differs under --position");
-    // The separator after the position field is the same character in both.
     let sep = |s: &str| -> Option<char> {
         s.lines()
             .find(|l| looks_like_position(l.split(['|', '\t']).next().unwrap_or("")))
@@ -225,8 +194,7 @@ fn the_two_tokenizers_use_the_same_separator_and_markers() {
 
 #[test]
 fn the_contract_check_rejects_the_defect_it_was_written_for() {
-    // Negative control: without this, a vacuous checker would pass and teach us nothing.
-    // These are the exact shapes rust_tokenizer emitted before the fix.
+    // Negative control: the exact shapes rust_tokenizer emitted before the fix.
     let old_bare = "-:-\tbegin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1\n\
                     1:1\tkeyword|fn\n\
                     -:-\tend_unit\n";
