@@ -100,7 +100,8 @@ TIMEOUT_FLAGS=()
 [ -n "$STALL_TIMEOUT" ] && TIMEOUT_FLAGS+=("--stall-timeout=$STALL_TIMEOUT")
 
 run_shard() {
-  local k="$1" sd="$OUT/shard-$k" memo="$OUT/memo-$k" rc t0 t1
+  local k="$1"
+  local sd="$OUT/shard-$k" memo="$OUT/memo-$k" rc t0 t1
   local warm=()
   mkdir -p "$sd" "$memo"
   [ -n "$WARM_DB" ] && warm=(--warm="$WARM_DB")
