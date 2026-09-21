@@ -1,19 +1,7 @@
 #!/usr/bin/env bash
-# Tests for step 2's handling of blobExec's "incomplete but resumable" statuses
-# (4 = a blob timed out, 5 = the stall watchdog fired), for both the serial and
-# the sharded branch, plus the marker clearing and the timeout passthrough.
-#
-# Why these matter:
-#   - the marker is what stops a later FROM_STEP=1 run from deleting the work, so
-#     a branch that does not write it silently loses days of tokenizing.
-#   - the markers are never removed by anything else, so a resumed-and-finished
-#     directory that keeps them blocks every later legitimate FROM_STEP=1 run.
-#   - the recovery text names --blob-timeout, which is only actionable if the
-#     runner actually passes it through.
-#
-# No tokenizing happens: `java` is stubbed on PATH, so each case is a second or
-# two and nothing depends on srcml, perl or the JVM. The stub records its argv,
-# which is how the passthrough is asserted.
+# Step 2 must turn blobExec's resumable statuses into a marker, a kept $WORK and
+# its own exit status, identically in the serial and sharded branches.
+# `java` is stubbed, and the stub records its argv so passthrough is assertable.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,8 +18,6 @@ check() {  # $1 = description, $2 = condition result (0/1)
     fi
 }
 
-# A `java` that exits with $STUB_RC, logs its argv to $STUB_ARGV, and (on 0)
-# creates the destination repo directory its caller will check for.
 make_stub_java() {  # $1 = bin dir
     cat > "$1/java" <<'STUB'
 #!/usr/bin/env bash
@@ -53,7 +39,6 @@ STUB
     chmod +x "$1/java"
 }
 
-# A work directory that looks like a resumable step-1 output.
 fixture() {
     local w
     w=$(mktemp -d "${TMPDIR:-/tmp}/gatetest-XXXXXX")
@@ -96,8 +81,6 @@ OUT=$(STUB_RC=5 run_step2 "$W"); RC=$?
 rm -rf "$W"
 
 echo "case 3: sharded branch, a shard exits 4 — same marker, same message"
-# Until this round the marker lived only in the serial branch, and shard_build.sh
-# collapsed every failure to 1, so this case lost the whole build.
 W=$(fixture)
 OUT=$(STUB_RC=4 run_step2 "$W" --mode sharded --shards 2); RC=$?
 [ "$RC" -ne 0 ]; check "step 2 refuses to continue (exit $RC)" $?
@@ -129,8 +112,6 @@ for rc in 4 5; do
 done
 
 echo "case 6: a completed step 2 clears the markers"
-# Otherwise the directory stays marked forever and every later FROM_STEP=1 run
-# dies at the guard, with no --force-clean passthrough in ctp.py to get past it.
 W=$(fixture)
 : > "$W/TOKENIZE-TIMEOUTS"
 : > "$W/TOKENIZE-STALLED"
@@ -169,8 +150,6 @@ OUT=$(STUB_RC=0 run_step2 "$W" --stall-timeout abc); RC=$?
 rm -rf "$W"
 
 echo "case 10: the runner exits with blobExec's own status, not a flat 1"
-# A caller driving many projects has to tell "incomplete but resumable" from
-# "broken" without opening $WORK, so 4 and 5 must survive to the process status.
 for rc in 4 5; do
     W=$(fixture)
     STUB_RC=$rc run_step2 "$W" > /dev/null 2>&1
@@ -178,7 +157,6 @@ for rc in 4 5; do
     [ "$GOT" -eq "$rc" ]; check "blobExec $rc makes the runner exit $rc (got $GOT)" $?
     rm -rf "$W"
 done
-# A failure with no recovery story still collapses to 1, as before.
 W=$(fixture)
 STUB_RC=3 run_step2 "$W" > /dev/null 2>&1
 GOT=$?

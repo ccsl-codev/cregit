@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# Tests for run_pipeline_process.sh's work-directory guard.
-#
-# A FROM_STEP=1 run deletes $WORK, and so does the failure trap. That is correct
-# for a fresh run and catastrophic for a resumable one: when step 2 stops with a
-# timed-out blob (blobExec exit 4) or a stall (exit 5) it leaves a marker, and the
-# memo, bare repos and blob map in that directory are exactly what a step-2 resume
-# needs. Deleting them turns a one-blob retry into days of re-tokenizing.
-#
-# The property each case asserts is simply: does the directory (and the work
-# planted in it) still exist afterwards?
-#
-# No pipeline work is performed: every case fails early, either at the guard or
-# at the first step, which is enough to exercise both deletion paths (the pre-run
-# wipe and the EXIT trap). Requires the build artifacts to be present, which they
-# are in a built checkout; it never builds anything itself.
+# A resumable $WORK must survive both deletion paths: the FROM_STEP=1 wipe and
+# the EXIT trap. `java` is stubbed, so no pipeline work runs.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,9 +20,7 @@ fixture() {  # $1 = marker name or "none"
 
 run_runner() {  # $1 = work dir, rest = extra args (including any FROM_STEP)
     local w=$1; shift
-    # Executed directly, not via `bash <file>`: that is how ctp.py launches it
-    # (subprocess.Popen(["./run_pipeline_process.sh", …])), so a lost executable
-    # bit shows up here as exit 126 instead of silently in production.
+    # Executed directly, as ctp.py launches it: a lost exec bit surfaces as 126.
     timeout 120 "$RUNNER" \
         --repo-url /nonexistent/does-not-exist.git \
         --repo-name proj \
@@ -56,8 +41,6 @@ check() {  # $1 = description, $2 = condition result (0/1)
 
 # ---------------------------------------------------------------------------
 echo "case 1: TOKENIZE-TIMEOUTS marker + FROM_STEP=1 (default) must refuse"
-# This also covers the EXIT trap: the guard's own `die` is a non-zero exit with
-# FROM_STEP=1, which is precisely the condition the trap deletes on.
 W=$(fixture TOKENIZE-TIMEOUTS)
 OUT=$(run_runner "$W"); RC=$?
 [ "$RC" -ne 0 ]; check "refuses (exit $RC)" $?
@@ -88,8 +71,6 @@ rm -rf "$W"
 echo "case 4: marker + FROM_STEP=2 must proceed with the directory untouched"
 W=$(fixture TOKENIZE-TIMEOUTS)
 OUT=$(run_runner "$W" 2); RC=$?
-# It fails inside step 2, because the fixture's blobmap.db is a stand-in rather
-# than a real database — which is the point: it reached step 2 at all.
 [ "$RC" -ne 0 ]; check "fails inside step 2 on the fixture's stand-in db (exit $RC)" $?
 [ -d "$W" ]; check "work directory still exists" $?
 [ -f "$W/proj-blobmap.db" ]; check "the expensive work is still there" $?
