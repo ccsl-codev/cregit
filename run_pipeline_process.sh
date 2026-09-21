@@ -229,10 +229,16 @@ TOKENIZE_STALLED_STATUS=5
 
 # Memo entries below which a step-1 wipe is allowed. Overridable for tests.
 MEMO_KEEP_THRESHOLD="${CREGIT_MEMO_KEEP_THRESHOLD:-10000}"
+case "$MEMO_KEEP_THRESHOLD" in
+    ''|0|*[!0-9]*)
+        echo "invalid CREGIT_MEMO_KEEP_THRESHOLD: '$MEMO_KEEP_THRESHOLD' is not a positive integer" >&2
+        exit 2
+        ;;
+esac
 
 # Canonical form of a path, existing or not, for the inside-$WORK comparison.
 canonical_path() {
-    readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"
+    readlink -m -- "$1" 2>/dev/null || printf '%s' "$1"
 }
 
 # True when <dir> holds at least <n> entries. Counts at most <n> and stops: a
@@ -248,11 +254,11 @@ memo_entries_at_least() {
 }
 
 # True when the memo lives inside $WORK, so a wipe of $WORK would take it too.
-memo_inside_work() {
-    local cw cm
+path_inside_work() {
+    local cw cp
     cw=$(canonical_path "$WORK")
-    cm=$(canonical_path "$MEMO_DIR")
-    case "$cm" in
+    cp=$(canonical_path "$1")
+    case "$cp" in
         "$cw"|"$cw"/*) return 0 ;;
         *) return 1 ;;
     esac
@@ -260,11 +266,20 @@ memo_inside_work() {
 
 # Prints the memo directory and returns 0 when deleting $WORK would destroy a
 # memo worth keeping.
+# Every memo a wipe of $WORK would take with it, not just this run's. Passing
+# --memo-dir elsewhere moves the NEW memo out of harm's way; it does not move the
+# one a previous default run already left in $WORK/memo.
 memo_at_risk() {
-    [ -n "$MEMO_DIR" ] || return 1
-    memo_inside_work || return 1
-    memo_entries_at_least "$MEMO_DIR" "$MEMO_KEEP_THRESHOLD" || return 1
-    printf '%s' "$MEMO_DIR"
+    local candidate
+    for candidate in "$MEMO_DIR" "$WORK/memo"; do
+        [ -n "$candidate" ] || continue
+        path_inside_work "$candidate" || continue
+        if memo_entries_at_least "$candidate" "$MEMO_KEEP_THRESHOLD"; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 memo_rescue_advice() {
@@ -463,7 +478,7 @@ else
     esac
     # An explicit memo dir inside $WORK is legal but pointless, and saying so is
     # cheaper than discovering it after a wipe.
-    if memo_inside_work; then
+    if path_inside_work "$MEMO_DIR"; then
         log "warning: --memo-dir $MEMO_DIR is inside $WORK, so a FROM_STEP=1 run still deletes it"
         log "warning: pass a directory outside $WORK for a memo that survives the wipe"
     fi
@@ -610,15 +625,18 @@ cleanup() {
     local ec=$?
     if [ $ec -ne 0 ] && [ "$FROM_STEP" = "1" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
         local marker memo
+        if [ "$FORCE_CLEAN" = 1 ]; then
+            log "Pipeline failed (exit $ec) — removing $WORK as --force-clean asks"
+            rm -rf "$WORK"
+            return 0
+        fi
         if marker=$(keep_markers_present); then
             log "Pipeline failed (exit $ec) — keeping $WORK: $marker says the work is resumable"
             log "Resume with FROM_STEP=2 (runner: append '2'; ctp.py: --from-step 2),"
             log "or discard it deliberately with --force-clean."
             return 0
         fi
-        # Same reasoning, for the memo rather than the markers: a failed run must
-        # not be the thing that deletes 2.6 million memoized tokenizations. There
-        # is no marker to write here — the memo itself is the evidence.
+        # Same for the memo; the memo itself is the evidence, so there is no marker.
         if memo=$(memo_at_risk); then
             log "Pipeline failed (exit $ec) — keeping $WORK: $memo holds at least" \
                 "$MEMO_KEEP_THRESHOLD memoized tokenizations"
@@ -670,7 +688,7 @@ echo "████████████████████████�
 echo "  CreGit Pipeline — ${REPO_NAME} (tokenize mode: ${MODE}, file jobs: ${JOBS})"
 echo "  Repo: ${REPO_GIT_URL}"
 echo "  Mask: ${MASK}   Commit links: ${REPO_COMMIT_URL}"
-if memo_inside_work; then
+if path_inside_work "$MEMO_DIR"; then
     echo "  Memo: ${MEMO_DIR}  (inside the work dir: a FROM_STEP=1 run deletes it)"
 else
     echo "  Memo: ${MEMO_DIR}  (outside the work dir: survives a FROM_STEP=1 wipe)"

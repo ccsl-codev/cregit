@@ -165,6 +165,16 @@ grep -q 'MEMO_KEEP_THRESHOLD="${CREGIT_MEMO_KEEP_THRESHOLD:-10000}"' "$RUNNER"
 check "MEMO_KEEP_THRESHOLD defaults to 10000" $?
 
 # ---------------------------------------------------------------------------
+echo "case 9: --memo-dir elsewhere must not expose \$WORK/memo to the wipe"
+W=$(fixture none); M=$(mktemp -d "${TMPDIR:-/tmp}/guardmemo-XXXXXX")
+plant_memo "$W/memo" 4
+OUT=$(CREGIT_MEMO_KEEP_THRESHOLD=2 run_runner "$W" --memo-dir "$M"); RC=$?
+[ "$RC" -ne 0 ];                 check "the run is refused (exit $RC)" $?
+[ -d "$W" ];                     check "the work directory still exists" $?
+[ "$(count_memo "$W/memo")" -eq 4 ]; check "the old memo is still there" $?
+grep -q "$W/memo" <<<"$OUT";     check "the refusal names the memo at risk" $?
+rm -rf "$W" "$M"
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
