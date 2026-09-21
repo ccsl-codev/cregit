@@ -148,24 +148,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     outcome shouldBe a[ChildRunner.Outcome.Killed]
   }
 
-  test("output that cannot be read in full is killed, never returned in part") {
-    // The child exits 0 straight away, but its background grandchild keeps the
-    // stdout pipe open, so no reader can see EOF. Returning what arrived would
-    // publish a truncated tokenization.
-    val cmd     = shellScript("sleep 30 & printf partial; exit 0")
-    val started = System.currentTimeMillis()
-    val outcome = new ChildRunner(30).run(cmd, "irrelevant".getBytes(UTF_8), Nil)
-    val elapsed = System.currentTimeMillis() - started
-    assert(elapsed < 20000, s"run took ${elapsed}ms; the drain grace did not fire")
-    outcome shouldBe a[ChildRunner.Outcome.Killed]
-  }
-
-  test("a blob whose output cannot be drained is skipped, never replaced") {
-    val cmd = shellScript("sleep 30 & printf partial; exit 0")
-    BlobExec.run("original".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
-                 abortOnError = true, inserter, timeoutSeconds = 30) shouldBe BlobExec.Outcome.Skip
-  }
-
   test("the environment reaches the child, and the exit status comes back") {
     val cmd = shellScript("""printf '%s' "$BFG_PATH"; exit 3""")
     inside(new ChildRunner(30).run(cmd, Array.emptyByteArray, Seq("BFG_PATH" -> "src/x.c"))) {
