@@ -676,22 +676,62 @@ def test_a_canonical_table_without_a_map_is_refused(monkeypatch, tmp_path):
     """argparse exits 2. There is no firm_raw to canonicalise without a map, and
     accepting the pair would write `firm` out of nothing."""
     canon = write_canonical(tmp_path, "NVidia,NVIDIA,merge,case only")
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as e:
         run_main(monkeypatch, tmp_path,
                  argv_extra=("--firm-canonical", str(canon)))
+    assert e.value.code == 2
 
 
 def test_a_missing_firm_map_stops_the_run_before_phase_1(monkeypatch, tmp_path):
     """A typo in the path must not produce a corpus of blank firm columns."""
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as e:
         run_main(monkeypatch, tmp_path,
                  argv_extra=("--firm-map", str(tmp_path / "absent.csv")))
+    assert e.value.code == 2
 
 
 def test_a_missing_canonical_table_stops_the_run_before_phase_1(
         monkeypatch, tmp_path):
     firm_map = write_map(tmp_path, "a.example,A,company,gitdm")
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as e:
         run_main(monkeypatch, tmp_path,
                  argv_extra=("--firm-map", str(firm_map),
                              "--firm-canonical", str(tmp_path / "absent.csv")))
+    assert e.value.code == 2
+
+def test_a_canonical_table_differing_only_in_case_is_accepted(monkeypatch, tmp_path):
+    """The uniqueness check and the join must agree: `NVidia` and `nvidia` are one
+    key to both, so a table carrying both is a genuine duplicate, and a table
+    carrying one matches a map company spelled the other way."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "a.example,NVIDIA,company,gitdm")
+    canon = write_canonical(tmp_path, "nvidia,NVIDIA Corporation,merge,case only")
+    out = generate_with_domain(monkeypatch, tmp_path, "a.example",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    rows = duckdb.connect().execute(
+        f"SELECT DISTINCT firm_raw, firm FROM read_parquet('{out}')").fetchall()
+    assert rows == [("NVIDIA", "NVIDIA Corporation")]
+
+
+def test_a_lookup_table_missing_its_key_column_is_refused(monkeypatch, tmp_path):
+    """A wrong-shaped CSV must be named, not silently read as empty keys and then
+    fail in DuckDB's binder half an hour into Phase 3."""
+    bad = tmp_path / "wrong-header.csv"
+    bad.write_text("Domain,Company,kind,source\na.example,A,company,gitdm\n")
+    with pytest.raises(SystemExit, match="no `domain` column"):
+        run_main(monkeypatch, tmp_path, argv_extra=("--firm-map", str(bad)))
+
+
+def test_a_blank_canonical_firm_falls_back_to_firm_raw(monkeypatch, tmp_path):
+    """An empty `firm` cell must not blank the column: the contract is that firm
+    always carries a name when firm_raw does."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "a.example,ACME,company,gitdm")
+    canon = write_canonical(tmp_path, "acme,,merge,blank on purpose")
+    out = generate_with_domain(monkeypatch, tmp_path, "a.example",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    rows = duckdb.connect().execute(
+        f"SELECT DISTINCT firm_raw, firm FROM read_parquet('{out}')").fetchall()
+    assert rows == [("ACME", "ACME")]

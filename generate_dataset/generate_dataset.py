@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import csv
 import logging
 import os
 import re
@@ -406,18 +407,22 @@ FIRM_FIELDS = ("firm_raw", "firm", "firm_source")
 
 
 def read_csv_column(path, column):
-    """One column of a CSV, as a list. Used only for the duplicate checks below.
+    """One column of a CSV, as a list. Raises when the header lacks `column`.
 
     csv, not duckdb: these checks run before Phase 1 and must not depend on the
-    query engine being reachable.
+    query engine being reachable. utf-8 explicitly, because DuckDB reads the same
+    file as utf-8 and a locale-default decode would disagree with it.
     """
-    import csv
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        header = reader.fieldnames or []
+        if column not in header:
+            raise SystemExit(
+                f"{path}: no `{column}` column; header is [{', '.join(header)}]")
+        return [(row.get(column) or "") for row in reader]
 
-    with open(path, newline="") as fh:
-        return [(row.get(column) or "") for row in csv.DictReader(fh)]
 
-
-def check_key_is_unique(path, column, what) -> int:
+def check_key_is_unique(path, column, what, normalize=None) -> int:
     """Refuse a lookup table with a repeated key. Returns the row count.
 
     This is the one failure mode of the firm join that would be invisible. Both
@@ -426,7 +431,8 @@ def check_key_is_unique(path, column, what) -> int:
     validates, the schema still matches, and only the row count betrays it.
     Failing here costs a second; finding it later costs the corpus.
     """
-    keys = [k.strip().lower() for k in read_csv_column(path, column)]
+    normalize = normalize or (lambda k: k.strip().lower())
+    keys = [normalize(k) for k in read_csv_column(path, column)]
     if len(keys) != len(set(keys)):
         seen, dupes = set(), []
         for k in keys:
@@ -450,7 +456,7 @@ def firm_sql(firm_map, firm_canonical) -> tuple[str, str]:
     """
     if not firm_map:
         return ("".join(f"                '' AS {f},\n" for f in FIRM_FIELDS), "")
-    firm_expr = ("coalesce(fc.firm, fm.company, '')" if firm_canonical
+    firm_expr = ("coalesce(nullif(fc.firm, ''), fm.company, '')" if firm_canonical
                  else "coalesce(fm.company, '')")
     select = (
         "                coalesce(fm.company, '')          AS firm_raw,\n"
@@ -467,10 +473,10 @@ def firm_sql(firm_map, firm_canonical) -> tuple[str, str]:
     )
     if firm_canonical:
         join += (
-            "            LEFT JOIN (SELECT firm_raw, firm\n"
+            "            LEFT JOIN (SELECT lower(trim(firm_raw)) AS firm_raw, firm\n"
             f"                       FROM read_csv_auto({sql_literal(firm_canonical)},\n"
             "                                          header=true, all_varchar=true)) fc\n"
-            "                   ON fc.firm_raw = fm.company\n"
+            "                   ON fc.firm_raw = lower(trim(fm.company))\n"
         )
     return (select, join)
 
@@ -625,20 +631,16 @@ def main():
     if args.firm_canonical and not args.firm_map:
         parser.error("--firm-canonical needs --firm-map: there is no firm_raw to "
                      "canonicalise without a map to read it from")
-    if args.firm_map:
-        if not Path(args.firm_map).is_file():
-            print(f"ERROR: firm-map not found: {args.firm_map}", file=sys.stderr)
-            sys.exit(1)
-        n = check_key_is_unique(args.firm_map, "domain", "the firm map")
-        print(f"Firm map:  {args.firm_map} ({n} domains)")
-    if args.firm_canonical:
-        if not Path(args.firm_canonical).is_file():
-            print(f"ERROR: firm-canonical not found: {args.firm_canonical}",
-                  file=sys.stderr)
-            sys.exit(1)
-        n = check_key_is_unique(args.firm_canonical, "firm_raw",
-                                "the canonical-name table")
-        print(f"Firm canon: {args.firm_canonical} ({n} names)")
+    for path, key, label, banner in (
+        (args.firm_map, "domain", "the firm map", "Firm map: "),
+        (args.firm_canonical, "firm_raw", "the canonical-name table", "Firm canon:"),
+    ):
+        if not path:
+            continue
+        if not Path(path).is_file():
+            parser.error(f"{label} is not a file: {path}")
+        n = check_key_is_unique(path, key, label)
+        print(f"{banner} {path} ({n} keys)")
 
     blame_files = sorted(blame_root.rglob("*.blame"))
     if not blame_files:
