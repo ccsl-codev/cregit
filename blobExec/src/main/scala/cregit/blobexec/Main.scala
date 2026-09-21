@@ -48,24 +48,6 @@ object Main {
   private[blobexec] def parsePositiveSeconds(spec: String): Option[Int] =
     spec.toIntOption.filter(s => s > 0 && s <= MaxTimeoutSeconds)
 
-  private[blobexec] def resolveStallTimeout(
-      blobTimeoutSeconds: Int,
-      stallTimeoutSeconds: Int,
-      stallExplicit: Boolean
-  ): Either[String, Int] = {
-    val floor = Walker.stallFloorFor(blobTimeoutSeconds)
-    if (stallTimeoutSeconds >= floor) Right(stallTimeoutSeconds)
-    else if (stallExplicit)
-      Left(
-        s"--stall-timeout=$stallTimeoutSeconds must be at least ${floor}s to go with " +
-          s"--blob-timeout=$blobTimeoutSeconds. A blob completing or being killed is the only " +
-          "progress a pure-blob commit makes, and killing one takes the budget plus the kill " +
-          "grace, so a smaller stall window kills runs whose blobs are merely slow. Try " +
-          s"--stall-timeout=${Walker.stallTimeoutFor(blobTimeoutSeconds)} with --blob-timeout=$blobTimeoutSeconds."
-      )
-    else Right(Walker.stallTimeoutFor(blobTimeoutSeconds))
-  }
-
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
@@ -179,7 +161,7 @@ object Main {
         sys.exit(1)
     }
 
-    resolveStallTimeout(blobTimeoutSeconds, stallTimeoutSeconds, stallExplicit) match {
+    Walker.resolveStallTimeout(blobTimeoutSeconds, stallTimeoutSeconds, stallExplicit) match {
       case Right(secs) =>
         if (secs != stallTimeoutSeconds) {
           System.err.println(

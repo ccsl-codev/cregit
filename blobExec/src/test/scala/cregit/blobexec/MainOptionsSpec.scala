@@ -50,29 +50,29 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   // -- the two timeouts are coupled -------------------------------------------
 
   test("a window at or above the floor is accepted unchanged") {
-    Main.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
-    Main.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
-    Main.resolveStallTimeout(600, Walker.stallFloorFor(600), stallExplicit = true) shouldEqual
+    Walker.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
+    Walker.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
+    Walker.resolveStallTimeout(600, Walker.stallFloorFor(600), stallExplicit = true) shouldEqual
       Right(Walker.stallFloorFor(600))
   }
 
   test("the floor is the child's whole lifetime, not just the budget") {
     Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
-    Main.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
-    Main.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
+    Walker.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
+    Walker.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
   }
 
   test("a refusal names the floor it wants, and the suggestion clears it") {
-    val why = Main.resolveStallTimeout(600, 601, stallExplicit = true).swap.getOrElse("")
+    val why = Walker.resolveStallTimeout(600, 601, stallExplicit = true).swap.getOrElse("")
     why should include(Walker.stallFloorFor(600).toString)
     val suggested = Walker.stallTimeoutFor(600)
-    Main.resolveStallTimeout(600, suggested, stallExplicit = true) shouldEqual Right(suggested)
+    Walker.resolveStallTimeout(600, suggested, stallExplicit = true) shouldEqual Right(suggested)
   }
 
   test("a small budget is widened past the fixed kill overhead, not just tripled") {
-    Main.resolveStallTimeout(5, 3, stallExplicit = false)
+    Walker.resolveStallTimeout(5, 3, stallExplicit = false)
       .getOrElse(0) should be >= Walker.stallFloorFor(5)
-    Main.resolveStallTimeout(1, 1, stallExplicit = false)
+    Walker.resolveStallTimeout(1, 1, stallExplicit = false)
       .getOrElse(0) should be >= Walker.stallFloorFor(1)
   }
 
@@ -82,7 +82,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("the defaults satisfy the relationship") {
-    Main.resolveStallTimeout(
+    Walker.resolveStallTimeout(
       BlobExec.DefaultTimeoutSeconds,
       Walker.DefaultStallTimeoutSeconds,
       stallExplicit = false
@@ -90,21 +90,21 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("a defaulted window is widened to fit a raised --blob-timeout") {
-    Main.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
-    Main.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
+    Walker.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
+    Walker.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
   }
 
   test("an explicit window that is too small is refused, naming both values") {
-    val bad = Main.resolveStallTimeout(1800, 1800, stallExplicit = true)
+    val bad = Walker.resolveStallTimeout(1800, 1800, stallExplicit = true)
     bad.isLeft shouldBe true
     val why = bad.swap.getOrElse("")
     why should include("--stall-timeout=1800")
     why should include("--blob-timeout=1800")
-    Main.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
+    Walker.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
   }
 
   test("widening cannot overflow Int") {
-    Main.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
+    Walker.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
   }
 
   // -- the stall window's floor -----------------------------------------------
