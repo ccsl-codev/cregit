@@ -100,13 +100,15 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   private def stats(
       aborted: Boolean = false,
       blobsTimedOut: Long = 0L,
-      blobsOversized: Long = 0L,
+      blobsGeneratedExcluded: Long = 0L,
+      blobsUntokenizable: Long = 0L,
       blobsDenylisted: Long = 0L,
       blobsParserCrashed: Long = 0L
   ) = WalkStats(
     commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = 1,
     blobsCacheHit = 0, refsProjected = 1, aborted = aborted,
-    blobsTimedOut = blobsTimedOut, blobsOversized = blobsOversized,
+    blobsTimedOut = blobsTimedOut, blobsGeneratedExcluded = blobsGeneratedExcluded,
+    blobsUntokenizable = blobsUntokenizable,
     blobsDenylisted = blobsDenylisted, blobsParserCrashed = blobsParserCrashed,
     blobCommandExecutions = 1,
     originalBlobCopyRequests = 0, originalBlobCopies = 0,
@@ -124,9 +126,54 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(blobsDenylisted = 1000)) shouldEqual 0
   }
 
-  test("oversized blobs do not change it either, unchanged from before") {
-    Main.exitStatus(stats(blobsOversized = 3)) shouldEqual 0
-    Main.exitStatus(stats(blobsOversized = 3, blobsDenylisted = 4)) shouldEqual 0
+  // A blob excluded because its own header names a generator is explained, so it
+  // does not gate — the same standing the denylist has, and for the same reason.
+  test("a generated-blob exclusion does not change it either, at any count") {
+    Main.exitStatus(stats(blobsGeneratedExcluded = 3)) shouldEqual 0
+    Main.exitStatus(stats(blobsGeneratedExcluded = 3, blobsDenylisted = 4)) shouldEqual 0
+  }
+
+  // ...and the counter that used to be folded in with it DOES gate. Under the old
+  // size-only gate, a large file nobody had shown to be generated was counted as
+  // `blobsOversized`, published around, and lost. The two must not share a verdict
+  // any more than they share a counter.
+  test("an unexplained untokenizable blob blocks publication, with its own status") {
+    Main.exitStatus(stats(blobsUntokenizable = 1)) shouldEqual Main.UntokenizableExitStatus
+    Main.exitStatus(stats(blobsUntokenizable = 2)) shouldEqual Main.UntokenizableExitStatus
+  }
+
+  test("an explained exclusion alongside an unexplained one still blocks") {
+    Main.exitStatus(
+      stats(blobsUntokenizable = 1, blobsGeneratedExcluded = 3, blobsDenylisted = 4)
+    ) shouldEqual Main.UntokenizableExitStatus
+  }
+
+  // The older, broader signals keep precedence: when several fire, any of these
+  // statuses correctly means "do not publish", and a timeout is the one an operator
+  // already knows how to act on.
+  test("a timeout and a parser crash both outrank an untokenizable blob") {
+    Main.exitStatus(stats(blobsTimedOut = 1, blobsUntokenizable = 1)) shouldEqual
+      Main.TimedOutExitStatus
+    Main.exitStatus(stats(blobsParserCrashed = 1, blobsUntokenizable = 1)) shouldEqual
+      Main.ParserCrashedExitStatus
+    Main.exitStatus(stats(aborted = true, blobsUntokenizable = 1)) shouldEqual 2
+  }
+
+  test("the untokenizable status collides with no other blobExec exit status") {
+    val others = Map(
+      "clean"        -> 0,
+      "usage"        -> 1,
+      "aborted"      -> 2,
+      "maskChanged"  -> 3,
+      "timedOut"     -> Main.TimedOutExitStatus,
+      "stalled"      -> Walker.StalledExitStatus,
+      "parserCrash"  -> Main.ParserCrashedExitStatus
+    )
+    others.foreach { case (name, status) =>
+      withClue(s"untokenizable status must differ from $name ($status): ") {
+        Main.UntokenizableExitStatus should not equal status
+      }
+    }
   }
 
   test("a timeout still blocks publication, even alongside a denylisted blob") {
@@ -152,8 +199,9 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("a parser crash still blocks alongside explained exclusions") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
-      Main.ParserCrashedExitStatus
+    Main.exitStatus(
+      stats(blobsParserCrashed = 1, blobsDenylisted = 4, blobsGeneratedExcluded = 3)
+    ) shouldEqual Main.ParserCrashedExitStatus
   }
 
   // Regression: this status was first written as 5, which is already
@@ -163,12 +211,13 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   // with must be distinct, so assert the whole set rather than just one pair.
   test("the parser-crash status collides with no other blobExec exit status") {
     val others = Map(
-      "clean"       -> 0,
-      "usage"       -> 1,
-      "aborted"     -> 2,
-      "maskChanged" -> 3,
-      "timedOut"    -> Main.TimedOutExitStatus,
-      "stalled"     -> Walker.StalledExitStatus
+      "clean"          -> 0,
+      "usage"          -> 1,
+      "aborted"        -> 2,
+      "maskChanged"    -> 3,
+      "timedOut"       -> Main.TimedOutExitStatus,
+      "stalled"        -> Walker.StalledExitStatus,
+      "untokenizable"  -> Main.UntokenizableExitStatus
     )
     others.foreach { case (name, status) =>
       withClue(s"parser-crash status must differ from $name ($status): ") {

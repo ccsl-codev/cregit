@@ -364,15 +364,16 @@ those are three different positions and none of them is the default.  Note that
 ### Files that produce no rows at all
 
 The generator writes a row for every token it is given, so what is missing from
-the Parquet is whatever never reached the tokenizer.  Three mechanisms upstream
-(in `blobExec`, step 2) exclude a blob, and in all three cases the file is
+the Parquet is whatever never reached the tokenizer.  Four mechanisms upstream
+(in `blobExec`, step 2) exclude a blob, and in every case the file is
 **absent from the tokenized repository rather than present as raw source** — so it
 produces no blame and no dataset row, rather than rows of unparsed text:
 
 | Mechanism | Recorded as | Effect here |
 |---|---|---|
 | the **blob denylist**, `blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list is a data file so a paper can cite it; nothing at run time can extend or override it |
-| **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
+| **machine-generated** blobs JGit will not materialise (at or above its stream-file threshold) | `blobsGeneratedExcluded`, plus one `EXCLUDED generated blob` line each, quoting the header line that identifies the generator | no rows for those blobs. The size is only the trigger: the recorded reason is the provenance, so a large *hand-written* file is never excluded on this ground |
+| a blob JGit will not materialise that nothing identifies as generated | `blobsUntokenizable`, plus one `UNTOKENIZABLE blob` line each, and exit 7 | **no Parquet at all**: like a timeout, the project cannot publish while the exclusion is unexplained. Resolve it by confirming the file is generated (a header marker or a denylist entry with a citation), or by making it tokenizable |
 | a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
 
 The denylist currently holds **209 blob ids, and they are the historical revisions

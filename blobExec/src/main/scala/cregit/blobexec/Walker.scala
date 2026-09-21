@@ -24,20 +24,23 @@ final case class WalkStats(
       * file left holding raw source instead of tokens, so a non-zero count must
       * reach the caller rather than living only in stderr. */
     blobsTimedOut: Long,
-    /** Distinct mask-matched blobs excluded from the rewrite because JGit will
-      * not materialise an object that large. Unlike [[blobsTimedOut]] this is
-      * explainable and deterministic, so it is reported but does not block
-      * publication: see [[Walker.MaxBlobBytes]]. */
-    blobsOversized: Long,
+    /** Distinct mask-matched blobs excluded because JGit will not materialise
+      * them AND their own header identifies them as machine-generated (see
+      * [[Walker.generatedEvidence]]). The provenance is the reason, which is why
+      * this is no longer called `blobsOversized`: the size only triggers the
+      * check, it does not justify the exclusion. Explained and deterministic, so
+      * like [[blobsDenylisted]] and unlike [[blobsTimedOut]] it is reported but
+      * does not block publication. */
+    blobsGeneratedExcluded: Long,
     /** Distinct mask-matched blobs excluded because they are on the shipped blob
       * denylist ([[BlobDenylist]]): srcML 1.1.0 does not terminate on them, the
       * defect is diagnosed and cited, and excluding them is deterministic. Like
-      * [[blobsOversized]] and unlike [[blobsTimedOut]] this is reported but does
-      * not block publication. */
+      * [[blobsGeneratedExcluded]] and unlike [[blobsTimedOut]] this is reported
+      * but does not block publication. */
     blobsDenylisted: Long,
     /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]: srcML died
       * on a signal, or the token stream came back empty. Like [[blobsTimedOut]]
-      * and unlike [[blobsOversized]]/[[blobsDenylisted]] this DOES block
+      * and unlike [[blobsGeneratedExcluded]]/[[blobsDenylisted]] this DOES block
       * publication, because an unexplained parser death is exactly the defect that
       * used to be written out as a silent 0-byte tokenization. It is a separate
       * counter rather than more timeouts because the two need different fixes: a
@@ -45,6 +48,15 @@ final case class WalkStats(
       * fixing. Defaulted so that adding it did not have to touch callers that
       * construct [[WalkStats]] for other reasons. */
     blobsParserCrashed: Long = 0L,
+    /** Distinct mask-matched blobs JGit will not materialise and that nothing
+      * identifies as generated: on the evidence available, large HAND-WRITTEN
+      * source files. Kept apart from [[blobsGeneratedExcluded]] precisely so that
+      * the defensible exclusion and the indefensible one can never be read as one
+      * number. Like [[blobsTimedOut]] this DOES block publication: an exclusion
+      * whose reason cannot be stated is not a finding, it is a hole. Defaulted so
+      * adding it did not have to touch callers that construct [[WalkStats]] for
+      * other reasons. */
+    blobsUntokenizable: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
     originalBlobCopies: Long,
@@ -86,7 +98,8 @@ final class Walker(
 
   private val blobCommandExecutions          = new LongAdder
   private val blobsTimedOut                  = new LongAdder
-  private val blobsOversized                 = new LongAdder
+  private val blobsGeneratedExcluded         = new LongAdder
+  private val blobsUntokenizable             = new LongAdder
   private val blobsDenylisted                = new LongAdder
   private val blobsParserCrashed             = new LongAdder
   private val originalBlobCopyRequests       = new LongAdder
@@ -235,7 +248,8 @@ final class Walker(
         refsProjected          = refsCount,
         aborted                = aborted,
         blobsTimedOut          = blobsTimedOut.sum(),
-        blobsOversized         = blobsOversized.sum(),
+        blobsGeneratedExcluded = blobsGeneratedExcluded.sum(),
+        blobsUntokenizable     = blobsUntokenizable.sum(),
         blobsDenylisted        = blobsDenylisted.sum(),
         blobsParserCrashed     = blobsParserCrashed.sum(),
         blobCommandExecutions       = blobCommandExecutions.sum(),
@@ -274,7 +288,8 @@ final class Walker(
       refsProjected          = 0,     // shards deliberately never project refs
       aborted                = aborted,
       blobsTimedOut          = blobsTimedOut.sum(),
-      blobsOversized         = blobsOversized.sum(),
+      blobsGeneratedExcluded = blobsGeneratedExcluded.sum(),
+      blobsUntokenizable     = blobsUntokenizable.sum(),
       blobsDenylisted        = blobsDenylisted.sum(),
       blobsParserCrashed     = blobsParserCrashed.sum(),
       blobCommandExecutions       = blobCommandExecutions.sum(),
@@ -870,11 +885,12 @@ final class Walker(
     * into dst). Never touches `mapping`, keeping the hot path lock-free. */
   private def executeBlobTask(task: BlobMissTask): BlobResult =
     readBlob(task) match {
-      // None means "excluded from the rewrite": too large for jgit to
-      // materialise, or on the blob denylist. Both take the same downstream path
-      // — no id, no tree entry, no blob_map row — which is why one result covers
-      // them. readBlob has already counted and explained whichever it was.
-      case None        => BlobResult.Oversized(task.origId)
+      // None means "excluded from the rewrite": machine-generated, untokenizable
+      // and unexplained, or on the blob denylist. All three take the same
+      // downstream path — no id, no tree entry, no blob_map row — which is why one
+      // result covers them. readBlob has already counted and reported which it was,
+      // and the exclusions differ in what they do to the exit status, not here.
+      case None        => BlobResult.Excluded(task.origId)
       case Some(bytes) => executeBlobTask(task, bytes)
     }
 
@@ -1033,7 +1049,7 @@ final class Walker(
     // single commit (e.g. the same (blob, path) reached via two subtrees).
     val unique = misses.map(m => (m.origId.name, m.fullPath) -> m).toMap.values.toVector
 
-    // An oversized blob yields None: it contributes no id, so no tree entry, no
+    // An excluded blob yields None: it contributes no id, so no tree entry, no
     // blob_map row and no dataset row. See readBlob and resolveEntry.
     val futures = unique.map { task =>
       Future {
@@ -1079,7 +1095,7 @@ final class Walker(
     }
 
     // Unbounded: the stall watchdog is the backstop, not a budget. `flatten`
-    // drops the oversized blobs: they are excluded, not resolved.
+    // drops the excluded blobs: they are excluded, not resolved.
     val results = Await.result(Future.sequence(futures), Duration.Inf).flatten
 
     val abort = results.exists { case (_, o, _) => o.isInstanceOf[BlobExec.Outcome.Abort] }
@@ -1099,8 +1115,9 @@ final class Walker(
     }
   }
 
-  /** Read one mask-matched blob, or `None` when it is too large for JGit to
-    * materialise and must therefore be excluded from the rewrite.
+  /** Read one mask-matched blob, or `None` when it has been excluded from the
+    * rewrite. Two things exclude it: the blob denylist, and a provenance
+    * classification made when JGit refuses to materialise the object.
     *
     * `qualcomm/qcom-embedded-power-measurement` ended with rc 1 here:
     *
@@ -1111,20 +1128,49 @@ final class Walker(
     * lines. The mask *did* select it (`.cpp`), so unlike the pass-through path
     * this is not a binary that slipped through. It is machine-generated: its own
     * header says it is a `dumpcpp` dump of Microsoft Excel's COM type library.
-    * It carries no contributor-behaviour signal, and the tokenizer cannot be run
-    * on it in any case, so it is excluded — and the size alone is not the reason
-    * worth writing down, the provenance is.
+    * It carries no contributor-behaviour signal, so it is excluded — and the size
+    * alone is not the reason worth writing down, the provenance is.
     *
-    * Two layers, because one is not enough:
-    *   - the size check is a fast path, at the threshold JGit itself uses;
-    *   - the `LargeObjectException` catch is the real mechanism, and covers any
-    *     blob that sits between [[Walker.MaxBlobBytes]] and a JGit configured
-    *     lower than its own default. A bare size check with a hand-picked
-    *     constant above JGit's threshold would still throw in that band.
+    * That last sentence used to sit above a size test, and the mismatch was the
+    * defect: a size test also drops a genuinely large HAND-WRITTEN source file,
+    * for a reason that does not apply to it. So size is the TRIGGER here and
+    * provenance is the VERDICT:
     *
-    * Streaming the bytes instead (as the pass-through path does) is not an
-    * option here: the tokenizer would then be handed 98 MB of generated C++ on
-    * a box with about 5 GiB to spare.
+    *   1. The trigger. JGit will not materialise an object at or above its
+    *      stream-file threshold, so such a blob cannot be handed to the tokenizer
+    *      as bytes. That physical limit fires in two places, and both are only
+    *      triggers: the [[Walker.isOversized]] fast path, and the
+    *      `LargeObjectException` catch, which is what covers a JGit configured
+    *      LOWER than its own default ([[Walker.MaxBlobBytes]] can only read the
+    *      default — the installed value is not exposed by public API). Classifying
+    *      from both sites is deliberate: the two must never disagree.
+    *   2. The verdict, when a banner is found. The blob is classified from a
+    *      bounded prefix — [[Walker.ProvenancePrefixBytes]] read through
+    *      `openStream`, which works at any size, so no 98 MB object has to be
+    *      materialised to read its header. A generator banner
+    *      ([[Walker.generatedEvidence]]) makes the exclusion defensible, and the
+    *      matched line is logged as the evidence rather than asserted: see
+    *      [[noteGeneratedExclusion]].
+    *   3. The verdict, when no banner is found. This is the case a size test got
+    *      wrong: a large file that nothing shows to be generated. It still cannot
+    *      be tokenized here, but it is NOT an explained exclusion, so it gets its
+    *      own counter, its own report line and its own exit status — see
+    *      [[noteUntokenizable]]. Being dropped silently is the one outcome ruled
+    *      out.
+    *
+    * Tokenizing that third case instead was assessed and rejected, with numbers.
+    * `openStream` can supply the bytes JGit refuses to materialise, so reading is
+    * not the obstacle; [[BlobExec.invoke]] is. It buffers the whole token stream
+    * in the heap (a `ByteArrayOutputStream` that doubles as it grows) and then
+    * compares it byte-for-byte with the input, so an N-byte blob costs N plus
+    * several times the size of its token stream, and the tokenizer's own srcML
+    * footprint on top. `parallelism` is `availableProcessors` (16 on this host)
+    * and the jar runs under the JVM's default ceiling (7.66 GiB here, 25% of 30
+    * GiB), with up to three projects running at once. Bounding that needs
+    * BlobExec's stdio spooled through temp files instead of buffered, which is a
+    * different change from this one — so it is reported, not guessed at. The 98 MB
+    * case does not need it: it is generated, and step 2 excludes it for the right
+    * reason.
     */
   private def readBlob(task: BlobMissTask): Option[Array[Byte]] = {
     // Before anything is read or opened: a denylisted blob is one srcML cannot be
@@ -1138,28 +1184,76 @@ final class Walker(
     try {
       val loader = r.open(task.origId, OBJ_BLOB)
       val size   = loader.getSize
-      if (Walker.isOversized(size)) { noteOversized(task, size); None }
+      // Size only says "the bytes cannot be produced here". Which exclusion this
+      // is, and whether it is defensible at all, is classifyUnmaterialisable's.
+      if (Walker.isOversized(size)) { classifyUnmaterialisable(task, loader, size); None }
       else
         try Some(loader.getBytes)
         catch {
           case _: org.eclipse.jgit.errors.LargeObjectException =>
-            noteOversized(task, size)
+            classifyUnmaterialisable(task, loader, size)
             None
         }
     } finally r.close()
   }
 
-  /** `(origSha, fullPath)` of every blob excluded as oversized. Read by
-    * [[resolveEntry]], which drops those entries from the rewritten tree: the
-    * key's absence from `resolved` is what omits the file, and this set is what
-    * distinguishes a deliberate omission from a missing-key bug. */
-  private val oversizedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
+  /** Decide WHY a blob JGit will not materialise is being left out, and record it
+    * under that reason. Called from both trigger sites in [[readBlob]] so the size
+    * fast path and the `LargeObjectException` band can never classify a blob
+    * differently. `loader`'s reader must still be open: the header is read through
+    * the loader's own stream. */
+  private def classifyUnmaterialisable(
+      task: BlobMissTask,
+      loader: ObjectLoader,
+      sizeBytes: Long
+  ): Unit =
+    Walker.generatedEvidence(provenancePrefix(task, loader)) match {
+      case Some(evidence) => noteGeneratedExclusion(task, sizeBytes, evidence)
+      case None           => noteUntokenizable(task, sizeBytes)
+    }
+
+  /** The first [[Walker.ProvenancePrefixBytes]] of a blob, read through
+    * `openStream` because `getBytes` is precisely what refused. Streaming a header
+    * is bounded work at any blob size, which is what makes classifying a 98 MB
+    * object affordable: this reads 8 KiB whatever the blob weighs.
+    *
+    * A read failure yields an empty prefix, which classifies as NOT generated.
+    * That direction is deliberate: an unreadable header is not evidence of
+    * provenance, and the unclassified path is the loud one. */
+  private def provenancePrefix(task: BlobMissTask, loader: ObjectLoader): Array[Byte] =
+    try {
+      val in = loader.openStream()
+      try in.readNBytes(Walker.ProvenancePrefixBytes)
+      finally in.close()
+    } catch {
+      case scala.util.control.NonFatal(e) =>
+        System.err.println(
+          s"blobExec: could not read the header of blob ${task.origId.name} " +
+            s"(${task.fullPath}) in order to classify it: ${e.getClass.getName}: " +
+            s"${e.getMessage}. Treating it as unclassified, which is the loud path."
+        )
+        Array.emptyByteArray
+    }
+
+  /** `(origSha, fullPath)` of every blob excluded because its header says a
+    * machine wrote it. Read by [[resolveEntry]], which drops those entries from
+    * the rewritten tree: the key's absence from `resolved` is what omits the file,
+    * and this set is what distinguishes a deliberate omission from a missing-key
+    * bug. */
+  private val generatedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
+
+  /** `(origSha, fullPath)` of every blob JGit would not materialise and nothing
+    * identified as generated. Read by [[resolveEntry]] for the same reason as
+    * [[generatedKeys]], and kept separate from it so that the explained exclusion
+    * and the unexplained one cannot be confused in the counts — which is the whole
+    * point of splitting them. */
+  private val untokenizableKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
   /** `(origSha, fullPath)` of every blob excluded by the denylist. Read by
-    * [[resolveEntry]] for the same reason as [[oversizedKeys]]: the key's absence
+    * [[resolveEntry]] for the same reason as [[generatedKeys]]: the key's absence
     * from `resolved` is what omits the path, and this set is what separates a
-    * deliberate omission from a missing-key bug. Kept separate from
-    * `oversizedKeys` so the two exclusions can never be confused in the counts. */
+    * deliberate omission from a missing-key bug. Kept separate from the other two
+    * so the exclusions can never be confused in the counts. */
   private val denylistedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
   /** Count and explain one denylisted blob, once per `(sha, path)`. The sha, the
@@ -1168,8 +1262,8 @@ final class Walker(
     * not parse it" is not a defensible sentence in a paper. */
   private def noteDenylisted(task: BlobMissTask, entry: BlobDenylist.Entry): Unit = {
     val key = (task.origId.name, task.fullPath)
-    // Counted and logged once per (sha, path), exactly like an oversized blob, so
-    // the two counters mean the same thing. One blob reached through two paths is
+    // Counted and logged once per (sha, path), exactly like the other exclusions,
+    // so every exclusion counter means the same thing. One blob reached through two paths is
     // therefore two, which is the honest figure for "paths the dataset is missing"
     // — but note the four shipped entries are ONE file's history, so a count of 4
     // is not four distinct files.
@@ -1187,22 +1281,64 @@ final class Walker(
     }
   }
 
-  /** Count and explain one exclusion, once per `(sha, path)`. The path and the
-    * size are in the line on purpose: a bare sha cannot be cited in a paper,
-    * and this line is the only durable record of what the dataset is missing. */
-  private def noteOversized(task: BlobMissTask, sizeBytes: Long): Unit = {
+  /** Count and explain one provenance-based exclusion, once per `(sha, path)`.
+    * The path and the size are in the line on purpose: a bare sha cannot be cited
+    * in a paper, and this line is the only durable record of what the dataset is
+    * missing. The matched marker and the header line it came from are in it for a
+    * stronger reason — they ARE the reason. "It was too big" is not a defensible
+    * sentence in a paper; "its own header says dumpcpp generated it" is, and a
+    * reader can check it. */
+  private def noteGeneratedExclusion(
+      task: BlobMissTask,
+      sizeBytes: Long,
+      evidence: Walker.GeneratedEvidence
+  ): Unit = {
     val key = (task.origId.name, task.fullPath)
-    if (oversizedKeys.add(key)) {
-      blobsOversized.increment()
+    if (generatedKeys.add(key)) {
+      blobsGeneratedExcluded.increment()
       System.err.println(
-        s"blobExec: EXCLUDED oversized blob: sha=${task.origId.name} " +
-          s"path=${task.fullPath} size=${sizeBytes}B limit=${Walker.MaxBlobBytes}B. " +
-          "JGit will not materialise an object this large, and a source file this size is " +
-          "machine-generated rather than authored. The blob is left out of the rewritten " +
-          "tree, so it produces no blame and no dataset row, and the file is absent from " +
-          "the tokenized repository rather than present as raw source. Deterministic and " +
-          "fully explained, so unlike a tokenizer timeout this does NOT block publication: " +
-          "the walk carries on and the run still exits 0."
+        s"blobExec: EXCLUDED generated blob: sha=${task.origId.name} " +
+          s"path=${task.fullPath} size=${sizeBytes}B jgitDefaultLimit=${Walker.MaxBlobBytes}B " +
+          s"marker=[${evidence.marker}] header=[${evidence.line}]. " +
+          "JGit will not materialise an object this large, so its bytes cannot be handed to " +
+          "the tokenizer here — but the reason it is EXCLUDED is the header above: the file " +
+          "is machine-generated, so it carries no contributor-behaviour signal. The blob is " +
+          "left out of the rewritten tree, so it produces no blame and no dataset row, and " +
+          "the file is absent from the tokenized repository rather than present as raw " +
+          "source. Explained and deterministic, so unlike a tokenizer timeout this does NOT " +
+          "block publication: the walk carries on and the run still exits 0."
+      )
+    }
+  }
+
+  /** Count and report one blob JGit will not materialise and nothing identifies as
+    * generated, once per `(sha, path)`.
+    *
+    * This is the case the old size test got wrong. On the evidence available it is
+    * a large hand-written source file, so excluding it is NOT defensible, and it
+    * must not be counted alongside the generated ones or the two become one
+    * indistinguishable number again. It still cannot be tokenized in this run (see
+    * [[readBlob]] on why buying that with memory is not free), so the path is
+    * dropped — but the run is reported incomplete, exactly as a timeout or a
+    * parser crash is, because an exclusion whose reason cannot be stated is a hole
+    * in the dataset rather than a finding about it. */
+  private def noteUntokenizable(task: BlobMissTask, sizeBytes: Long): Unit = {
+    val key = (task.origId.name, task.fullPath)
+    if (untokenizableKeys.add(key)) {
+      blobsUntokenizable.increment()
+      System.err.println(
+        s"blobExec: UNTOKENIZABLE blob, exclusion NOT explained: sha=${task.origId.name} " +
+          s"path=${task.fullPath} size=${sizeBytes}B jgitDefaultLimit=${Walker.MaxBlobBytes}B. " +
+          "JGit will not materialise an object this large, so the tokenizer cannot be handed " +
+          s"its bytes — but nothing in its first ${Walker.ProvenancePrefixBytes} bytes says a " +
+          "machine wrote it, so on the evidence this is a large HAND-WRITTEN source file and " +
+          "dropping it is not defensible. It is left out of the rewritten tree for this run " +
+          "(no blame, no dataset row, absent rather than raw source) and the run is reported " +
+          "INCOMPLETE. Remedies, in order: look at the file. If it is generated after all, the " +
+          "honest fix is a header marker this check can see, or the blob denylist with a reason " +
+          "and a citation (see " + BlobDenylist.ResourcePath + "). If it really is authored, " +
+          "tokenizing it needs BlobExec's stdio spooled to disk instead of buffered in the " +
+          "heap: a deliberate memory decision, not a flag to flip."
       )
     }
   }
@@ -1251,7 +1387,7 @@ final class Walker(
     case TreeExisting(id) => id
     case TreeBuild(origId, entries) =>
       val tf = new org.eclipse.jgit.lib.TreeFormatter
-      // flatMap, not map: an oversized blob resolves to no entry at all, so the
+      // flatMap, not map: an excluded blob resolves to no entry at all, so the
       // rewritten tree simply does not contain that path.
       val resolvedEntries = entries.flatMap(resolveEntry(_, resolved, inserter, subtreeAcc))
       // jgit requires sorted entries (git tree order). The TreeWalk visited
@@ -1287,16 +1423,20 @@ final class Walker(
       val key = (origId.name, fullPath)
       resolved.get(key) match {
         case Some(newId) => Some(ResolvedEntry(name, mode, newId, copyBytes = false))
-        // Excluded as oversized or by the denylist (see readBlob): drop the entry,
-        // so the file is absent from the rewritten tree rather than present as raw
-        // source.
-        case None if oversizedKeys.contains(key) || denylistedKeys.contains(key) => None
+        // Deliberately excluded (see readBlob): machine-generated, untokenizable
+        // and unexplained, or denylisted. Drop the entry, so the file is absent
+        // from the rewritten tree rather than present as raw source.
+        case None
+            if generatedKeys.contains(key) || untokenizableKeys.contains(key) ||
+              denylistedKeys.contains(key) =>
+          None
         // Anything else missing is a bug, and used to surface as a bare
         // NoSuchElementException. Keep it fatal and say which blob it was.
         case None =>
           throw new IllegalStateException(
             s"blob ${origId.name} ($fullPath) is a mask-matched miss with no resolution " +
-              "and was excluded neither as oversized nor by the blob denylist")
+              "and was excluded neither as generated, nor as untokenizable, nor by the " +
+              "blob denylist")
       }
   }
 
@@ -1579,7 +1719,13 @@ final class Walker(
 
 object Walker {
 
-  /** Size at which a mask-matched blob stops being tokenizable and is excluded.
+  /** Size at or above which JGit will not materialise a blob, so its bytes cannot
+    * be handed to the tokenizer.
+    *
+    * This is a TRIGGER, not a reason to exclude anything: reaching it makes
+    * [[Walker#readBlob]] classify the blob's provenance, and the classification is
+    * what decides between a defensible exclusion and a reported hole. A file is not
+    * generated because it is large.
     *
     * Deliberately not a number of our own choosing. It is read from JGit, which
     * refuses to materialise any object at or above its stream-file threshold
@@ -1601,8 +1747,85 @@ object Walker {
   private[blobexec] val MaxBlobBytes: Long =
     new org.eclipse.jgit.storage.file.WindowCacheConfig().getStreamFileThreshold.toLong
 
-  /** Pure form of the exclusion decision, so it can be checked without a repo. */
+  /** Pure form of the TRIGGER, so it can be checked without a repo. Deliberately
+    * not the exclusion decision: it answers "can JGit produce these bytes?" and
+    * nothing else. [[Walker#readBlob]] decides what to do about that, from the
+    * blob's provenance. */
   private[blobexec] def isOversized(sizeBytes: Long): Boolean = sizeBytes >= MaxBlobBytes
+
+  /** Bytes of a blob's head read to classify it when JGit will not materialise the
+    * whole object.
+    *
+    * 8 KiB, because a generator banner is a header: MSVC's `#import`/dumpcpp writes
+    * "compiler-generated file ... DO NOT EDIT!" at the top, and every convention in
+    * [[GeneratedMarkers]] is a header convention. Bounded on purpose — the point of
+    * classifying from a prefix is that it costs the same on a 98 MB object as on a
+    * 1 KB one, so provenance can be established without the memory the whole blob
+    * would take. */
+  private[blobexec] val ProvenancePrefixBytes: Int = 8 * 1024
+
+  /** Lowercase substrings that identify a file as machine-generated.
+    *
+    * Header conventions rather than cleverness, because this list is the thing a
+    * paper has to defend: `DO NOT EDIT` and "generated by" are what generators
+    * actually write, `@generated` is the codemod convention, and `dumpcpp` names
+    * the tool in the one case the corpus really hit.
+    *
+    * The two error directions are deliberately asymmetric, which is what lets the
+    * list stay short and literal. A false positive costs a label on a blob that
+    * could not have been tokenized here anyway. A false negative costs nothing at
+    * all: the unclassified path is reported loudly, counted separately and gates
+    * publication, so a missed marker becomes a question asked, not data lost. */
+  private[blobexec] val GeneratedMarkers: Vector[String] = Vector(
+    "do not edit",
+    "do not modify",
+    "@generated",
+    "autogenerated",
+    "auto-generated",
+    "automatically generated",
+    "generated automatically",
+    "generated by",
+    "machine generated",
+    "machine-generated",
+    "dumpcpp"
+  )
+
+  /** Which marker matched, and the header line it matched in. The line travels
+    * with the marker so a log line can quote its evidence instead of asserting a
+    * verdict — that quotation is what makes the exclusion checkable by a reader. */
+  final case class GeneratedEvidence(marker: String, line: String)
+
+  /** Longest header line quoted as evidence: long enough for a real banner, short
+    * enough that a single-line generated file cannot print 8 KiB into a log. */
+  private val MaxEvidenceLineChars = 200
+
+  /** Pure classifier, so provenance is testable without a repository: does this
+    * header prefix identify the blob as machine-generated, and on what evidence?
+    *
+    * ISO-8859-1, not UTF-8: the prefix is arbitrary bytes cut at a fixed offset, so
+    * a decoder that can fail, or that swallows a split multi-byte character, would
+    * be deciding provenance by accident. Every marker is ASCII, so the byte-per-char
+    * decode finds all of them and can never throw.
+    *
+    * Line by line, and the first match wins, so the reported evidence is the line a
+    * human would have looked at.
+    *
+    * The [[ProvenancePrefixBytes]] bound is enforced here as well as by the caller
+    * that reads the blob, so "provenance is decided from a header" is a property of
+    * this function rather than of one call site. A marker further down a file than
+    * that is not a header and does not classify it. */
+  private[blobexec] def generatedEvidence(prefix: Array[Byte]): Option[GeneratedEvidence] =
+    new String(
+      prefix, 0, math.min(prefix.length, ProvenancePrefixBytes),
+      java.nio.charset.StandardCharsets.ISO_8859_1
+    ).linesIterator
+      .flatMap { line =>
+        val lowered = line.toLowerCase(java.util.Locale.ROOT)
+        GeneratedMarkers.iterator
+          .filter(lowered.contains)
+          .map(marker => GeneratedEvidence(marker, line.trim.take(MaxEvidenceLineChars)))
+      }
+      .nextOption()
 
   private val OriginalBlobCacheSize = 1 << 16
   private val OriginalBlobCopyLockCount = 256
@@ -1710,11 +1933,14 @@ object Walker {
       * a `Resolved`: nothing about this blob, the trees containing it, or its
       * commit may be persisted, or a re-run would treat raw source as done. */
     final case class TimedOut(origId: ObjectId) extends BlobResult
-    /** Too large for JGit to materialise, so excluded from the rewrite. It is
+    /** Deliberately excluded from the rewrite: machine-generated, untokenizable
+      * and unexplained, or denylisted (see [[Walker#readBlob]]). It is
       * deliberately neither `Resolved` nor `TimedOut`: it contributes no id, so
-      * every `collect` that builds a tree/blob_map map drops it, `resolveEntry`
-      * omits the path, and the run is still publishable. */
-    final case class Oversized(origId: ObjectId) extends BlobResult
+      * every `collect` that builds a tree/blob_map map drops it and `resolveEntry`
+      * omits the path. Whether the RUN is still publishable is not decided here
+      * but by the counter the exclusion was recorded under — an explained
+      * exclusion does not gate, an unexplained one does. */
+    final case class Excluded(origId: ObjectId) extends BlobResult
   }
 
   /** Items flowing producer -> consumer across the bounded queue. */

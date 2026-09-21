@@ -48,15 +48,33 @@ object Main {
     * the next free one. `parserCrashStatusIsUnique` in MainOptionsSpec pins that. */
   private[blobexec] val ParserCrashedExitStatus = 6
 
+  /** Exit status when a blob JGit cannot materialise could not be classified as
+    * machine-generated: on the evidence, a large hand-written source file that this
+    * run excluded without being able to say why.
+    *
+    * Its own status, distinct from [[TimedOutExitStatus]] and
+    * [[ParserCrashedExitStatus]], because the remedy is again different: not more
+    * time, not a srcML fix, but a decision about one file — confirm it is generated
+    * (then a header marker or the denylist covers it), or accept that tokenizing it
+    * needs BlobExec's stdio spooled to disk. Telling an operator "timed out" here
+    * would send them to --blob-timeout for a file that never ran.
+    *
+    * 7, the next free status: 1 usage, 2 abort, 3 mask changed, 4 timed out, 5
+    * stalled, 6 parser crash. "the untokenizable status collides with no other
+    * blobExec exit status", in MainOptionsSpec, pins that. */
+  private[blobexec] val UntokenizableExitStatus = 7
+
   /** The process exit status for a finished walk.
     *
     * A function, and taking the whole [[WalkStats]], so that "which counters gate
     * publication" is a property something can be asserted about rather than a
-    * conditional buried in `main`. Exactly two things gate it: an abort, and a
-    * blob whose tokenizer was killed on its budget. Deliberately NOT gating:
+    * conditional buried in `main`. The dividing line is not severity and not
+    * determinism, it is whether the dataset's gap can be EXPLAINED. Deliberately
+    * NOT gating:
     *
-    *   - `blobsOversized` — jgit will not materialise the object; deterministic,
-    *     explained per blob, and the file is absent rather than wrong.
+    *   - `blobsGeneratedExcluded` — jgit will not materialise the object and its own
+    *     header names a generator; the provenance is quoted per blob, and a
+    *     generated file carries no contributor behaviour to lose.
     *   - `blobsDenylisted` — srcML 1.1.0 does not terminate on it; diagnosed, with
     *     an upstream citation, in a data file a paper can cite. Gating on this
     *     would mean tencent__tencentkona-21 could never publish, while telling us
@@ -72,13 +90,23 @@ object Main {
     * known third-party parser bug to stop blocking publication. Until then, failing
     * closed is the point: the alternative is the 0-byte tokenization that shipped.
     *
+    * `blobsUntokenizable` joins the gating set for the same reason, and it is the
+    * counter this function used to be wrong about. Under the old size-only gate that
+    * blob was counted as `blobsOversized` and published around: a file nobody had
+    * shown to be generated, dropped from the dataset because of its size, while the
+    * comment beside the code claimed provenance was the reason. An exclusion whose
+    * reason cannot be stated is a hole, so it blocks publication until someone
+    * states the reason — by confirming the file is generated, denylisting it with a
+    * citation, or making it tokenizable.
+    *
     * A timeout is checked first only because it is the older and broader signal;
-    * when both fire, either status correctly means "do not publish".
+    * when several fire, any of those statuses correctly means "do not publish".
     */
   private[blobexec] def exitStatus(stats: WalkStats): Int =
     if (stats.aborted) 2
     else if (stats.blobsTimedOut > 0) TimedOutExitStatus
     else if (stats.blobsParserCrashed > 0) ParserCrashedExitStatus
+    else if (stats.blobsUntokenizable > 0) UntokenizableExitStatus
     else 0
 
   /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
@@ -456,7 +484,8 @@ object Main {
         s"refsProjected=${stats.refsProjected} " +
         s"blobsTimedOut=${stats.blobsTimedOut} " +
         s"blobsTimedOutEver=$timedOutEver " +
-        s"blobsOversized=${stats.blobsOversized} " +
+        s"blobsGeneratedExcluded=${stats.blobsGeneratedExcluded} " +
+        s"blobsUntokenizable=${stats.blobsUntokenizable} " +
         s"blobsDenylisted=${stats.blobsDenylisted} " +
         s"blobsParserCrashed=${stats.blobsParserCrashed} " +
         s"aborted=${stats.aborted}"
@@ -479,17 +508,40 @@ object Main {
       )
     }
 
-    if (stats.blobsOversized > 0) {
-      // Reported, never fatal. An oversized blob is deterministic and fully
-      // explained by the EXCLUDED lines above, so gating publication on it would
-      // only mean this project could never publish while telling us nothing new.
+    if (stats.blobsGeneratedExcluded > 0) {
+      // Reported, never fatal. The exclusion is explained by the provenance quoted
+      // on the EXCLUDED lines above, so gating publication on it would only mean
+      // this project could never publish while telling us nothing new.
       System.err.println(
-        s"blobExec: ${stats.blobsOversized} blob(s) were excluded as oversized (>= " +
-          s"${Walker.MaxBlobBytes} bytes, JGit's stream-file threshold). Each one is named with " +
-          "its sha, path and size on an 'EXCLUDED oversized blob' line above; those lines are the " +
-          "record of what this project's dataset does not contain. The files are absent from the " +
+        s"blobExec: ${stats.blobsGeneratedExcluded} blob(s) were excluded as machine-generated. " +
+          "Each is a blob JGit will not materialise (>= " + Walker.MaxBlobBytes + " bytes, " +
+          "JGit's default stream-file threshold; an installed one can be lower) whose own " +
+          "header identifies a generator, and each is " +
+          "named with its sha, path, size and the matching header line on an 'EXCLUDED generated " +
+          "blob' line above; those lines are the record of what this project's dataset does not " +
+          "contain, and the header is the reason — not the size. The files are absent from the " +
           "tokenized repository, not present as raw source, so they produce no blame and no " +
           "dataset row. This is not a failure and does not affect the exit status."
+      )
+    }
+
+    if (stats.blobsUntokenizable > 0) {
+      System.err.println(
+        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsUntokenizable} blob(s) could not be " +
+          "tokenized and their exclusion is NOT explained. Each is named on an 'UNTOKENIZABLE " +
+          "blob' line above: JGit will not materialise it (>= " + Walker.MaxBlobBytes + " bytes, " +
+          "JGit's default stream-file threshold; an installed one can be lower), and nothing in " +
+          "its header says a machine wrote it, so on " +
+          "the evidence it is a large hand-written source file. That is the one case this gate " +
+          "used to get wrong — it dropped such a file as merely 'oversized', silently, under a " +
+          "comment that claimed provenance was the reason. Its path is absent from the rewritten " +
+          s"tree for this run, so exiting $UntokenizableExitStatus rather than publishing a hole. " +
+          "Re-running changes nothing by itself: this is deterministic, and --blob-timeout is " +
+          "irrelevant. Decide what the file is. If it is generated, give it a header marker this " +
+          s"check can see, or denylist it with a reason and citation (${BlobDenylist.ResourcePath}). " +
+          "If it is genuinely authored, tokenizing it means spooling BlobExec's stdio to disk " +
+          "instead of buffering the whole token stream in the heap — a deliberate memory change, " +
+          "not a flag."
       )
     }
 
