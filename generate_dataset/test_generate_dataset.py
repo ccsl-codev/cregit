@@ -219,10 +219,7 @@ def test_duckdb_reads_back_the_default_limit():
 
 
 # --------------------------------------------------------------------------- #
-# the per-project metadata columns. The escaping is the part that can corrupt
-# data: the COPY query is one f-string, and these values are free text out of
-# candidates.csv, where history_shared_with holds repository names and file_mask
-# holds a regex.
+# per-project metadata columns
 # --------------------------------------------------------------------------- #
 
 def test_a_metadata_value_with_an_apostrophe_is_escaped():
@@ -234,7 +231,7 @@ def test_a_metadata_value_with_an_apostrophe_is_escaped():
 
 
 def test_a_value_holding_two_apostrophes_escapes_both():
-    """One replacement pass must cover every occurrence, not the first."""
+    """Every occurrence is replaced, not just the first."""
     assert sql_literal("it's o'clock") == "'it''s o''clock'"
     assert sql_literal("''") == "''''''"
 
@@ -254,7 +251,7 @@ def test_a_non_string_value_is_still_quoted():
 
 
 def test_the_field_list_is_twenty_nine_names_ending_in_the_manifest_pair():
-    """Task 6's sidecar carries 29 fields. manifest_category and file_mask come
+    """The sidecar carries 29 fields. manifest_category and file_mask come
     last, and file_mask is the regex the project was actually tokenized with."""
     assert len(PROJECT_META_FIELDS) == 29
     assert len(set(PROJECT_META_FIELDS)) == 29
