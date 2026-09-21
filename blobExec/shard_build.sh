@@ -14,7 +14,7 @@ CREGIT="$(cd "$HERE/.." && pwd)"                        # repo root
 SRC=""; OUT=""; N=4; THREADS=""
 JAR="$HERE/target/scala-2.13/blobExec-0.1.0-assembly.jar"
 COMMAND="$CREGIT/tokenizeByBlobId/tokenBySha.pl"
-MASK='\.[ch]$'
+MASK="$("$CREGIT/tokenize/fileMask.pl")"
 TOK_CMD=""; WARM_DB=""; WARM_GIT=""
 # Empty means "do not pass the flag", leaving blobExec's own defaults in place.
 BLOB_TIMEOUT=""; STALL_TIMEOUT=""

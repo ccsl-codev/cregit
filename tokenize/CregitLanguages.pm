@@ -70,6 +70,23 @@ our %LANG_PARSER_REL = (
 # The parser the srcML-routed languages share.
 our $SRCML_PARSER_REL = 'tokenizeSrcMl.pl';
 
+# Extensions whose CASE routes them differently. By the GNU convention an
+# uppercase .C or .H is C++, while the lowercase forms are C; every other
+# extension is case-insensitive.
+our %CASE_SENSITIVE_EXT = (
+    'C' => 'C++',
+    'H' => 'C++',
+);
+
+# The language for one extension, given without its dot and with its case intact.
+# Returns undef when nothing routes it.
+sub language_for_ext {
+    my ($ext) = @_;
+    return undef unless defined $ext && $ext ne '';
+    return $CASE_SENSITIVE_EXT{$ext} if exists $CASE_SENSITIVE_EXT{$ext};
+    return $EXT_LANG{ lc($ext) };
+}
+
 # Keyed WITH the leading dot, as both callers look them up after lc().
 sub extensions_by_dot {
     return map { ( ".$_" => $EXT_LANG{$_} ) } keys %EXT_LANG;
