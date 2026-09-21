@@ -722,14 +722,9 @@ def main():
                         ORDER BY coalesce(fpn.personname, fe.personid))
                         FILTER (WHERE coalesce(fpn.personname, fe.personid) IS NOT NULL)                AS footer_person_names
                 FROM footers f
-                -- nullif on BOTH arms, and a capture group on the bare form.
-                -- regexp_extract returns '' rather than NULL when the pattern
-                -- does not match, so without nullif the coalesce never reaches
-                -- the second arm and a trailer carrying no address at all joins
-                -- on '' -- which matches every `Name <>` row in emails, and 27
-                -- of 199 corpus persons DBs have one. That published a person
-                -- for every `Former-commit-id:` trailer. The angle-bracket form
-                -- stays first: it is the correct precedence.
+                -- regexp_extract returns '' rather than NULL on no match, so
+                -- without nullif a no-address trailer joins on '' and matches
+                -- every `Name <>` row. Bracketed form first: correct precedence.
                 LEFT JOIN emails fe
                     ON fe.emailaddr = coalesce(
                         nullif(regexp_extract(f.value, '<([^>]+)>', 1), ''),
