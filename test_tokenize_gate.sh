@@ -168,6 +168,23 @@ OUT=$(STUB_RC=0 run_step2 "$W" --stall-timeout abc); RC=$?
 [ "$RC" -ne 0 ]; check "--stall-timeout abc is rejected (exit $RC)" $?
 rm -rf "$W"
 
+echo "case 10: the runner exits with blobExec's own status, not a flat 1"
+# A caller driving many projects has to tell "incomplete but resumable" from
+# "broken" without opening $WORK, so 4 and 5 must survive to the process status.
+for rc in 4 5; do
+    W=$(fixture)
+    STUB_RC=$rc run_step2 "$W" > /dev/null 2>&1
+    GOT=$?
+    [ "$GOT" -eq "$rc" ]; check "blobExec $rc makes the runner exit $rc (got $GOT)" $?
+    rm -rf "$W"
+done
+# A failure with no recovery story still collapses to 1, as before.
+W=$(fixture)
+STUB_RC=3 run_step2 "$W" > /dev/null 2>&1
+GOT=$?
+[ "$GOT" -eq 1 ]; check "an ordinary failure still exits 1 (got $GOT)" $?
+rm -rf "$W"
+
 # ---------------------------------------------------------------------------
 echo
 echo "passed $PASS, failed $FAIL"
