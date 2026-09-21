@@ -171,20 +171,13 @@ GC_MODE="plain"
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
 FORCE_CLEAN=0
-# Empty means "do not pass the flag", so blobExec keeps its own defaults (600s
-# per blob, 1800s stall window). The CREGIT_* environment fallbacks exist so the
-# values are reachable through ctp.py, which has no passthrough of its own but
-# does hand its environment to this script.
+# Empty means "do not pass the flag". The CREGIT_* fallbacks are how ctp.py,
+# which has no passthrough of its own, reaches these values.
 BLOB_TIMEOUT="${CREGIT_BLOB_TIMEOUT:-}"
 STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
 
-# Markers meaning "the work in $WORK is incomplete but recoverable, and a
-# FROM_STEP=1 wipe would throw away days of tokenizing to redo it". Written by
-# step 2 when blobExec reports a timed-out blob (exit 4) or a stall (exit 5);
-# see keep_markers_present and --force-clean.
 KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED"
 
-# Prints the first marker found in $WORK and returns 0; returns 1 if none.
 keep_markers_present() {
     local m
     for m in $KEEP_MARKERS; do
@@ -309,9 +302,8 @@ if [ -n "$DUCKDB_THREADS" ]; then
     esac
 fi
 
-# Validate early: step 2 runs for hours on a large repository. blobExec enforces
-# the relationship between the two values (the stall window must exceed the
-# per-blob budget); this only checks that both are positive integers.
+# Validate early: step 2 runs for hours. blobExec enforces the relationship
+# between the two values; this only rejects non-positive integers.
 for _tv in "BLOB_TIMEOUT:$BLOB_TIMEOUT:--blob-timeout" "STALL_TIMEOUT:$STALL_TIMEOUT:--stall-timeout"; do
     _val=${_tv#*:}; _flag=${_val#*:}; _val=${_val%%:*}
     [ -n "$_val" ] || continue
@@ -485,10 +477,6 @@ PYTHON=$(command -v python3 || true)  # only needed by step 10 (dataset)
 cleanup() {
     local ec=$?
     if [ $ec -ne 0 ] && [ "$FROM_STEP" = "1" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
-        # A recoverable tokenize failure must survive its own error path. Without
-        # this the exit-4 / exit-5 die below would delete the marker it just
-        # wrote, plus the memo, the bare repos and the blob map it promises are
-        # still there — the work the operator is told to resume from.
         local marker
         if marker=$(keep_markers_present); then
             log "Pipeline failed (exit $ec) — keeping $WORK: $marker says the work is resumable"
@@ -504,9 +492,6 @@ trap cleanup EXIT
 
 # A full run starts clean; resuming (FROM_STEP >= 2) keeps existing work.
 if [ "$FROM_STEP" = "1" ] && [ -d "$WORK" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
-    # ...unless the previous run left work that is incomplete but recoverable.
-    # Deleting it here is the expensive mistake: on a large repository this is
-    # days of tokenizing, and the re-run would redo all of it to retry one blob.
     if marker=$(keep_markers_present) && [ "$FORCE_CLEAN" != "1" ]; then
         die "refusing to delete $WORK: $marker
      That run stopped with work that is incomplete but resumable — the memo,
@@ -569,8 +554,6 @@ TOKENIZE_RC=0
 if [ "$MODE" = "sharded" ]; then
   # Memory-bounded path: N tree-only shards in parallel, then merge + serial
   # re-fold into $SHARD_OUT/final/{dst.git,blobmap.db} (byte-identical to serial).
-  # shard_build.sh propagates blobExec's 4 and 5 instead of collapsing them, so
-  # this branch gets the same marker and the same guard as the serial one.
   "${CREGIT}/blobExec/shard_build.sh" \
     --src "$REPO_PATH_ORIGINAL_BARE" \
     --out "$SHARD_OUT" \
@@ -599,9 +582,8 @@ fi
 
 [ -d "$REPO_PATH_CREGIT_BARE" ] || die "tokenize did not produce $REPO_PATH_CREGIT_BARE"
 
-# Step 2 finished: the work here is no longer "incomplete but resumable", so drop
-# the markers. Leaving them would block every later FROM_STEP=1 run for the life
-# of the directory, and ctp.py has no --force-clean passthrough to get past that.
+# Step 2 finished, so the markers must go: they would block every later
+# FROM_STEP=1 run, and ctp.py has no --force-clean passthrough.
 for _m in $KEEP_MARKERS; do
     if [ -e "${WORK}/${_m}" ]; then
         log "tokenize completed — clearing ${WORK}/${_m}"
@@ -652,10 +634,8 @@ end_step
 step "clone non-bare working clones"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -f "$DB_PATH_PERSONS" ] || die "step 5 did not produce $DB_PATH_PERSONS"
-# A repository can hold LFS objects the server no longer serves, and a smudge
-# failure exits 128 — which the EXIT trap then answers by deleting a finished
-# step 2. The tokenizer never reads LFS payloads: the mask selects source
-# files, and the pointers are enough to walk the tree.
+# A missing LFS object fails checkout, and blame and HTML read only mask-matched
+# source, never LFS payloads.
 GIT_LFS_SKIP_SMUDGE=1 git clone $REPO_PATH_ORIGINAL_BARE $REPO_PATH_ORIGINAL
 GIT_LFS_SKIP_SMUDGE=1 git clone $REPO_PATH_CREGIT_BARE $REPO_PATH_CREGIT
 fi

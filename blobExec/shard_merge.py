@@ -52,10 +52,6 @@ import sys
 import time
 
 
-# blobExec's "incomplete but resumable" exit statuses: 4 = a blob's tokenizer was
-# killed on its budget, 5 = the stall watchdog fired. They are propagated rather
-# than turned into a traceback (exit 1), because run_pipeline_process.sh uses them
-# to keep the work directory for a step-2 resume instead of deleting it.
 BLOBEXEC_TIMEOUT_RC = 4
 BLOBEXEC_STALL_RC = 5
 
@@ -166,8 +162,6 @@ def refold(java, jar, src, final_git, final_db, command, mask, tok_cmd, memo,
     if r.stderr:
         sys.stderr.write(r.stderr)
     if r.returncode in (BLOBEXEC_TIMEOUT_RC, BLOBEXEC_STALL_RC):
-        # Not a crash: the re-fold stopped on work that a step-2 resume retries.
-        # Exit with the same status so shard_build.sh and the runner can tell.
         log(f"re-fold exited {r.returncode} (incomplete but resumable) after {dt:.1f}s")
         sys.exit(r.returncode)
     r.check_returncode()
