@@ -3,8 +3,8 @@
 # the EXIT trap. `java` is stubbed, so no pipeline work runs.
 set -uo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
-RUNNER="$HERE/run_pipeline_process.sh"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER="$ROOT/run_pipeline_process.sh"
 PASS=0
 FAIL=0
 

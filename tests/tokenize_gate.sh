@@ -4,9 +4,9 @@
 # `java` is stubbed, and the stub records its argv so passthrough is assertable.
 set -uo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
-RUNNER="$HERE/run_pipeline_process.sh"
-SHARD_BUILD="$HERE/blobExec/shard_build.sh"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER="$ROOT/run_pipeline_process.sh"
+SHARD_BUILD="$ROOT/blobExec/shard_build.sh"
 PASS=0
 FAIL=0
 
@@ -102,8 +102,8 @@ for rc in 4 5; do
     S=$(mktemp -d "${TMPDIR:-/tmp}/shardsrc-XXXXXX")
     PATH="$BIN:$PATH" STUB_RC=$rc timeout 300 "$SHARD_BUILD" \
         --src "$S" --out "$O" --shards 2 \
-        --jar "$HERE/blobExec/target/scala-2.13/blobExec-0.1.0-assembly.jar" \
-        --command "$HERE/tokenizeByBlobId/tokenBySha.pl" \
+        --jar "$ROOT/blobExec/target/scala-2.13/blobExec-0.1.0-assembly.jar" \
+        --command "$ROOT/tokenizeByBlobId/tokenBySha.pl" \
         --mask '\.c$' --tok-cmd "true" > "$O/out.log" 2>&1
     GOT=$?
     [ "$GOT" -eq "$rc" ]; check "a shard exiting $rc makes shard_build.sh exit $rc (got $GOT)" $?
