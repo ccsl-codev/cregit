@@ -74,6 +74,9 @@ jobs:
       - name: Build & test Rust tokenizer (rust_tokenizer)
         run: devenv shell -- bash -c 'cd tokenize/rustTokenizer && make && make test'
 
+      - name: "Pipeline runner: artifact staleness guard"
+        run: devenv shell -- bash test_ensure_artifacts.sh
+
       - name: Perl tests (prove)
         run: devenv shell -- bash -c 'prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t'
 

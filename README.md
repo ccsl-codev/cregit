@@ -114,6 +114,9 @@ cd ../rustTokenizer && make && make test
 cd ../..
 prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t
 
+# the pipeline runner's own guards (stubbed builds and a stubbed java, seconds)
+bash test_ensure_artifacts.sh
+
 for module in slickGitLog persons remapCommits; do
   (cd "$module" && sbt --java-home "$LEGACY_JAVA_HOME" -batch test one-jar)
 done

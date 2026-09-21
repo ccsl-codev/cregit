@@ -12,6 +12,14 @@ artifacts (jars, tokenizers) are built automatically first — run inside
 
 Build:
   --build-only      build all pipeline artifacts and exit, running nothing
+  --ensure-artifacts
+                    run the pre-run build guard and exit, building nothing that
+                    is already current. That guard builds any MISSING artifact,
+                    and additionally rebuilds the Rust tokenizer when its
+                    sources are newer than the binary — it is the pipeline's only
+                    compiled tokenizer, and a stale one silently shifts every
+                    Rust token column by a field. The four jars and srcml2token
+                    are still only checked for existence.
 
 Target repository:
   --repo-url URL    git URL (or local path) of the repository to process (REQUIRED)
@@ -229,6 +237,10 @@ DEFAULT_JOBS=4
 JOBS=${CREGIT_JOBS:-$DEFAULT_JOBS}
 FROM_STEP=1
 BUILD_ONLY=0
+# 1 means "run ensure_artifacts and exit". Distinct from --build-only, which
+# rebuilds all six unconditionally: this one runs exactly the guard a normal run
+# runs, so it is also how that guard is tested.
+ENSURE_ARTIFACTS_ONLY=0
 REPO_GIT_URL=""
 REPO_NAME=""
 REPO_COMMIT_URL=""
@@ -450,6 +462,7 @@ need_val() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-only) BUILD_ONLY=1; shift ;;
+        --ensure-artifacts) ENSURE_ARTIFACTS_ONLY=1; shift ;;
         --repo-url)   need_val "$@"; REPO_GIT_URL="$2"; shift 2 ;;
         --repo-name)  need_val "$@"; REPO_NAME="$2"; shift 2 ;;
         --commit-url) need_val "$@"; REPO_COMMIT_URL="$2"; shift 2 ;;
@@ -704,10 +717,102 @@ build_all() {
     log "build complete"
 }
 
-# Build only what is missing, so an already-built checkout starts instantly.
+# ---------------------------------------------------------------------------
+# Staleness — which sources decide whether the Rust tokenizer is current.
+#
+# ONLY the Rust tokenizer, deliberately and on a decision. It is the single
+# COMPILED tokenizer in the pipeline: CregitLanguages.pm:109-115 routes C, C++
+# and Java to tokenizeSrcMl.pl and M4 to m4Tokenizer/m4.py, which are
+# interpreted and therefore read fresh from disk on every invocation. An
+# interpreted tokenizer cannot go stale the way a cargo artifact can. (The
+# srcml2token binary those scripts shell out to is compiled, but it is currently
+# newer than its own sources — verified — and it is not the artifact that
+# failed.)
+#
+# Sources are named file by file and tree by tree, not as "the module
+# directory", because the build OUTPUT lives inside that same directory: a
+# directory-wide comparison would find target/ newer than the binary it
+# contains and rebuild on every single run.
+#
+# A path listed here that the checkout does not have is a hard error, not a
+# skip: a typo would switch the guard off silently, which is precisely the
+# failure mode the guard exists to remove.
+# ---------------------------------------------------------------------------
+RUST_TOKENIZER_SOURCES=(
+    "$CREGIT/tokenize/rustTokenizer/Makefile"
+    "$CREGIT/tokenize/rustTokenizer/Cargo.toml"
+    "$CREGIT/tokenize/rustTokenizer/Cargo.lock"
+    "$CREGIT/tokenize/rustTokenizer/src"
+)
+
+# needs_build <artifact> <source>...
+#
+# Returns 0 when the artifact has to be (re)built and sets NEEDS_BUILD_REASON to
+# why: either "missing" or the path of the first source found newer than it, so
+# the log says what triggered the build. Returns 1 when the artifact is current.
+#
+# The reason goes in a variable rather than on stdout deliberately. Called as
+# `reason=$(needs_build ...)` the `die` below would exit the command
+# substitution's subshell only, the function would look like it had returned
+# "artifact is current", and a checkout with a missing source file would sail
+# past the guard — the exact silent-skip this function exists to prevent.
+#
+# `find -newer ... -print -quit` stops at the first hit, so the common answer
+# ("nothing is newer") costs one stat per source file and the fast path stays
+# fast: a few milliseconds over all six artifacts, against builds costing
+# minutes. Source DIRECTORIES are passed whole and walked, and their own mtimes
+# count too: a file added to or removed from blobExec/src changes the directory
+# and nothing else, and that is still a source change.
+NEEDS_BUILD_REASON=""
+needs_build() {
+    local artifact=$1; shift
+    NEEDS_BUILD_REASON=""
+    [ $# -gt 0 ] || die "needs_build: no sources declared for $artifact (a source list is missing)"
+    local p
+    for p in "$@"; do
+        [ -e "$p" ] || die \
+"declared source path does not exist: $p
+     (it guards $artifact). Either the checkout is incomplete or the source list
+     in this script is wrong. Refusing to guess: an unreadable source list
+     silently stops guarding that artifact, which is how a 16-day-old
+     rustTokenizer binary shipped a corpus of shifted token columns."
+    done
+    if [ ! -e "$artifact" ]; then
+        NEEDS_BUILD_REASON="missing"
+        return 0
+    fi
+    local newer
+    newer=$(find "$@" -newer "$artifact" -print -quit 2>/dev/null) || true
+    [ -n "$newer" ] || return 1
+    NEEDS_BUILD_REASON="$newer"
+    return 0
+}
+
+# Build what is missing, and — for the Rust tokenizer only — what is out of
+# date, so an already-built and up-to-date checkout starts instantly and a
+# checkout whose Rust sources moved does not run yesterday's tokenizer.
+#
+# Existence alone was not enough, and that was a real defect rather than a
+# theoretical one. tokenize/rustTokenizer/target/release/rust_tokenizer was
+# dated 2026-09-04 18:57 while its src/main.rs was dated 2026-09-20 21:30: the
+# binary predated the fix (729643e) that removed a `line:col<TAB>` prefix from
+# every Rust token, so the stale binary kept emitting it and every consumer
+# split the token on the wrong field. token_type, token_value, source_text,
+# source_line, source_col and is_structural were all shifted by one, and nothing
+# errored. `[ -x "$RUST_TOKENIZER" ]` was true the whole time.
+#
+# KNOWN GAP, accepted rather than fixed here: the four sbt jars — blobExec
+# included — and srcml2token stay behind an existence-only test. A stale jar
+# would still be used, silently. The narrow fix was chosen because Rust is the
+# only language routed to a compiled tokenizer (CregitLanguages.pm:109-115) and
+# it is the artifact that actually failed; widening the guard is a separate
+# decision with its own risk of rebuilding on every run.
 ensure_artifacts() {
     [ -x "$SRCML2TOKEN" ]      || build_srcml2token
-    [ -x "$RUST_TOKENIZER" ]   || build_rust_tokenizer
+    if needs_build "$RUST_TOKENIZER" "${RUST_TOKENIZER_SOURCES[@]}"; then
+        log "artifact out of date ($NEEDS_BUILD_REASON): $RUST_TOKENIZER"
+        build_rust_tokenizer
+    fi
     [ -f "$BFG" ]              || build_blobexec
     [ -f "$SLICKGITLOG_JAR" ]  || build_legacy_jar slickGitLog
     [ -f "$PERSONS_JAR" ]      || build_legacy_jar persons
@@ -719,9 +824,14 @@ if [ "$BUILD_ONLY" = 1 ]; then
     exit 0
 fi
 
-# Auto-build any missing artifact BEFORE the work directory is touched, so a
-# build failure never disturbs the outputs of a previous run.
+# Auto-build any missing or out-of-date artifact BEFORE the work directory is
+# touched, so a build failure never disturbs the outputs of a previous run.
 ensure_artifacts
+
+if [ "$ENSURE_ARTIFACTS_ONLY" = 1 ]; then
+    log "artifacts up to date"
+    exit 0
+fi
 
 REPO_PATH_ORIGINAL="${WORK}/${REPO_NAME}-original"
 REPO_PATH_CREGIT="${WORK}/${REPO_NAME}-cregit"
