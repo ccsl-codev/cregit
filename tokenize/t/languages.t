@@ -1,29 +1,11 @@
 #!/usr/bin/env perl
 
-# The test that would have caught the live defect.
+# For every extension the shared table names: both gates accept it and agree on
+# the language, its parser exists and is executable, the mask selects it
+# case-insensitively and nothing else, and srcml really parses it.
 #
-# tokenizeByBlobId/tokenBySha.pl used to map `go`, `md` and `yaml`, and
-# tokenize/tokenize.pl had no parser for any of the three. The two scripts are
-# consecutive gates on the same blob, so such a file passed the first and died at
-# the second with "Unknown parser for extension" — after step 1 had already run.
-# Nothing tested that the two tables described the same capability.
-#
-# So this file asserts, for EVERY extension the shared table names:
-#
-#   1. tokenBySha.pl (the per-blob gate bfg calls) accepts it and asks for the
-#      same language tokenize.pl would;
-#   2. tokenize.pl routes it to a parser that exists on disk and is executable;
-#   3. the universal file mask selects it, case-insensitively, and selects
-#      nothing that is not in the table;
-#   4. for the srcML-routed extensions, the pinned srcml ACTUALLY PARSES a file
-#      with that extension.
-#
-# (4) is not paranoia. srcml 1.1.0 keys its parser off the file extension and
-# ignores `-l C++` when it does not recognise one: for .ixx, .inl, .cppm, .cxxm
-# and .ipp it emits an XML declaration with no <unit> and exits 0. The chain then
-# writes an EMPTY token file and reports success, so an unverified extension in
-# the mask is silent data loss, not a crash. Probing beats reading a reference
-# page that says "srcML supports C++".
+# The last one matters because srcml 1.1.0 exits 0 and emits no <unit> for an
+# extension it does not know, so "exit 0" alone proves nothing.
 
 use strict;
 use warnings;
@@ -67,10 +49,7 @@ sub run_cmd {
 
 ok(scalar(keys %EXT_LANG) > 0, "the extension table is not empty");
 
-# Every language in the extension table has a parser, and every parser in the
-# parser table is reachable from some extension. Either gap is a hole: a language
-# with no parser is the go/md/yaml defect, and a parser no extension routes to is
-# dead code pretending the capability exists.
+# A language with no parser, or a parser no extension reaches, is a hole.
 my %langs_from_ext = map { $_ => 1 } values %EXT_LANG;
 is_deeply([sort keys %langs_from_ext],
           [sort keys %CregitLanguages::LANG_PARSER_REL],
@@ -82,8 +61,7 @@ for my $lang (sort keys %parsers) {
     ok(-x $p, "parser for [$lang] is executable: $p");
 }
 
-# The three entries that caused the defect. Named individually so a
-# reintroduction says which one.
+# Named individually so a reintroduction says which one.
 for my $dead (qw(go md yaml)) {
     ok(!exists $EXT_LANG{$dead},
        "[$dead] is not in the table — cregit has no parser for it "
@@ -91,15 +69,14 @@ for my $dead (qw(go md yaml)) {
        . "the parser table)");
 }
 
-# Lowercase, dotless keys: tokenize.pl prepends the dot, tokenBySha.pl does not,
-# and both lc() the extension before the lookup. An uppercase key is unreachable.
+# Both callers lc() before the lookup, so an uppercase key is unreachable.
 for my $ext (sort keys %EXT_LANG) {
     is($ext, lc($ext), "table key [$ext] is lowercase, so the lc() lookup finds it");
     unlike($ext, qr/^\./, "table key [$ext] carries no leading dot");
 }
 
 # ---------------------------------------------------------------------------
-# The three tables that used to be separate literals now come from this one
+# The callers derive their tables from this one
 # ---------------------------------------------------------------------------
 
 for my $script ($dispatcher, $srcMlDirect, $tokenBySha) {
@@ -123,10 +100,8 @@ for my $script ($dispatcher, $srcMlDirect, $tokenBySha) {
 
 like($mask, qr/^\Q(?i)\E/, "the mask is case-insensitive: .C and .H are real files");
 
-# Every extension the mask may name is in the table, so it has a parser, and the
-# mask really does name it. Both directions matter: an extension the mask names
-# but the table does not know kills the run part-way, and an extension of a
-# masked language that the mask forgets is source silently left untokenized.
+# Both directions: nothing the mask names is missing from the table, and nothing
+# a masked language owns is missing from the mask.
 my @masked_ext = CregitLanguages::masked_extensions_sorted();
 ok(scalar(@masked_ext) > 0, "the mask names at least one extension");
 
@@ -137,11 +112,7 @@ for my $ext (@masked_ext) {
     }
 }
 
-# M4 is in the table (tokenize.pl routes .am/.ac to m4Tokenizer/m4.py) but must
-# not be in the mask: m4.py's lexer sets end_quote to a backtick instead of an
-# apostrophe, so `x' swallows text up to the next backtick, and 2 of 38 real
-# autotools files on this machine die outright. See %MASKED_LANGUAGES. Selecting
-# .am/.ac would fail whole projects at step 2.
+# M4 is routed but must not be masked: m4.py mis-lexes real autotools quoting.
 ok(!$CregitLanguages::MASKED_LANGUAGES{'M4'},
    "M4 is routed but not masked — m4.py mis-lexes real autotools quoting");
 for my $ext (qw(am ac)) {
@@ -149,9 +120,7 @@ for my $ext (qw(am ac)) {
     ok("file.$ext" !~ /$mask/, "the mask does not select [file.$ext]");
 }
 
-# Extensions cregit cannot tokenize, including the five candidates the srcML
-# probe below rejects. A mask that selected these would produce empty token
-# files (srcML) or kill the run (no parser at all).
+# Extensions cregit cannot tokenize, including the five the srcML probe rejects.
 for my $no (qw(go md yaml py txt cs cppm ixx inl ipp cxxm rb ts json xml)) {
     ok("file.$no" !~ /$mask/, "the mask does not select [file.$no]");
 }
@@ -159,7 +128,7 @@ ok("file.hxx.bak" !~ /$mask/, "the mask is anchored: file.hxx.bak is not selecte
 ok("Makefile" !~ /$mask/, "the mask does not select an extensionless file");
 
 # ---------------------------------------------------------------------------
-# tokenBySha.pl — the first gate. Same extension, same language, no die.
+# tokenBySha.pl — the first gate
 # ---------------------------------------------------------------------------
 
 {
@@ -193,8 +162,7 @@ ok("Makefile" !~ /$mask/, "the mask does not select an extensionless file");
 }
 
 # ---------------------------------------------------------------------------
-# tokenize.pl — the second gate, and the real parsers. This is where go/md/yaml
-# died. Every extension must produce tokens, not an error and not silence.
+# tokenize.pl — the second gate: every extension must produce tokens
 # ---------------------------------------------------------------------------
 
 my $have_srcml   = system("srcml --version >/dev/null 2>&1") == 0;
