@@ -1451,6 +1451,24 @@ object Walker {
   private[blobexec] val DefaultStallTimeoutSeconds: Int =
     stallTimeoutFor(BlobExec.DefaultTimeoutSeconds)
 
+  private[blobexec] def resolveStallTimeout(
+      blobTimeoutSeconds: Int,
+      stallTimeoutSeconds: Int,
+      stallExplicit: Boolean
+  ): Either[String, Int] = {
+    val floor = stallFloorFor(blobTimeoutSeconds)
+    if (stallTimeoutSeconds >= floor) Right(stallTimeoutSeconds)
+    else if (stallExplicit)
+      Left(
+        s"--stall-timeout=$stallTimeoutSeconds must be at least ${floor}s to go with " +
+          s"--blob-timeout=$blobTimeoutSeconds. A blob completing or being killed is the only " +
+          "progress a pure-blob commit makes, and killing one takes the budget plus the kill " +
+          "grace, so a smaller stall window kills runs whose blobs are merely slow. Try " +
+          s"--stall-timeout=${stallTimeoutFor(blobTimeoutSeconds)} with --blob-timeout=$blobTimeoutSeconds."
+      )
+    else Right(stallTimeoutFor(blobTimeoutSeconds))
+  }
+
   /** Pure form of the watchdog's decision, so it can be tested without halting
     * a JVM: has more than `stallTimeoutSeconds` passed with no progress? */
   private[blobexec] def isStalled(
