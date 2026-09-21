@@ -107,23 +107,28 @@ log "launching $N shards (ActiveProcessorCount=$THREADS each)"
 G0=$(date +%s); pids=(); ks=()
 for k in $(seq 0 $((N-1))); do run_shard "$k" & pids+=($!); ks+=("$k"); done
 fail=0
-timedout=0
+# blobExec's resumable statuses, which must reach the caller instead of
+# collapsing into 1: the caller keys "keep the work" off them. 5 outranks 4
+# because a stall needs the wider window, not just another attempt.
+resumable=0
 for i in "${!pids[@]}"; do
   shard_rc=0
   wait "${pids[$i]}" || shard_rc=$?
   [ "$shard_rc" -eq 0 ] && continue
   log "SHARD ${ks[$i]} FAILED exit=$shard_rc (see $OUT/shard-${ks[$i]}/run.log)"
-  # 4 means a blob's tokenizer was killed on its budget. That is retryable by
-  # simply re-running, so it must not collapse into the generic exit 1: the
-  # caller's recovery advice differs.
-  if [ "$shard_rc" -eq 4 ]; then timedout=1; else fail=1; fi
+  case "$shard_rc" in
+    4) [ "$resumable" -eq 0 ] && resumable=4 ;;
+    5) resumable=5 ;;
+    *) fail=1 ;;
+  esac
 done
-log "shard phase wall=$(( $(date +%s) - G0 ))s fail=$fail timedout=$timedout"
-[ $fail -eq 0 ] || { log "ABORT: a shard failed"; exit 1; }
-[ $timedout -eq 0 ] || {
-  log "ABORT: a shard left blobs untokenized (exit 4). Re-run to retry just those blobs."
-  exit 4
-}
+log "shard phase wall=$(( $(date +%s) - G0 ))s fail=$fail resumable=$resumable"
+if [ "$resumable" -ne 0 ]; then
+  log "ABORT: a shard stopped with resumable status $resumable. The build is kept; resume at step 2."
+  [ "$fail" -eq 0 ] || log "NOTE: another shard failed outright and will fail again; see its run.log."
+  exit "$resumable"
+fi
+[ "$fail" -eq 0 ] || { log "ABORT: a shard failed"; exit 1; }
 
 FINAL="$OUT/final"
 MERGE=(--src "$SRC" --final "$FINAL" --jar "$JAR" --command "$COMMAND" --mask "$MASK" \
@@ -135,6 +140,10 @@ for k in $(seq 0 $((N-1))); do MERGE+=(--shard "$OUT/shard-$k"); done
 log "merge + serial re-fold"
 python3 "$HERE/shard_merge.py" "${MERGE[@]}" 2>&1 | tee -a "$LOG"
 mrc=${PIPESTATUS[0]}
-[ "$mrc" -eq 0 ] || { log "ABORT: merge failed (exit $mrc)"; exit 1; }
+case "$mrc" in
+  0) ;;
+  4|5) log "ABORT: the re-fold stopped with resumable status $mrc. Resume at step 2."; exit "$mrc" ;;
+  *)   log "ABORT: merge failed (exit $mrc)"; exit 1 ;;
+esac
 
 log "=== DONE. final DB: $FINAL/blobmap.db  final git: $FINAL/dst.git ==="
