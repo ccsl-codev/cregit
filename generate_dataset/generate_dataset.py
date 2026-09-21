@@ -400,26 +400,8 @@ def sql_literal(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-# The three firm columns, in dataset order. They sit immediately after
-# person_domain and before repo_tag, because firm is RESOLVED FROM person_domain:
-# the key and the three values it produces belong together, and a reader who
-# filters on person_domain finds the answer in the next three columns.
-#
-# Unlike the 29 metadata columns these are NOT per-project constants. They are
-# per row, so they come from a real join against an external, auditable map
-# (--firm-map, this repository's cregit-token-pipeline/data/affiliation.merged.csv)
-# rather than from a SQL literal. The map stays a file on disk on purpose: baking
-# 4,049 rows into a query would make the attribution unreviewable.
-#
-#   firm_raw     the map's `company` string, exactly as the map gives it
-#   firm         the canonical name after --firm-canonical is applied
-#   firm_source  the map's `source`: patch | gitdm | rich | builtin | correction |
-#                cncf-gitdm | cncf-gitdm-single | spinellis[-sec] | …
-#
-# An empty firm_source means "this person_domain is not in the map", so it is the
-# column to filter on for "attributed at all". A reader who distrusts
-# single-person inferences filters firm_source <> 'cncf-gitdm-single', which is
-# 2,771 of the map's 4,049 rows.
+# The three firm columns, resolved per row from person_domain via --firm-map, so
+# they sit between person_domain and repo_tag. DATASET.md documents the values.
 FIRM_FIELDS = ("firm_raw", "firm", "firm_source")
 
 
@@ -468,8 +450,6 @@ def firm_sql(firm_map, firm_canonical) -> tuple[str, str]:
     """
     if not firm_map:
         return ("".join(f"                '' AS {f},\n" for f in FIRM_FIELDS), "")
-    # No canonical table means `firm` repeats `firm_raw`: the column still exists
-    # and still carries a name, it is just the unnormalised one.
     firm_expr = ("coalesce(fc.firm, fm.company, '')" if firm_canonical
                  else "coalesce(fm.company, '')")
     select = (
@@ -477,8 +457,6 @@ def firm_sql(firm_map, firm_canonical) -> tuple[str, str]:
         f"                {firm_expr} AS firm,\n"
         "                coalesce(fm.source, '')           AS firm_source,\n"
     )
-    # lower() on both sides: the map is written lower-cased by build_domain_map,
-    # but persons.db's domain column is whatever the commit's e-mail carried.
     # all_varchar=true so a company spelled like a number ('1&1', '360') cannot
     # be sniffed into another type and change the Parquet's schema.
     join = (
@@ -643,9 +621,7 @@ def main():
     project_meta = load_project_meta(
         args.project_meta, args.project_key or args.repo_name)
 
-    # Same rule for the firm map, and one extra reason: a repeated key in either
-    # lookup table multiplies token rows silently, so both are checked here
-    # rather than after the join has already written the Parquet.
+    # Checked before Phase 1: a repeated key multiplies token rows.
     if args.firm_canonical and not args.firm_map:
         parser.error("--firm-canonical needs --firm-map: there is no firm_raw to "
                      "canonicalise without a map to read it from")

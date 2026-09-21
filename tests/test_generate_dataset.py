@@ -444,11 +444,8 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
 
 
 # --------------------------------------------------------------------------- #
-# firm attribution. The shape is different from everything above: the 29
-# metadata columns are per-project CONSTANTS injected as SQL literals, while
-# firm is PER ROW and comes from a real join against an external CSV. So the
-# failure modes are different too — a duplicate key in either lookup table
-# multiplies token rows through the LEFT JOIN, and nothing downstream notices.
+# firm attribution: resolved PER ROW from an external CSV, so a duplicate key in
+# either lookup table multiplies token rows.
 # --------------------------------------------------------------------------- #
 
 FIRM_MAP_HEADER = "domain,company,kind,source\n"
