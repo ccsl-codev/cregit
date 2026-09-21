@@ -54,12 +54,29 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   // runs. That is the trap the "raise --blob-timeout" recovery advice leads to.
 
   test("the floor clears one blob's whole lifetime, kill grace included") {
-    Walker.stallFloorFor(600) should be > BlobExec.maxChildLifetimeSeconds(600)
-    Walker.stallFloorFor(1) should be > BlobExec.maxChildLifetimeSeconds(1)
+    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
+    Walker.stallFloorFor(1) should be > ChildRunner.maxLifetimeSeconds(1)
   }
 
   test("the default window already clears the default blob budget") {
     Walker.DefaultStallTimeoutSeconds should be >= Walker.stallFloorFor(BlobExec.DefaultTimeoutSeconds)
+  }
+
+  test("the default window is derived from the blob budget, not a second literal") {
+    Walker.DefaultStallTimeoutSeconds shouldEqual Walker.stallTimeoutFor(BlobExec.DefaultTimeoutSeconds)
+  }
+
+  test("a defaulted window follows a raised budget past the floor") {
+    Walker.stallTimeoutFor(1800) shouldEqual 5400
+    Walker.stallTimeoutFor(5) should be >= Walker.stallFloorFor(5)
+    Walker.stallTimeoutFor(1) should be >= Walker.stallFloorFor(1)
+  }
+
+  test("the accepted range of a timeout keeps every derived window inside Int") {
+    Main.parsePositiveSeconds((Main.MaxTimeoutSeconds + 1).toString) shouldEqual None
+    Main.parsePositiveSeconds(Int.MaxValue.toString) shouldEqual None
+    Walker.stallTimeoutFor(Main.MaxTimeoutSeconds) should be > 0
+    ChildRunner.maxLifetimeSeconds(Main.MaxTimeoutSeconds) should be > 0
   }
 
   test("a blob budget past the default window raises the floor above it") {
@@ -77,7 +94,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   test("a run at exactly the floor is not stalled by its own slowest blob") {
     val blobBudget = 3600
     val floor      = Walker.stallFloorFor(blobBudget)
-    val quiet      = BlobExec.maxChildLifetimeSeconds(blobBudget).toLong * 1000000000L
+    val quiet      = ChildRunner.maxLifetimeSeconds(blobBudget).toLong * 1000000000L
     Walker.isStalled(nowNanos = quiet, lastProgressNanos = 0L, floor) shouldBe false
   }
 

@@ -116,23 +116,15 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     }
   }
 
-  test("a child that never exits is killed at the timeout, not awaited forever") {
-    // `sleep 30` stands in for the wedged srcml chain: it reads nothing and
-    // writes nothing, and it holds its stdout open so the reader thread parks
-    // in pipe_read. With a 1 second budget the call must return quickly.
+  test("a child that never exits is killed at its budget, not awaited forever") {
+    // `sleep 30` is the wedged srcml chain: it reads nothing, writes nothing, and
+    // holds its stdout open so the reader parks in pipe_read.
     val cmd     = shellScript("sleep 30")
     val started = System.currentTimeMillis()
-    val (exit, _, _) = BlobExec.invoke(
-      "irrelevant".getBytes(UTF_8),
-      "0" * 40,
-      "input.java",
-      "input.java",
-      cmd,
-      timeoutSeconds = 1
-    )
+    val outcome = new ChildRunner(1).run(cmd, "irrelevant".getBytes(UTF_8), Nil)
     val elapsed = System.currentTimeMillis() - started
-    assert(elapsed < 10000, s"invoke took ${elapsed}ms; the timeout did not fire")
-    exit shouldEqual BlobExec.TimeoutExitCode
+    assert(elapsed < 10000, s"run took ${elapsed}ms; the budget did not fire")
+    outcome shouldBe a[ChildRunner.Outcome.Killed]
   }
 
   test("a timed-out blob is skipped, never tokenized and never an abort") {
@@ -145,20 +137,43 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     out shouldBe BlobExec.Outcome.Skip
   }
 
-  test("an orphan grandchild holding the pipes cannot outlive the timeout") {
-    // The real process shape, tokenBySha.pl -> sh -> srcml, where killing the
-    // direct child leaves grandchildren holding the JVM's stdout/stderr pipes,
-    // the reader threads blocked, and `exitValue()`'s join unreturnable. The
-    // background `sleep` is that grandchild. Only a process-group kill returns
-    // near the budget; a destroy() of the direct child alone would park here
-    // until the JVM-side backstop latch, far past this assertion.
+  test("an orphan grandchild holding the pipes cannot outlive the budget") {
+    // The real process shape, tokenBySha.pl -> sh -> srcml: killing only the
+    // direct child leaves the background `sleep` holding this JVM's pipes.
     val cmd     = shellScript("sleep 30 & sleep 30")
     val started = System.currentTimeMillis()
-    val (exit, _, _) = BlobExec.invoke(
-      "irrelevant".getBytes(UTF_8), "0" * 40, "input.java", "input.java", cmd, timeoutSeconds = 1)
+    val outcome = new ChildRunner(1).run(cmd, "irrelevant".getBytes(UTF_8), Nil)
     val elapsed = System.currentTimeMillis() - started
-    assert(elapsed < 10000, s"invoke took ${elapsed}ms; the process group was not killed")
-    exit shouldEqual BlobExec.TimeoutExitCode
+    assert(elapsed < 10000, s"run took ${elapsed}ms; the descendant tree was not killed")
+    outcome shouldBe a[ChildRunner.Outcome.Killed]
+  }
+
+  test("output that cannot be read in full is killed, never returned in part") {
+    // The child exits 0 straight away, but its background grandchild keeps the
+    // stdout pipe open, so no reader can see EOF. Returning what arrived would
+    // publish a truncated tokenization.
+    val cmd     = shellScript("sleep 30 & printf partial; exit 0")
+    val started = System.currentTimeMillis()
+    val outcome = new ChildRunner(30).run(cmd, "irrelevant".getBytes(UTF_8), Nil)
+    val elapsed = System.currentTimeMillis() - started
+    assert(elapsed < 20000, s"run took ${elapsed}ms; the drain grace did not fire")
+    outcome shouldBe a[ChildRunner.Outcome.Killed]
+  }
+
+  test("a blob whose output cannot be drained is skipped, never replaced") {
+    val cmd = shellScript("sleep 30 & printf partial; exit 0")
+    BlobExec.run("original".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                 abortOnError = true, inserter, timeoutSeconds = 30) shouldBe BlobExec.Outcome.Skip
+  }
+
+  test("the environment reaches the child, and the exit status comes back") {
+    val cmd = shellScript("""printf '%s' "$BFG_PATH"; exit 3""")
+    inside(new ChildRunner(30).run(cmd, Array.emptyByteArray, Seq("BFG_PATH" -> "src/x.c"))) {
+      case ChildRunner.Outcome.Exited(status, stdout, _) =>
+        status shouldEqual 3
+        new String(stdout, UTF_8) shouldEqual "src/x.c"
+      case other => fail(s"expected Exited, got $other")
+    }
   }
 
   test("a timeout is reported to the caller exactly once, and only on a timeout") {

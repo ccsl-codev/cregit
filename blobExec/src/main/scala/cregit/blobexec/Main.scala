@@ -37,12 +37,16 @@ object Main {
     * succeeded, but the output is incomplete and must not be validated. */
   private[blobexec] val TimedOutExitStatus = 4
 
-  /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
-    * positive whole number, else None (which the caller reports and exits 1 on).
-    * Zero and negatives are rejected rather than read as "no limit" — an
-    * unbounded blob is the defect this whole change exists to remove. */
+  /** Upper bound on either timeout flag. A week is already far past any real
+    * budget, and bounding the input here is what keeps every window derived from
+    * it inside `Int`. */
+  private[blobexec] val MaxTimeoutSeconds: Int = 7 * 86400
+
+  /** Seconds for `--blob-timeout=` / `--stall-timeout=`: a positive whole number
+    * within [[MaxTimeoutSeconds]], else None. Zero is rejected rather than read
+    * as "no limit". */
   private[blobexec] def parsePositiveSeconds(spec: String): Option[Int] =
-    spec.toIntOption.filter(_ > 0)
+    spec.toIntOption.filter(s => s > 0 && s <= MaxTimeoutSeconds)
 
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
@@ -52,28 +56,18 @@ object Main {
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
       |  --blob-timeout=<seconds>
-      |                    wall-clock budget for one <command> invocation
-      |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
-      |                    killed (whole process group) and that single blob is
-      |                    left untokenized; the run continues, and
-      |                    --abort-on-error does not turn a timeout into a
-      |                    whole-run abort. The count is reported on the done
-      |                    line and the process then exits ${TimedOutExitStatus},
-      |                    so the caller cannot publish a project whose tokens are
-      |                    incomplete. Nothing durable is recorded for the blob,
-      |                    the trees above it or its commit, so simply running
-      |                    the same command again retries just that blob.
+      |                    budget for one <command> invocation (default ${BlobExec.DefaultTimeoutSeconds}).
+      |                    A child that exceeds it is killed with everything
+      |                    beneath it; that blob is left untokenized, the walk
+      |                    records nothing for its commit, and the run exits
+      |                    ${TimedOutExitStatus} so an incomplete project cannot be published.
+      |                    Re-running retries exactly those blobs.
       |  --stall-timeout=<seconds>
-      |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}). If no blob, tree,
-      |                    commit or blob copy completes anywhere in this window,
-      |                    the run is stuck in a way the per-blob kill did not
-      |                    cover: it is reported with the work in flight and the
-      |                    process is killed with status ${Walker.StalledExitStatus}. The memo is
-      |                    durable, so re-running resumes. Must exceed one blob's
-      |                    whole lifetime, because a commit whose last blob is
-      |                    slow completes nothing until that blob is killed: a
-      |                    window below that floor is rejected, and the default
-      |                    is raised to it when --blob-timeout is large.
+      |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}, derived from
+      |                    --blob-timeout). If nothing completes anywhere in this
+      |                    window the run exits ${Walker.StalledExitStatus}. Neither flag normally
+      |                    needs setting: the window follows the budget, and a
+      |                    window that one blob's lifetime could trip is refused.
       |
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
@@ -179,11 +173,8 @@ object Main {
       sys.exit(1)
     }
 
-    // The stall window must clear one blob's whole lifetime, or the watchdog
-    // kills healthy runs: a commit whose last miss is slow completes nothing
-    // until that blob is killed. Raising --blob-timeout is the documented
-    // recovery from exit 4, so the two settings must be reconciled here rather
-    // than left for the operator to get right.
+    // Raising --blob-timeout lengthens the quiet period a slow blob creates, so
+    // an unset window has to follow it.
     val stallFloor = Walker.stallFloorFor(blobTimeoutSeconds)
     if (stallTimeoutSeconds < stallFloor) {
       if (stallTimeoutGiven) {
@@ -194,11 +185,12 @@ object Main {
         )
         sys.exit(1)
       }
+      val widened = Walker.stallTimeoutFor(blobTimeoutSeconds)
       System.err.println(
-        s"blobExec: raising the stall window from ${stallTimeoutSeconds}s to ${stallFloor}s to clear " +
+        s"blobExec: raising the stall window from ${stallTimeoutSeconds}s to ${widened}s to clear " +
           s"--blob-timeout=${blobTimeoutSeconds}s; pass --stall-timeout to choose your own."
       )
-      stallTimeoutSeconds = stallFloor
+      stallTimeoutSeconds = widened
     }
 
     if (positional.length != 5) {
