@@ -65,6 +65,20 @@ Tokenizer:
                                   for repos too large to tokenize in one process;
                                   delegates to blobExec/shard_build.sh
   --shards N    shard count for --mode sharded (default: 4)
+  --blob-timeout SECONDS
+                wall-clock budget for tokenizing one blob (default: blobExec's
+                own 600). A tokenizer that exceeds it is killed and the run
+                stops with exit 4, leaving that blob to be retried by a re-run
+                from step 2. Raise this when a blob keeps timing out because it
+                is genuinely large; the stall window below is raised with it
+                automatically. Exit 4 and exit 5 keep --work rather than deleting
+                it, because the re-run resumes from the memo there.
+  --stall-timeout SECONDS
+                window with no completed work after which the run is declared
+                stuck and killed (default: blobExec's own 1800, or one blob
+                lifetime, whichever is larger). It must exceed --blob-timeout,
+                because a commit whose last blob is slow completes nothing until
+                that blob is killed.
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck. Each file is independent, so the output does not
@@ -81,6 +95,17 @@ EOF
 die() {
     log "ERROR: $1"
     exit 1
+}
+
+# Stop, but keep $WORK, and exit with the status the failing tool reported.
+# For a retryable failure the work directory IS the recovery: blobExec's memo,
+# the partly tokenized repo and the marker file all live there, and re-running
+# the same command is the documented fix. `die` would instead leave the cleanup
+# trap to delete every commit the run had already folded.
+die_retryable() {
+    KEEP_WORK=1
+    log "ERROR: $2"
+    exit "$1"
 }
 
 log() {
@@ -145,6 +170,9 @@ SKIP_HTML=0
 GC_MODE="plain"
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
+BLOB_TIMEOUT=""
+STALL_TIMEOUT=""
+KEEP_WORK=0
 
 # need_val <flag> <value...>: refuse a value-taking flag with no value.
 need_val() {
@@ -165,6 +193,8 @@ while [ $# -gt 0 ]; do
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
+        --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
+        --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         ''|*[!0-9]*) echo "unknown argument: $1" >&2; usage; exit 2 ;;
@@ -177,6 +207,15 @@ case "$GC_MODE" in
     none|plain|aggressive) ;;
     *) echo "invalid --gc: '$GC_MODE' (want none, plain or aggressive)" >&2; exit 2 ;;
 esac
+
+# Validate early: blobExec rejects these too, but step 2 can be an hour of
+# cloning away, and a typo must not cost that hour.
+for tmo in "--blob-timeout:$BLOB_TIMEOUT" "--stall-timeout:$STALL_TIMEOUT"; do
+    case "${tmo#*:}" in
+        '') ;;
+        0|*[!0-9]*) echo "invalid ${tmo%%:*}: '${tmo#*:}' (want a positive whole number of seconds)" >&2; exit 2 ;;
+    esac
+done
 
 # Validate early: the dataset generator is the last step. Mirrors
 # parse_memory_limit() in generate_dataset.py, which refuses a percentage
@@ -362,7 +401,9 @@ PYTHON=$(command -v python3 || true)  # only needed by step 10 (dataset)
 
 cleanup() {
     local ec=$?
-    if [ $ec -ne 0 ] && [ "$FROM_STEP" = "1" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
+    if [ $ec -ne 0 ] && [ "$KEEP_WORK" = 1 ]; then
+        log "Pipeline stopped (exit $ec) — keeping $WORK so a re-run can resume"
+    elif [ $ec -ne 0 ] && [ "$FROM_STEP" = "1" ] && [ -n "$WORK" ] && [ "$WORK" != "/" ]; then
         log "Pipeline failed (exit $ec) — removing $WORK for a clean restart"
         rm -rf "$WORK"
     fi
@@ -417,17 +458,39 @@ export BFG_TOKENIZE_CMD="${CREGIT}/tokenize/tokenize.pl \
   --srcml=$(which srcml) \
   --ctags=$(which ctags)"
 
+# Omitted flags leave blobExec on its own defaults, so the two tools never
+# disagree about what the default is.
+TIMEOUT_FLAGS=()
+[ -n "$BLOB_TIMEOUT" ]  && TIMEOUT_FLAGS+=("--blob-timeout=$BLOB_TIMEOUT")
+[ -n "$STALL_TIMEOUT" ] && TIMEOUT_FLAGS+=("--stall-timeout=$STALL_TIMEOUT")
+
 if [ "$MODE" = "sharded" ]; then
   # Memory-bounded path: N tree-only shards in parallel, then merge + serial
   # re-fold into $SHARD_OUT/final/{dst.git,blobmap.db} (byte-identical to serial).
-  "${CREGIT}/blobExec/shard_build.sh" \
-    --src "$REPO_PATH_ORIGINAL_BARE" \
-    --out "$SHARD_OUT" \
-    --shards "$SHARDS" \
-    --jar "$BFG" \
-    --command "${CREGIT}/tokenizeByBlobId/tokenBySha.pl" \
-    --mask "$MASK" \
+  SHARD_ARGV=(
+    --src "$REPO_PATH_ORIGINAL_BARE"
+    --out "$SHARD_OUT"
+    --shards "$SHARDS"
+    --jar "$BFG"
+    --command "${CREGIT}/tokenizeByBlobId/tokenBySha.pl"
+    --mask "$MASK"
     --tok-cmd "$BFG_TOKENIZE_CMD"
+  )
+  [ -n "$BLOB_TIMEOUT" ]  && SHARD_ARGV+=(--blob-timeout "$BLOB_TIMEOUT")
+  [ -n "$STALL_TIMEOUT" ] && SHARD_ARGV+=(--stall-timeout "$STALL_TIMEOUT")
+  # A shard that times out exits 4 and shard_build.sh forwards it, so the same
+  # retry advice as the single-process path applies.
+  SHARD_RC=0
+  "${CREGIT}/blobExec/shard_build.sh" "${SHARD_ARGV[@]}" || SHARD_RC=$?
+  if [ "$SHARD_RC" -eq 4 ]; then
+    die_retryable 4 "a tokenize shard left blobs untokenized (exit 4). Refusing
+     to continue: the dataset would carry raw source in place of tokens. $WORK is
+     kept. Recovery: re-run the same command with a trailing 2 (resume from step
+     2) — the shard resumes and retries just those blobs. Re-running from step 1
+     deletes $WORK instead. If they keep timing out, add --blob-timeout SECONDS."
+  elif [ "$SHARD_RC" -ne 0 ]; then
+    die "sharded tokenize failed (shard_build.sh exit $SHARD_RC)"
+  fi
 else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
@@ -441,7 +504,7 @@ else
   #       dataset.
   #   5 = the stall watchdog killed a run that stopped making progress.
   BFG_RC=0
-  java -jar "$BFG" $MODE_FLAG \
+  java -jar "$BFG" $MODE_FLAG "${TIMEOUT_FLAGS[@]+"${TIMEOUT_FLAGS[@]}"}" \
     "$REPO_PATH_ORIGINAL_BARE" \
     "$REPO_PATH_CREGIT_BARE" \
     "$DB_PATH_BLOBMAP" \
@@ -451,22 +514,27 @@ else
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-TIMEOUTS"
     echo "blobExec exited 4: at least one blob timed out; see the blobsTimedOut" \
          "count and the 'will retry on the next run' lines in this step's log." \
-         "Nothing was recorded for the containing commit, so re-running retries" \
-         "those blobs." >> "${WORK}/TOKENIZE-TIMEOUTS"
-    die "tokenize left blobs untokenized (blobExec exit 4). Refusing to continue:
-     the dataset would carry raw source in place of tokens. Marker written to
-     ${WORK}/TOKENIZE-TIMEOUTS. Recovery: run this same command again — the
-     timed-out blobs are retried automatically and no database surgery is
-     needed. If they keep timing out, the tokenizer is too slow for them:
-     raise blobExec's --blob-timeout."
+         "Nothing was recorded for the containing commit, so resuming from step 2" \
+         "retries those blobs." >> "${WORK}/TOKENIZE-TIMEOUTS"
+    die_retryable 4 "tokenize left blobs untokenized (blobExec exit 4). Refusing
+     to continue: the dataset would carry raw source in place of tokens. Marker
+     written to ${WORK}/TOKENIZE-TIMEOUTS, and $WORK is kept. Recovery: re-run
+     the same command with a trailing 2 (resume from step 2) — the timed-out
+     blobs are retried and no database surgery is needed. Do NOT re-run from
+     step 1: a full run starts by deleting $WORK, which is where the memo that
+     makes the retry cheap lives. If the blobs keep timing out, the tokenizer is
+     too slow for them: add --blob-timeout SECONDS."
   elif [ "$BFG_RC" -eq 5 ]; then
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "${WORK}/TOKENIZE-STALLED"
     echo "blobExec exited 5: the stall watchdog fired. The STALLED line in this" \
          "step's log names the work that was in flight." >> "${WORK}/TOKENIZE-STALLED"
-    die "tokenize stalled and was killed by blobExec's watchdog (exit 5). The
-     memo is durable, so re-running resumes from where it stopped. The STALLED
-     line in this step's log names the blobs that were in flight; if one of them
-     is pathological, raise --blob-timeout or exclude it via --mask."
+    die_retryable 5 "tokenize stalled and was killed by blobExec's watchdog
+     (exit 5). The memo is durable and $WORK is kept, so re-running the same
+     command with a trailing 2 (resume from step 2) continues from where it
+     stopped; re-running from step 1 deletes $WORK instead. The STALLED line in
+     this step's log names the blobs that were in flight; if one of them is
+     pathological, add --blob-timeout SECONDS (which raises the stall window
+     with it) or exclude it via --mask."
   elif [ "$BFG_RC" -ne 0 ]; then
     die "tokenize failed (blobExec exit $BFG_RC)"
   fi

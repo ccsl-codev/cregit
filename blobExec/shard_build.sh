@@ -16,6 +16,7 @@ JAR="$HERE/target/scala-2.13/blobExec-0.1.0-assembly.jar"
 COMMAND="$CREGIT/tokenizeByBlobId/tokenBySha.pl"
 MASK='\.[ch]$'
 TOK_CMD=""; WARM_DB=""; WARM_GIT=""
+BLOB_TIMEOUT=""; STALL_TIMEOUT=""
 
 usage() {
   cat >&2 <<EOF
@@ -30,6 +31,8 @@ usage: shard_build.sh --src <bare.git> --out <dir> [options]
   --tok-cmd CMD    BFG_TOKENIZE_CMD                              [default: tokenize/tokenize.pl …]
   --warm-db DB     frozen prior blobmap.db (incremental)        [optional]
   --warm-git GIT   frozen prior dst.git to union objects from   [optional]
+  --blob-timeout S per-blob wall-clock budget, seconds          [default: blobExec's own]
+  --stall-timeout S no-progress window, seconds                 [default: blobExec's own]
 EOF
 }
 
@@ -45,6 +48,8 @@ while [ $# -gt 0 ]; do
     --tok-cmd) TOK_CMD="$2"; shift 2;;
     --warm-db) WARM_DB="$2"; shift 2;;
     --warm-git) WARM_GIT="$2"; shift 2;;
+    --blob-timeout) BLOB_TIMEOUT="$2"; shift 2;;
+    --stall-timeout) STALL_TIMEOUT="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "unknown arg: $1" >&2; usage; exit 2;;
   esac
@@ -83,12 +88,14 @@ log "=== sharded build: N=$N threads/shard=$THREADS src=$SRC out=$OUT warm=${WAR
 
 run_shard() {
   local k="$1" sd="$OUT/shard-$k" memo="$OUT/memo-$k" rc t0 t1
-  local warm=()
+  local warm=() budget=()
   mkdir -p "$sd" "$memo"
   [ -n "$WARM_DB" ] && warm=(--warm="$WARM_DB")
+  [ -n "$BLOB_TIMEOUT" ]  && budget+=("--blob-timeout=$BLOB_TIMEOUT")
+  [ -n "$STALL_TIMEOUT" ] && budget+=("--stall-timeout=$STALL_TIMEOUT")
   t0=$(date +%s)
   BFG_MEMO_DIR="$memo" "$JAVA" -XX:ActiveProcessorCount="$THREADS" -XX:+ExitOnOutOfMemoryError \
-    -jar "$JAR" "--shard=$k/$N" "${warm[@]}" \
+    -jar "$JAR" "--shard=$k/$N" "${warm[@]}" "${budget[@]+"${budget[@]}"}" \
     "$SRC" "$sd/dst.git" "$sd/blobmap.db" "$COMMAND" "$MASK" \
     > "$sd/run.log" 2>&1
   rc=$?; t1=$(date +%s)
@@ -100,11 +107,23 @@ log "launching $N shards (ActiveProcessorCount=$THREADS each)"
 G0=$(date +%s); pids=(); ks=()
 for k in $(seq 0 $((N-1))); do run_shard "$k" & pids+=($!); ks+=("$k"); done
 fail=0
+timedout=0
 for i in "${!pids[@]}"; do
-  wait "${pids[$i]}" || { log "SHARD ${ks[$i]} FAILED (see $OUT/shard-${ks[$i]}/run.log)"; fail=1; }
+  shard_rc=0
+  wait "${pids[$i]}" || shard_rc=$?
+  [ "$shard_rc" -eq 0 ] && continue
+  log "SHARD ${ks[$i]} FAILED exit=$shard_rc (see $OUT/shard-${ks[$i]}/run.log)"
+  # 4 means a blob's tokenizer was killed on its budget. That is retryable by
+  # simply re-running, so it must not collapse into the generic exit 1: the
+  # caller's recovery advice differs.
+  if [ "$shard_rc" -eq 4 ]; then timedout=1; else fail=1; fi
 done
-log "shard phase wall=$(( $(date +%s) - G0 ))s fail=$fail"
+log "shard phase wall=$(( $(date +%s) - G0 ))s fail=$fail timedout=$timedout"
 [ $fail -eq 0 ] || { log "ABORT: a shard failed"; exit 1; }
+[ $timedout -eq 0 ] || {
+  log "ABORT: a shard left blobs untokenized (exit 4). Re-run to retry just those blobs."
+  exit 4
+}
 
 FINAL="$OUT/final"
 MERGE=(--src "$SRC" --final "$FINAL" --jar "$JAR" --command "$COMMAND" --mask "$MASK" \
