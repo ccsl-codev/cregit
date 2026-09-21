@@ -149,12 +149,6 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   // -- which counters gate publication ----------------------------------------
-  //
-  // The denylist only earns its place if it does NOT gate the exit status: the
-  // four blobs it holds hang srcml, the timeout path answers that with exit 4
-  // ("incomplete, do not publish"), and a project cannot sit unpublishable
-  // forever over a diagnosed third-party parser bug. A timeout is different — it
-  // is a hang nobody has explained — and it must keep blocking.
 
   private def stats(
       aborted: Boolean = false,

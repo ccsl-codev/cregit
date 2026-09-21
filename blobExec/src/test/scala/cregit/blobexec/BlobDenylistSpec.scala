@@ -6,15 +6,11 @@ import org.scalatest.matchers.should.Matchers
 import java.nio.file.Files
 
 /** The denylist is a DATA file, because the list of blobs a published dataset
-  * omits is a property of the dataset and a paper has to cite it. That makes the
-  * file's contents part of the contract, so they are asserted here and not only
+  * contents are part of the dataset's contract, so they are asserted, not only
   * parsed. */
 class BlobDenylistSpec extends AnyFunSuite with Matchers {
 
-  // The four blobs, and the sizes `git cat-file --batch-check` reports for them.
-  // All four are historical versions of one OpenJDK langtools regression test, at
-  // two paths after a repository reorganisation — which is why the list is keyed
-  // on content, not on path.
+  // Four historical versions of one file at two paths: the list is keyed on content.
   private val KnownShas = Set(
     "2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65",
     "303c1a109f1fdc4b9d84e15111c56931202844ac",
@@ -23,17 +19,12 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   )
 
   test("the shipped list is on the classpath and holds exactly the four known blobs") {
-    // A jar built without the resource would hand these four back to srcml, which
-    // does not terminate on any of them: 600s each, then exit 4, then the project
-    // cannot publish. So "the resource is present" is itself a requirement.
+    // A jar built without the resource would hand these four back to srcml.
     BlobDenylist.shipped.shas shouldEqual KnownShas
     BlobDenylist.shipped.size shouldEqual 4
   }
 
   test("every entry carries a one-line reason and the upstream citation") {
-    // Without both, an exclusion is indistinguishable from data loss. The partner
-    // rejected "we could not parse it" as indefensible in a paper, and this is the
-    // assertion that keeps the answer in the artefact.
     BlobDenylist.shipped.entries.foreach { e =>
       withClue(s"${e.sha}: ") {
         e.citation shouldEqual "srcML/srcML#2361"
@@ -77,8 +68,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("a line that is not three fields is refused, naming the line") {
-    // Silently skipping a malformed line would re-admit a blob that hangs the run
-    // for 600s and then blocks publication — the exact failure this list removes.
     val bad = intercept[IllegalArgumentException] {
       BlobDenylist.parse(Vector(s"$sha1\tsrcML/srcML#2361"), "fixture")
     }
@@ -92,9 +81,7 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("a key that is not a 40-hex git blob sha is refused") {
-    // The memo's key is sha1 of the file contents with no git header, so a
-    // plausible-looking wrong hash is an easy mistake to make. A 39-character or
-    // non-hex key would simply never match, silently.
+    // The key is the git blob id, not the memo's content hash.
     intercept[IllegalArgumentException] {
       BlobDenylist.parse(Vector(s"${"a" * 39}\tc\tr"), "fixture")
     }
@@ -121,8 +108,8 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
       Files.writeString(f, s"# header\n$sha1\tsrcML/srcML#2361\tnon-termination\n")
       val list = BlobDenylist.fromFile(f)
       list.shas shouldEqual Set(sha1)
-      list.entryFor(sha1).map(_.describe) shouldEqual
-        Some("non-termination [srcML/srcML#2361]")
+      list.entryFor(sha1).map(e => (e.reason, e.citation)) shouldEqual
+        Some(("non-termination", "srcML/srcML#2361"))
     } finally Files.deleteIfExists(f)
   }
 

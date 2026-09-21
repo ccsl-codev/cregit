@@ -47,21 +47,8 @@ object Main {
     * as "no limit". */
 
   /** The process exit status for a finished walk.
-    *
-    * A function, and taking the whole [[WalkStats]], so that "which counters gate
-    * publication" is a property something can be asserted about rather than a
-    * conditional buried in `main`. Exactly two things gate it: an abort, and a
-    * blob whose tokenizer was killed on its budget. Deliberately NOT gating:
-    *
-    *   - `blobsOversized` — jgit will not materialise the object; deterministic,
-    *     explained per blob, and the file is absent rather than wrong.
-    *   - `blobsDenylisted` — srcML 1.1.0 does not terminate on it; diagnosed, with
-    *     an upstream citation, in a data file a paper can cite. Gating on this
-    *     would hold a project back for a fault that is already recorded.
-    *
-    * The distinction is the whole point of the denylist: a timeout is a hang
-    * nobody has explained yet, and that must keep blocking publication.
-    */
+    * Only an abort and a killed tokenizer gate publication; blobsOversized and
+    * blobsDenylisted do not. */
   private[blobexec] def exitStatus(stats: WalkStats): Int =
     if (stats.aborted) 2
     else if (stats.blobsTimedOut > 0) TimedOutExitStatus
@@ -250,9 +237,7 @@ object Main {
     val dbParent = dbPath.getParent
     if (dbParent != null && !Files.isDirectory(dbParent)) Files.createDirectories(dbParent)
 
-    // Loaded here rather than on first use: a jar built without the resource, or a
-    // malformed line in it, must stop the run now and say so, not silently hand a
-    // known non-terminating blob to srcml an hour into the walk.
+    // Eagerly, so a jar built without the resource fails now, not mid-walk.
     val denylist =
       try BlobDenylist.shipped
       catch {
@@ -325,9 +310,7 @@ object Main {
     )
 
     if (stats.blobsDenylisted > 0) {
-      // Reported, never fatal. The same blob on the timeout path spends the whole
-      // budget and then exits 4, which holds the project back for a third-party
-      // parser bug that is already diagnosed and cited.
+      // Reported, never fatal.
       System.err.println(
         s"blobExec: ${stats.blobsDenylisted} blob(s) were excluded by the blob denylist " +
           s"(${BlobDenylist.ResourcePath} in this jar, ${denylist.size} entr" +
