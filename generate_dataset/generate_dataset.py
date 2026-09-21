@@ -374,6 +374,8 @@ def parse_memory_limit(text):
 # Dataset column order. Mirrors META_FIELDS in cregit-token-pipeline/project_meta.py
 # and EXPECTED_COLUMNS in its validate_schema.py; tests/test_meta_field_drift.py
 # reads this tuple. The sidecar is alphabetical, so iterate this, never the JSON.
+# All 29 emit as VARCHAR, including the numeric-looking ones, because that is what
+# the sidecar and the validator agree on. DATASET.md tells readers to cast.
 PROJECT_META_FIELDS = (
     "clone_url", "provenance_status",
     "source", "stratum", "fact", "contested", "label_date",

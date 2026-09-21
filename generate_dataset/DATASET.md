@@ -48,6 +48,13 @@ set does not depend on the caller. All 29 are `TEXT`, they are constants per
 file, and they repeat per row by design: a reader can filter a corpus without a
 second join against `candidates.csv`.
 
+`TEXT` is the contract, not an oversight: the sidecar is JSON written by
+`cregit-token-pipeline/project_meta.py` and checked by its `validate_schema.py`,
+and both treat every one of the 29 as a string. So `commits`, `size_kb`, `stars`,
+`pushed_at`, `archived` and `fork` are strings here even though they read as
+numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
+`ORDER BY size_kb` sorts lexicographically.
+
 | Column | Description |
 |--------|-------------|
 | `clone_url` | Clone URL the project was selected by. `repo_name` is a lossy slug; this is not. |
