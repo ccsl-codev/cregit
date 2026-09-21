@@ -52,10 +52,13 @@ final case class WalkStats(
       * identifies as generated: on the evidence available, large HAND-WRITTEN
       * source files. Kept apart from [[blobsGeneratedExcluded]] precisely so that
       * the defensible exclusion and the indefensible one can never be read as one
-      * number. Like [[blobsTimedOut]] this DOES block publication: an exclusion
-      * whose reason cannot be stated is not a finding, it is a hole. Defaulted so
-      * adding it did not have to touch callers that construct [[WalkStats]] for
-      * other reasons. */
+      * number: unlike the other two exclusions, this one is NOT explained, and the
+      * whole value of the counter is that it says so. Reported, not gating — like
+      * [[blobsGeneratedExcluded]] and [[blobsDenylisted]] and unlike
+      * [[blobsTimedOut]] it leaves the exit status alone, which is the project
+      * owner's decision; [[Main.exitStatus]] records the reasoning and what a future
+      * gate would also have to change. Defaulted so adding it did not have to touch
+      * callers that construct [[WalkStats]] for other reasons. */
     blobsUntokenizable: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
@@ -1154,9 +1157,11 @@ final class Walker(
     *   3. The verdict, when no banner is found. This is the case a size test got
     *      wrong: a large file that nothing shows to be generated. It still cannot
     *      be tokenized here, but it is NOT an explained exclusion, so it gets its
-    *      own counter, its own report line and its own exit status — see
-    *      [[noteUntokenizable]]. Being dropped silently is the one outcome ruled
-    *      out.
+    *      own counter and its own report line, which says in terms that the reason
+    *      is unexplained — see [[noteUntokenizable]]. It does not change the exit
+    *      status: reported, not gated, by the project owner's decision (the
+    *      reasoning is in [[Main.exitStatus]]). Being dropped SILENTLY is the one
+    *      outcome ruled out, and that is what the counter and the line buy.
     *
     * Tokenizing that third case instead was assessed and rejected, with numbers.
     * `openStream` can supply the bytes JGit refuses to materialise, so reading is
@@ -1319,9 +1324,14 @@ final class Walker(
     * must not be counted alongside the generated ones or the two become one
     * indistinguishable number again. It still cannot be tokenized in this run (see
     * [[readBlob]] on why buying that with memory is not free), so the path is
-    * dropped — but the run is reported incomplete, exactly as a timeout or a
-    * parser crash is, because an exclusion whose reason cannot be stated is a hole
-    * in the dataset rather than a finding about it. */
+    * dropped.
+    *
+    * The exit status is deliberately left alone — reported, not gated, by the project
+    * owner's decision ([[Main.exitStatus]] carries the reasoning). That puts the
+    * entire weight of the warning on this one line, which is why it is phrased the
+    * way it is: it has to name the blob, say that the reason is unexplained, and say
+    * that the run nevertheless succeeds, because nothing downstream will stop to ask.
+    * A silent drop is the one outcome ruled out; a quiet one would be nearly as bad. */
   private def noteUntokenizable(task: BlobMissTask, sizeBytes: Long): Unit = {
     val key = (task.origId.name, task.fullPath)
     if (untokenizableKeys.add(key)) {
@@ -1332,9 +1342,10 @@ final class Walker(
           "JGit will not materialise an object this large, so the tokenizer cannot be handed " +
           s"its bytes — but nothing in its first ${Walker.ProvenancePrefixBytes} bytes says a " +
           "machine wrote it, so on the evidence this is a large HAND-WRITTEN source file and " +
-          "dropping it is not defensible. It is left out of the rewritten tree for this run " +
-          "(no blame, no dataset row, absent rather than raw source) and the run is reported " +
-          "INCOMPLETE. Remedies, in order: look at the file. If it is generated after all, the " +
+          "dropping it is not defensible. It is left out of the rewritten tree (no blame, no " +
+          "dataset row, absent rather than raw source) and this is REPORTED ONLY: the run still " +
+          "exits 0, so this line and the blobsUntokenizable count are the only record that the " +
+          "path is missing. Remedies, in order: look at the file. If it is generated after all, the " +
           "honest fix is a header marker this check can see, or the blob denylist with a reason " +
           "and a citation (see " + BlobDenylist.ResourcePath + "). If it really is authored, " +
           "tokenizing it needs BlobExec's stdio spooled to disk instead of buffered in the " +

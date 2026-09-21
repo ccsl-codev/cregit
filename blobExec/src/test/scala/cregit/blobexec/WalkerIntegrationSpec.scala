@@ -863,7 +863,9 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
 
   /** The case the size test got wrong: same trigger, same 78 KB fixture in the
     * LargeObjectException band, but a header that says nothing about a generator.
-    * It must NOT be counted, reported or gated as a generated exclusion. */
+    * It must NOT be counted or reported as a generated exclusion, and above all it
+    * must not vanish without a counter — the exclusion is report-only, so the counter
+    * and its own log line are the entire record that a path is missing. */
   private def checkUnexplainedNotDropped(label: String, pipeline: Boolean, pipelineTrees: Boolean): Unit = {
     val dir = freshWorkDir("untokenizable-" + label)
     val git = initSrc(dir.resolve("src"))
@@ -907,9 +909,11 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       stats.blobsUntokenizable shouldEqual 1L
       stats.blobsGeneratedExcluded shouldEqual 0L
       stats.blobsDenylisted shouldEqual 0L
-      // And it is NOT silently dropped: the run is reported incomplete, with a
-      // status of its own rather than a timeout's or a parser crash's.
-      Main.exitStatus(stats) shouldEqual Main.UntokenizableExitStatus
+      // Report-only: the exclusion leaves the exit status alone. That is exactly why
+      // the counter above has to be non-zero — with no gate, the count and the
+      // UNTOKENIZABLE line are the only thing standing between "reported" and "lost".
+      Main.exitStatus(stats) shouldEqual 0
+      // And it is not misfiled as one of the failures that DO gate.
       stats.blobsTimedOut shouldEqual 0L
       stats.blobsParserCrashed shouldEqual 0L
     }
@@ -918,9 +922,9 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     try {
       withClue(s"mode=$label: ") {
         fileAtHead(dst, "master", "keep.c") shouldBe Some("int main(){}\n")
-        // Still absent from the tree for this run — present-as-raw-source would
-        // corrupt the meaning of the dataset. The gate above is what stops that
-        // absence from being published.
+        // Still absent from the tree — present-as-raw-source would corrupt the
+        // meaning of the dataset, since every other masked path holds tokens and a
+        // later reader could not tell. The counter is what makes the absence visible.
         fileAtHead(dst, "master", "big/authored.c") shouldBe None
       }
     } finally dst.close()

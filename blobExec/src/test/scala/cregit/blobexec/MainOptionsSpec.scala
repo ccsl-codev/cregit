@@ -133,47 +133,31 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(blobsGeneratedExcluded = 3, blobsDenylisted = 4)) shouldEqual 0
   }
 
-  // ...and the counter that used to be folded in with it DOES gate. Under the old
-  // size-only gate, a large file nobody had shown to be generated was counted as
-  // `blobsOversized`, published around, and lost. The two must not share a verdict
-  // any more than they share a counter.
-  test("an unexplained untokenizable blob blocks publication, with its own status") {
-    Main.exitStatus(stats(blobsUntokenizable = 1)) shouldEqual Main.UntokenizableExitStatus
-    Main.exitStatus(stats(blobsUntokenizable = 2)) shouldEqual Main.UntokenizableExitStatus
-  }
-
-  test("an explained exclusion alongside an unexplained one still blocks") {
+  // An UNEXPLAINED exclusion does not gate either — the project owner's decision,
+  // pinned here because it is the kind of thing a later reader would assume the other
+  // way. The counter and the UNTOKENIZABLE line are the whole mechanism: WalkerSpec's
+  // end-to-end cases prove the blob is counted and named rather than dropped in
+  // silence, and this asserts that the run still exits 0 while that is true. If a gate
+  // is ever wanted, `tokenize_gate` in run_pipeline_process.sh needs a branch for the
+  // new status first, or an exit nobody handles loses a work directory to a step-1
+  // re-run.
+  test("an unexplained untokenizable blob is reported, but does not change the status") {
+    Main.exitStatus(stats(blobsUntokenizable = 1)) shouldEqual 0
+    Main.exitStatus(stats(blobsUntokenizable = 2)) shouldEqual 0
     Main.exitStatus(
       stats(blobsUntokenizable = 1, blobsGeneratedExcluded = 3, blobsDenylisted = 4)
-    ) shouldEqual Main.UntokenizableExitStatus
+    ) shouldEqual 0
   }
 
-  // The older, broader signals keep precedence: when several fire, any of these
-  // statuses correctly means "do not publish", and a timeout is the one an operator
-  // already knows how to act on.
-  test("a timeout and a parser crash both outrank an untokenizable blob") {
+  // What must keep working is the other direction: the two counters that DO gate are
+  // unaffected by an untokenizable blob sitting beside them, so removing that gate
+  // cannot have weakened a timeout or a parser crash.
+  test("a timeout, a parser crash and an abort all still gate alongside one") {
     Main.exitStatus(stats(blobsTimedOut = 1, blobsUntokenizable = 1)) shouldEqual
       Main.TimedOutExitStatus
     Main.exitStatus(stats(blobsParserCrashed = 1, blobsUntokenizable = 1)) shouldEqual
       Main.ParserCrashedExitStatus
     Main.exitStatus(stats(aborted = true, blobsUntokenizable = 1)) shouldEqual 2
-  }
-
-  test("the untokenizable status collides with no other blobExec exit status") {
-    val others = Map(
-      "clean"        -> 0,
-      "usage"        -> 1,
-      "aborted"      -> 2,
-      "maskChanged"  -> 3,
-      "timedOut"     -> Main.TimedOutExitStatus,
-      "stalled"      -> Walker.StalledExitStatus,
-      "parserCrash"  -> Main.ParserCrashedExitStatus
-    )
-    others.foreach { case (name, status) =>
-      withClue(s"untokenizable status must differ from $name ($status): ") {
-        Main.UntokenizableExitStatus should not equal status
-      }
-    }
   }
 
   test("a timeout still blocks publication, even alongside a denylisted blob") {
@@ -211,13 +195,12 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   // with must be distinct, so assert the whole set rather than just one pair.
   test("the parser-crash status collides with no other blobExec exit status") {
     val others = Map(
-      "clean"          -> 0,
-      "usage"          -> 1,
-      "aborted"        -> 2,
-      "maskChanged"    -> 3,
-      "timedOut"       -> Main.TimedOutExitStatus,
-      "stalled"        -> Walker.StalledExitStatus,
-      "untokenizable"  -> Main.UntokenizableExitStatus
+      "clean"       -> 0,
+      "usage"       -> 1,
+      "aborted"     -> 2,
+      "maskChanged" -> 3,
+      "timedOut"    -> Main.TimedOutExitStatus,
+      "stalled"     -> Walker.StalledExitStatus
     )
     others.foreach { case (name, status) =>
       withClue(s"parser-crash status must differ from $name ($status): ") {
