@@ -101,12 +101,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     }
   }
 
-  // CHANGED ASSERTION. This test used to be "zero exit, empty stdout against
-  // non-empty input → Replace with empty blob", and it pinned the defect: a
-  // crashed srcML exits 0 through the wrapper with empty stdout, and that empty
-  // stdout was inserted as the file's tokenization. 36 files across 19 projects
-  // were published as 0-byte blobs that way, with nothing counting them. Zero
-  // output from non-empty input is now a counted failure, never a blob.
   test("zero exit, empty stdout against non-empty input → Skip, counted, no blob") {
     val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
     val cmd = shellScript("cat > /dev/null; true")
@@ -117,9 +111,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     crashes.get shouldEqual 1
   }
 
-  // The other half of the distinction the fix has to make: an input that is
-  // genuinely empty may legitimately produce empty output, and must stay a plain
-  // Skip that is NOT counted as a crash.
   test("zero exit, empty stdout against empty input → Skip, not counted a crash") {
     val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
     val cmd = shellScript("cat > /dev/null; true")
@@ -132,9 +123,7 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   test("the parser-crash exit status is Skip, counted, and never a Replace") {
     val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
-    // Writes plausible-looking output first, so the test proves the status is what
-    // rejects it rather than the emptiness check: a crashed srcML can emit a
-    // truncated prefix before dying, and that prefix must never become a blob.
+    // Output first, so the status is what rejects it, not the emptiness check.
     val cmd = shellScript(s"echo 'partial tokens'; exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
                  abortOnError = false, inserter,
@@ -144,8 +133,7 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("a parser crash skips one blob even with abortOnError, like a timeout") {
-    // The hostile case: one crashing blob must not take down a run that has
-    // already folded thousands of commits. It gates publication through the exit
+    // One crashing blob must not end the run. It gates publication through the exit
     // status instead (Main.exitStatus), which is where a timeout gates it too.
     val cmd = shellScript(s"exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,

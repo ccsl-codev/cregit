@@ -20,14 +20,8 @@ use FindBin;
 use lib $FindBin::Bin;
 use CregitLanguages;
 
-# Exit status meaning "this parse did not produce a usable tokenization": srcML
-# died on a signal, either pipeline stage exited non-zero, or the token stream
-# came back empty (which a healthy srcML parse never is -- see Tokenize).
-#
-# Picked to be distinguishable from every other outcome in the chain: below 128,
-# so it can never be confused with a shell's 128+signal encoding; clear of GNU
-# timeout's 124 and 137, which blobExec already reads as "we killed it"; and clear
-# of blobExec's own 2 (abort), 3 (mask changed) and 4 (timed out).
+# Exit status for "no usable tokenization". Below 128, and clear of blobExec's
+# 2, 3 and 4 and of GNU timeout's 124 and 137.
 our $PARSER_CRASH_EXIT = 33;
 
 my %declarations;
@@ -118,22 +112,9 @@ sub Tokenize
     chomp $saveDir;
     my ($filename) = @_;
 
-    # The two stages still stream through a single pipe on purpose: buffering
-    # srcML's XML would cost memory proportional to the source (3.9MB of C becomes
-    # far more XML) and buy nothing. What changes is that the pipeline's per-stage
-    # exit statuses are no longer discarded.
-    #
-    # Why this is not just `close(parser)`: Perl's `open(FH, "cmd |")` reports
-    # failure only at close, and $? then carries the LAST command's status. Here
-    # that is srcml2token, which exits 0 even while printing
-    #   "Fatal Error at file stdin, line 1, char 1 / invalid document structure"
-    # on the truncated XML a crashed srcML leaves behind. So an upstream srcML
-    # death was hidden twice over: once by open(), once by srcml2token's exit 0.
-    #
-    # bash's PIPESTATUS is the only thing that reports BOTH stages, so it is
-    # written to a temp file and read back after close. Note that PIPESTATUS
-    # encodes a signal death the way a shell does, as 128+signal (139 for SIGSEGV,
-    # 134 for SIGABRT), not as a raw wait status.
+    # `close` reports only the LAST stage's status, and srcml2token exits 0 on the
+    # truncated XML a crashed srcML leaves behind. PIPESTATUS is the only way to
+    # see both stages; it encodes a signal death as 128+signal, not a wait status.
     my ($statusFh, $statusFile) =
         tempfile("cregit-pipestatus-XXXXXX", TMPDIR => 1, UNLINK => 1);
     close $statusFh;
@@ -144,8 +125,7 @@ sub Tokenize
         Shell_Quote($filename), Shell_Quote($srcml2token),
         Shell_Quote($statusFile));
 
-    # Explicitly bash, not the `sh` that a one-argument open() would pick:
-    # PIPESTATUS is a bashism and /bin/sh is not guaranteed to be bash.
+    # bash, not sh: PIPESTATUS is a bashism.
     open(parser, "-|", "bash", "-c", $pipeline)
         or die "Unable to execute srcml pipeline on file [$filename]: $!";
 
@@ -192,9 +172,7 @@ sub Tokenize
     Verify_Parse($filename, $tokensRead, $statusFile, $closed, $closeStatus);
 }
 
-# Single-quote a string for the shell: end the quote, escape the literal quote,
-# reopen. Replaces the bare '$filename' interpolation that used to sit in the
-# command string, which broke on any path containing a quote.
+# Single-quote a string for the shell.
 sub Shell_Quote
 {
     my ($s) = @_;
@@ -203,17 +181,13 @@ sub Shell_Quote
     return "'$s'";
 }
 
-# Fail closed. Anything other than "both stages exited 0 and we got a non-empty
-# token stream" is a defect, and must be reported with a status the caller can
-# count rather than silently becoming a 0-byte tokenization.
+# Fail closed: anything but two clean stages and a non-empty stream is a defect.
 sub Verify_Parse
 {
     my ($filename, $tokensRead, $statusFile, $closed, $closeStatus) = @_;
 
     my ($srcmlStatus, $tokenStatus) = Read_Pipe_Status($statusFile);
 
-    # srcML first: it is the stage that crashes, and its status is the one the old
-    # code could never see.
     if (defined $srcmlStatus and $srcmlStatus > 128) {
         my $signal = $srcmlStatus - 128;
         Parser_Crash($filename,

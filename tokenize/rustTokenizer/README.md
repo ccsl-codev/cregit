@@ -68,8 +68,8 @@ to, and its committed golden output is the reference:
 
 Both downstream consumers split on `|`:
 
-- `generate_dataset/generate_dataset.py:243` — `re.match(r"^(.+?)\|(.+)$", token_content)`
-- `prettyPrint/prettyPrint-author.pl:976` — `split('\|', $value)`
+- `generate_dataset/generate_dataset.py` — `re.match(r"^(.+?)\|(.+)$", token_content)`
+- `prettyPrint/prettyPrint-author.pl` — `split('\|', $value)`
 
 The first capture group is **non-greedy**, so any extra leading field silently becomes
 `token_type` and shifts `token_value`, `source_text` and `is_structural` by one. Nothing

@@ -64,24 +64,14 @@ fn parse_args() -> (String, bool) {
     (path, position)
 }
 
-// Emits the cregit FINAL token format. That format is defined by tokenizeSrcMl.pl -- the
-// only other tokenizer the pipeline actually routes to (CregitLanguages.pm
-// %LANG_PARSER_REL: C/C++/Java -> tokenizeSrcMl.pl, Rust -> here; Go is unrouted and M4
-// is excluded from the file mask) -- and it is PIPE-separated with NO position prefix
-// unless --position is given:
+// Emits the cregit FINAL token format, defined by tokenizeSrcMl.pl: pipe-separated,
+// with a `line:col` prefix only under --position. The golden streams are
+// tokenize/t/expected/main.c.token and main.c.nopos.token.
 //
-//   tokenize/t/expected/main.c.nopos.token   begin_unit|revision:...   comment|/* ... */
-//   tokenize/t/expected/main.c.token         -:-|begin_unit|...        1:1|comment|/* ... */
-//
-// Do NOT copy the TAB form in tokenize/srcMLtoken/tests/expected/*.token: that is
-// srcml2token's INTERMEDIATE output, which tokenizeSrcMl.pl:120 consumes with
-// /^([0-9]+|-):([0-9]+|-)\s+(.+)$/ and re-emits with `|`. It never reaches a consumer.
-//
-// The consumers both split on `|`:
-//   generate_dataset/generate_dataset.py:243  re.match(r"^(.+?)\|(.+)$", token_content)
-//   prettyPrint/prettyPrint-author.pl:976     split('\|', $value)
-// The first group is NON-GREEDY, so any extra leading `line:col<TAB>` field lands whole
-// in token_type and shifts token_value, source_text and is_structural by one.
+// Not the TAB form in tokenize/srcMLtoken/tests/expected/*.token: that is
+// srcml2token's intermediate output, which tokenizeSrcMl.pl re-emits with `|`.
+// Consumers split on `|` with a non-greedy first group, so an extra leading field
+// shifts every later column.
 fn tokenize_source(src: &str, position: bool) {
     // A line with no source position of its own: `-:-|` under --position, bare otherwise.
     let marker = |body: &str| {
@@ -126,9 +116,7 @@ fn tokenize_source(src: &str, position: bool) {
     }
 
     marker("end_unit");
-    // tokenizeSrcMl.pl:143 prints a bare marker line after every `end_*` token, so the
-    // stream ends `end_unit` + blank (or `-:-|end_unit` + `-:-|`). generate_dataset.py
-    // classifies that blank as token_type `blank`, is_structural 1.
+    // tokenizeSrcMl.pl prints a bare marker after every `end_*` token.
     marker("");
 }
 

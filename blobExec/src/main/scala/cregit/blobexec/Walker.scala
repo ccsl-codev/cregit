@@ -30,14 +30,8 @@ final case class WalkStats(
       * denylist. Reported, not gating. */
     blobsDenylisted: Long,
     /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]: srcML died
-      * on a signal, or the token stream came back empty. Like [[blobsTimedOut]]
-      * and unlike [[blobsOversized]]/[[blobsDenylisted]] this DOES block
-      * publication, because an unexplained parser death is exactly the defect that
-      * used to be written out as a silent 0-byte tokenization. It is a separate
-      * counter rather than more timeouts because the two need different fixes: a
-      * timeout wants --blob-timeout, a crash wants the blob denylisting or srcML
-      * fixing. Defaulted so that adding it did not have to touch callers that
-      * construct [[WalkStats]] for other reasons. */
+      * on a signal, or produced no tokens. Gates publication like
+      * [[blobsTimedOut]], counted apart because the remedies differ. */
     blobsParserCrashed: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
@@ -597,7 +591,7 @@ final class Walker(
               // duration, is what stops a wedged run (see withStallWatchdog).
               val results = missFutures.map { case (k, f) => k -> Await.result(f, Duration.Inf) }
               val timedOutIds: IMap[(String, String), ObjectId] =
-                results.iterator.collect { case (k, BlobResult.TimedOut(id)) => k -> id }.toMap
+                results.iterator.collect { case (k, BlobResult.Unusable(id)) => k -> id }.toMap
               results.values.collectFirst { case a: BlobResult.Aborted => a } match {
                 case Some(_) =>
                   aborted.set(true)  // stop the producer; drain the remainder
@@ -823,7 +817,7 @@ final class Walker(
         val resolved: IMap[(String, String), ObjectId] =
           blobResults.iterator.collect { case (k, BlobResult.Resolved(id)) => k -> id }.toMap
         val timedOut: IMap[(String, String), ObjectId] =
-          blobResults.iterator.collect { case (k, BlobResult.TimedOut(id)) => k -> id }.toMap
+          blobResults.iterator.collect { case (k, BlobResult.Unusable(id)) => k -> id }.toMap
         val inserter = dst.newObjectInserter()
         try {
           val subtreeMap = scala.collection.mutable.Map.empty[String, String]
@@ -850,8 +844,7 @@ final class Walker(
     inFlightBlobs.put(label, System.nanoTime())
     try {
       blobCommandExecutions.increment()
-      // Set by either callback below: both mean "this blob's tokenization is
-      // unusable, so nothing about it may be persisted".
+      // Either callback means nothing about this blob may be persisted.
       val unusable = new AtomicBoolean(false)
       val outcome = BlobExec.run(
         bytes        = bytes,
@@ -868,11 +861,9 @@ final class Walker(
       val res = outcome match {
         case BlobExec.Outcome.Skip if unusable.get() =>
           // The tree must still reference something, so keep the original bytes
-          // available — but report it as TimedOut so nothing gets persisted. A
-          // parser crash takes this same branch: the name is now narrower than the
-          // meaning, which is "unusable, persist nothing".
+          // available — but report it as Unusable so nothing gets persisted.
           ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
-          BlobResult.TimedOut(task.origId)
+          BlobResult.Unusable(task.origId)
         case BlobExec.Outcome.Skip =>
           ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
           BlobResult.Resolved(task.origId)
@@ -1007,8 +998,7 @@ final class Walker(
           inFlightBlobs.put(label, System.nanoTime())
           try {
             blobCommandExecutions.increment()
-            // Set by either callback below: both mean "this blob's tokenization is
-      // unusable, so nothing about it may be persisted".
+            // Either callback means nothing about this blob may be persisted.
       val unusable = new AtomicBoolean(false)
             val outcome = BlobExec.run(
               bytes        = bytes,
@@ -1598,7 +1588,7 @@ object Walker {
       * original blob (dst stays self-consistent), but this is deliberately not
       * a `Resolved`: nothing about this blob, the trees containing it, or its
       * commit may be persisted, or a re-run would treat raw source as done. */
-    final case class TimedOut(origId: ObjectId) extends BlobResult
+    final case class Unusable(origId: ObjectId) extends BlobResult
     /** Too large for JGit to materialise; contributes no id. */
     final case class Oversized(origId: ObjectId) extends BlobResult
   }
