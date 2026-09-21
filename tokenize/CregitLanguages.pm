@@ -13,39 +13,16 @@ package CregitLanguages;
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-# THE single source of truth for "which files can cregit tokenize".
-#
-# Before this module the same knowledge was written out three times and the
-# copies did not agree:
-#
-#   tokenize/tokenize.pl          %extensions  — the dispatcher's gate
-#   tokenize/tokenizeSrcMl.pl     %extensions  — the srcML parser's autodetect
-#   tokenizeByBlobId/tokenBySha.pl %mapLang    — the per-blob gate bfg calls
-#
-# tokenBySha.pl mapped `go`, `md` and `yaml`; tokenize.pl had no parser for any
-# of them. So such a blob passed the first gate and died at the second with
-# "Unknown parser for extension" — a whole project's run lost to an
-# inconsistency between two tables that describe the same capability. They are
-# now one table, and t/languages.t holds them to it.
-#
-# The file mask the pipeline selects blobs with is DERIVED from this table
-# (file_mask below), never typed out again: a mask naming an extension the table
-# does not know is a run that dies mid-way, and an extension in the table that
-# no mask names is source silently left untokenized.
+# Single source of truth for which files cregit can tokenize. tokenize.pl,
+# tokenizeSrcMl.pl, tokenizeByBlobId/tokenBySha.pl and the pipeline's default
+# mask all derive from it; t/languages.t holds them to it.
 
 use strict;
 use warnings;
 
-# Extension (lowercase, no leading dot) -> language name. The language names are
-# the ones %LANG_PARSER_REL keys on and the ones passed as --language.
-#
-# Every entry was verified against the pinned srcML (1.1.0) by tokenizing one C++
-# fixture under each extension and comparing the token stream to .cpp's. `.ixx
-# .inl .cppm .cxxm .ipp` are absent on purpose: srcml 1.1.0 does not know them,
-# so it ignores `-l C++` and emits an XML declaration with no <unit> at all. It
-# exits 0 doing so, and the chain then writes an EMPTY token file and reports
-# success. That is why t/languages.t probes srcML per extension instead of
-# trusting a reference page.
+# Extension (lowercase, no leading dot) -> language name, as passed to --language.
+# srcML 1.1.0 ignores -l for an extension it does not know (.ixx .inl .cppm .cxxm
+# .ipp) and emits no <unit> while exiting 0, so t/languages.t probes each entry.
 our %EXT_LANG = (
     # C
     'c'    => 'C',
@@ -63,32 +40,16 @@ our %EXT_LANG = (
     'tcc'  => 'C++',
     # Java
     'java' => 'Java',
-    # M4 (autoconf/automake input). Routed, but NOT in the mask: see
-    # %MASKED_LANGUAGES for the measurement that keeps it out.
+    # Routed, not masked; see %MASKED_LANGUAGES.
     'ac'   => 'M4',
     'am'   => 'M4',
     # Rust
     'rs'   => 'Rust',
 );
 
-# Languages the pipeline's file mask is allowed to select, i.e. the ones whose
-# parser is known to produce correct tokens for real-world input.
-#
-# M4 is deliberately ABSENT. m4Tokenizer/m4.py now runs under the pinned Python
-# 3, but its lexer is still wrong on real autotools input:
-#
-#   Lexer::__init__ sets end_quote to a BACKTICK, where m4 and this file's own
-#   changequote() default to the apostrophe. So `` `x' `` runs the string on to
-#   the next backtick and swallows every token between. An apostrophe end_quote
-#   trades the fault for a worse one: shell backticks in Makefile.am then never
-#   close, and two thirds of a real sample stop parsing.
-#
-#   An unterminated string at end of file raises "generator raised
-#   StopIteration", which fails the file outright.
-#
-# Selecting .am/.ac would therefore fail whole projects at step 2. Fixing the m4
-# lexer is its own task with its own fixtures; when it is done, add 'M4' here and
-# the mask widens by itself.
+# Languages the default mask may select. M4 is out: m4.py's lexer uses a backtick
+# end_quote and raises StopIteration on an unterminated string, so real autotools
+# input fails. Add 'M4' when that is fixed and the mask widens by itself.
 our %MASKED_LANGUAGES = (
     'C'    => 1,
     'C++'  => 1,
@@ -106,18 +67,15 @@ our %LANG_PARSER_REL = (
     'Rust' => 'rustTokenizer/target/release/rust_tokenizer',
 );
 
-# The parser every srcML-routed language shares. Named so callers can ask "is
-# this extension srcML's?" without string-matching a path.
+# The parser the srcML-routed languages share.
 our $SRCML_PARSER_REL = 'tokenizeSrcMl.pl';
 
-# Extensions keyed WITH the leading dot, as tokenize.pl and tokenizeSrcMl.pl
-# look them up (both lowercase the extension first).
+# Keyed WITH the leading dot, as both callers look them up after lc().
 sub extensions_by_dot {
     return map { ( ".$_" => $EXT_LANG{$_} ) } keys %EXT_LANG;
 }
 
-# The same, restricted to the languages srcML parses. tokenizeSrcMl.pl must not
-# autodetect a .rs file as Rust: it would hand `-l Rust` to srcml.
+# srcML-routed extensions only: srcml must never be handed -l Rust.
 sub srcml_extensions_by_dot {
     return map { ( ".$_" => $EXT_LANG{$_} ) }
            grep { $LANG_PARSER_REL{ $EXT_LANG{$_} } eq $SRCML_PARSER_REL }
@@ -131,8 +89,7 @@ sub parsers {
     return map { ( $_ => "$basedir/$LANG_PARSER_REL{$_}" ) } keys %LANG_PARSER_REL;
 }
 
-# Extensions in a stable order, so the derived mask is byte-stable: it is stored
-# in blobExec's meta table and compared string-for-string on every resume.
+# Sorted, so the mask is byte-stable: blobExec stores it and compares it on resume.
 sub extensions_sorted {
     return sort keys %EXT_LANG;
 }
@@ -142,15 +99,8 @@ sub masked_extensions_sorted {
     return grep { $MASKED_LANGUAGES{ $EXT_LANG{$_} } } extensions_sorted();
 }
 
-# The universal file mask: every extension of every masked language, and nothing
-# else.
-#
-# Case-insensitive, because `.C` and `.H` are real files and the per-language
-# masks this replaces missed them. Anchored at the end only: every consumer
-# matches it against a repository-relative path, not just a basename, and all
-# four regex engines it reaches (Scala/Java in blobExec, Perl in blameRepoFiles
-# and prettyPrintFiles, and whatever later reads the recorded string) search
-# rather than full-match.
+# Case-insensitive (.C and .H are real). End-anchored only: every consumer
+# searches a repository-relative path rather than full-matching a basename.
 sub file_mask {
     return '(?i)\.(' . join('|', map { quotemeta } masked_extensions_sorted()) . ')$';
 }

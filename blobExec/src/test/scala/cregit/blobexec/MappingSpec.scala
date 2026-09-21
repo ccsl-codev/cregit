@@ -126,15 +126,8 @@ class MappingSpec extends AnyFunSuite with Matchers {
     } finally Files.deleteIfExists(tmp)
   }
 
-  // The mask widening (per-language masks -> one universal mask) is exactly the
-  // change this refusal exists for, so pin it with the real strings rather than
-  // ".*" vs "\.c$". A project whose mask changes MUST be rebuilt: its tree_map
-  // rows were assembled from the files the old mask selected, so reusing them
-  // would produce a repository that silently omits every newly selected file —
-  // and the omission is invisible afterwards, because the trees look complete.
-  //
-  // If someone later "fixes" this into a warning to make a resume work, this test
-  // is what says no. The rows below are the ones that would be reused.
+  // A mask change invalidates tree_map: rows assembled under the old mask omit
+  // every newly selected file, and the trees still look complete afterwards.
   test("a widened mask is refused on resume, not silently reused") {
     val oldMask = """\.(c|cc|cp|cpp|cxx|h|hh|hpp)$"""
     val newMask = """(?i)\.(c|c\+\+|cc|cp|cpp|cxx|h|h\+\+|hh|hpp|hxx|java|rs|tcc)$"""
@@ -154,8 +147,7 @@ class MappingSpec extends AnyFunSuite with Matchers {
       ex.getMessage should include(oldMask)
       ex.getMessage should include(newMask)
 
-      // Same mask still resumes, and the rows are still there — the refusal is
-      // about the mask changing, not about resuming at all.
+      // Same mask still resumes.
       val m2 = Mapping.open(tmp, "/bin/cat", oldMask)
       try {
         m2.getTree("origtree") shouldBe Some("newtree")
@@ -165,9 +157,7 @@ class MappingSpec extends AnyFunSuite with Matchers {
   }
 
   test("the warm-DB fallback refuses a widened mask too") {
-    // shard_build.sh passes a prior run's DB as --warm. Its blob ids were minted
-    // under that run's mask, so a mask change makes them foreign; openWarm has
-    // its own check and it must not drift from checkOrSetMeta's.
+    // shard_build.sh passes a prior run's DB as --warm; openWarm has its own check.
     val oldMask = """\.(c|cc|cp|cpp|cxx|h|hh|hpp)$"""
     val newMask = """(?i)\.(c|c\+\+|cc|cp|cpp|cxx|h|h\+\+|hh|hpp|hxx|java|rs|tcc)$"""
     val warm = Files.createTempFile("mapping-warm-", ".db")

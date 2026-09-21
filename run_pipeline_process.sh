@@ -183,12 +183,7 @@ BUILD_ONLY=0
 REPO_GIT_URL=""
 REPO_NAME=""
 REPO_COMMIT_URL=""
-# Empty means "use the universal mask", which is DERIVED from the tokenizer's own
-# extension table by tokenize/fileMask.pl rather than written out here. A default
-# typed beside the table drifts from it, and both directions are quiet: a mask
-# naming an extension with no parser kills the run part-way through, and an
-# extension the table knows but no mask names is source silently left
-# untokenized. Resolved after argument parsing, so --mask still wins.
+# Empty means "derive it from tokenize/fileMask.pl after parsing", so --mask wins.
 MASK=""
 WORK="../cregit-files"
 SKIP_HTML=0
