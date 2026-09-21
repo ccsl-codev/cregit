@@ -136,10 +136,15 @@ final class Walker(
     val tick = math.max(1L, math.min(30L, math.max(1, stallTimeoutSeconds).toLong / 4L))
     val watchdog = new Thread(
       () => {
-        while (!done.get()) {
+        var interrupted = false
+        while (!done.get() && !interrupted) {
+          // Leave the loop on an interrupt instead of re-arming the flag: a set
+          // flag makes the next `sleep` throw at once, which turns the wait into
+          // a spin on a core for the rest of the walk. The only interrupt this
+          // thread ever gets is the one below, after `done` is already true.
           try Thread.sleep(tick * 1000L)
-          catch { case _: InterruptedException => Thread.currentThread().interrupt() }
-          if (!done.get()) stalled().foreach { stalledNanos =>
+          catch { case _: InterruptedException => interrupted = true }
+          if (!done.get() && !interrupted) stalled().foreach { stalledNanos =>
             System.err.println(watchdogReport(stalledNanos))
             // Halting leaves nothing behind to reap the children, and an
             // orphaned srcml tree is what survived its parent by 51 hours in
@@ -1456,6 +1461,22 @@ object Walker {
   /** Exit status when the watchdog kills a stalled run. Distinct from 4 (a blob
     * timed out but the walk finished) so the runner can tell them apart. */
   private[blobexec] val StalledExitStatus = 5
+
+  /** Headroom above one blob's maximum lifetime. The watchdog ticks every 30s at
+    * most, and the progress stamp lands only after the killed child is reaped. */
+  private val StallFloorMarginSeconds = 60
+
+  /** Smallest stall window that cannot fire while a single blob is still inside
+    * its own budget.
+    *
+    * The watchdog measures completed work, and one blob is the smallest unit
+    * that completes, so a commit whose last miss is slow makes the whole run
+    * quiet for that blob's lifetime. A window below this floor therefore kills
+    * healthy runs — and it is the trap the "raise --blob-timeout" advice walks
+    * straight into, because raising the budget lengthens exactly that quiet
+    * period. */
+  private[blobexec] def stallFloorFor(blobTimeoutSeconds: Int): Int =
+    BlobExec.maxChildLifetimeSeconds(blobTimeoutSeconds) + StallFloorMarginSeconds
 
   /** Pure form of the watchdog's decision, so it can be tested without halting
     * a JVM: has more than `stallTimeoutSeconds` passed with no progress? */

@@ -69,7 +69,11 @@ object Main {
       |                    the run is stuck in a way the per-blob kill did not
       |                    cover: it is reported with the work in flight and the
       |                    process is killed with status ${Walker.StalledExitStatus}. The memo is
-      |                    durable, so re-running resumes.
+      |                    durable, so re-running resumes. Must exceed one blob's
+      |                    whole lifetime, because a commit whose last blob is
+      |                    slow completes nothing until that blob is killed: a
+      |                    window below that floor is rejected, and the default
+      |                    is raised to it when --blob-timeout is large.
       |
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
@@ -114,6 +118,7 @@ object Main {
     var warmPath: Option[java.nio.file.Path] = None
     var blobTimeoutSeconds = BlobExec.DefaultTimeoutSeconds
     var stallTimeoutSeconds = Walker.DefaultStallTimeoutSeconds
+    var stallTimeoutGiven = false
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
       case "--pipeline"       => pipeline = true
@@ -151,7 +156,7 @@ object Main {
       case t if t.startsWith("--stall-timeout=") =>
         val spec = t.stripPrefix("--stall-timeout=")
         parsePositiveSeconds(spec) match {
-          case Some(secs) => stallTimeoutSeconds = secs
+          case Some(secs) => stallTimeoutSeconds = secs; stallTimeoutGiven = true
           case None =>
             System.err.println(s"Error: --stall-timeout must be a positive whole number of seconds [$spec]")
             sys.exit(1)
@@ -172,6 +177,28 @@ object Main {
       System.err.println("Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
       System.err.println(Usage)
       sys.exit(1)
+    }
+
+    // The stall window must clear one blob's whole lifetime, or the watchdog
+    // kills healthy runs: a commit whose last miss is slow completes nothing
+    // until that blob is killed. Raising --blob-timeout is the documented
+    // recovery from exit 4, so the two settings must be reconciled here rather
+    // than left for the operator to get right.
+    val stallFloor = Walker.stallFloorFor(blobTimeoutSeconds)
+    if (stallTimeoutSeconds < stallFloor) {
+      if (stallTimeoutGiven) {
+        System.err.println(
+          s"Error: --stall-timeout=$stallTimeoutSeconds is below the floor of ${stallFloor}s implied by " +
+            s"--blob-timeout=$blobTimeoutSeconds. A blob may run that long before it is killed, so a " +
+            "shorter window would stop a healthy run. Raise --stall-timeout or lower --blob-timeout."
+        )
+        sys.exit(1)
+      }
+      System.err.println(
+        s"blobExec: raising the stall window from ${stallTimeoutSeconds}s to ${stallFloor}s to clear " +
+          s"--blob-timeout=${blobTimeoutSeconds}s; pass --stall-timeout to choose your own."
+      )
+      stallTimeoutSeconds = stallFloor
     }
 
     if (positional.length != 5) {

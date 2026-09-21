@@ -51,6 +51,13 @@ object BlobExec {
     * missing or wedged. */
   private val BackstopSlackSeconds: Int = 25
 
+  /** Longest a single [[invoke]] can take: the child's own budget, the kill
+    * grace, and the JVM-side backstop latch. A healthy run can therefore go
+    * this long with no blob completing, which is what the stall watchdog's
+    * window has to clear — see [[Walker.stallFloorFor]]. */
+  private[blobexec] def maxChildLifetimeSeconds(timeoutSeconds: Int): Int =
+    math.max(1, timeoutSeconds) + KillGraceSeconds + BackstopSlackSeconds
+
   /** GNU `timeout`'s own statuses: 124 = the budget expired, 137 = 128+SIGKILL,
     * i.e. the command ignored SIGTERM and needed the `-k` follow-up. Both mean
     * "we killed it", and both must reach the Skip branch rather than the
@@ -206,7 +213,7 @@ object BlobExec {
     // `timeout` is the primary kill, so the latch is only a backstop: give it
     // the child's own budget, the -k grace, and slack. It fires only when
     // `timeout` is absent or itself wedged.
-    val latchBudget = secs.toLong + KillGraceSeconds + BackstopSlackSeconds
+    val latchBudget = maxChildLifetimeSeconds(secs).toLong
 
     // The io threads are abandoned rather than joined on every timeout path: if
     // a surviving grandchild still holds a pipe, joining them is exactly the

@@ -47,6 +47,40 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Set(0, 1, 2, 3) should not contain Walker.StalledExitStatus
   }
 
+  // -- the stall window's floor -----------------------------------------------
+  //
+  // The watchdog counts completed work, and a blob is the smallest thing that
+  // completes, so a stall window shorter than one blob's lifetime kills healthy
+  // runs. That is the trap the "raise --blob-timeout" recovery advice leads to.
+
+  test("the floor clears one blob's whole lifetime, kill grace included") {
+    Walker.stallFloorFor(600) should be > BlobExec.maxChildLifetimeSeconds(600)
+    Walker.stallFloorFor(1) should be > BlobExec.maxChildLifetimeSeconds(1)
+  }
+
+  test("the default window already clears the default blob budget") {
+    Walker.DefaultStallTimeoutSeconds should be >= Walker.stallFloorFor(BlobExec.DefaultTimeoutSeconds)
+  }
+
+  test("a blob budget past the default window raises the floor above it") {
+    // `--blob-timeout=3600` with the default 1800s window is the configuration
+    // that used to halt a healthy run at exit 5.
+    Walker.stallFloorFor(3600) should be > Walker.DefaultStallTimeoutSeconds
+  }
+
+  test("the floor grows with the blob budget, and never underflows") {
+    Walker.stallFloorFor(60) should be < Walker.stallFloorFor(600)
+    Walker.stallFloorFor(0) should be > 0
+    Walker.stallFloorFor(-5) should be > 0
+  }
+
+  test("a run at exactly the floor is not stalled by its own slowest blob") {
+    val blobBudget = 3600
+    val floor      = Walker.stallFloorFor(blobBudget)
+    val quiet      = BlobExec.maxChildLifetimeSeconds(blobBudget).toLong * 1000000000L
+    Walker.isStalled(nowNanos = quiet, lastProgressNanos = 0L, floor) shouldBe false
+  }
+
   // -- the watchdog's decision ------------------------------------------------
 
   private val second = 1000000000L
