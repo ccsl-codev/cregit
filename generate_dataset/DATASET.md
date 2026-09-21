@@ -160,21 +160,12 @@ list aligned with the 13 typed columns, and they cannot be zipped with them.  A
 trailer whose address matches no `emails` row contributes nothing to either, so
 `footer_signed_off_by` can be non-empty while `footer_personids` is empty.
 
-**Known limitation: a trailer with no angle brackets never resolves.**  The
-generator tries `<([^>]+)>` first and a bare-address pattern second, through a
-`coalesce`, but DuckDB's `regexp_extract` returns the **empty string** on no match
-rather than NULL, so the `coalesce` never reaches the second pattern — and that
-second pattern has no capture group, so asking it for group 1 would also return
-`''`.  Measured:
-
-```sql
-SELECT regexp_extract('Bob <b@x.com>', '<([^>]+)>', 1),        -- 'b@x.com'
-       regexp_extract('Bob b@x.com',   '<([^>]+)>', 1);        -- ''
-```
-
-So `Reviewed-by: bob@example.com` (a real, if less common, spelling) lands in
-`footer_reviewed_by` but contributes nothing to `footer_personids`.  Use the 13
-raw columns, not the resolved pair, if you need every named contributor.
+Both bracketed and bare addresses resolve: `Reviewed-by: Bob <b@x.com>` and
+`Reviewed-by: bob@example.com` both reach `footer_personids`.  A trailer carrying
+no address at all contributes nothing, which is why `nullif` wraps both
+extractions — DuckDB's `regexp_extract` returns the empty string rather than NULL
+on no match, and an empty join key would otherwise match every `Name <>` row in
+`emails`.
 
 These columns are why the dataset can say anything about contribution that is not
 authorship.  `Signed-off-by`, `Reviewed-by` and `Co-authored-by` carry attribution
