@@ -89,12 +89,14 @@ my $blobFN = $ENV{BFG_FILENAME};
 die "BFG_FILENAME environment variable not set " if $blobFN eq "";
 
 my $fileExt;
+my $blobLang;
 
 if ($blobFN =~ /\.([^.]+)$/) {
     $fileExt = lc($1);
+    $blobLang = CregitLanguages::language_for_ext($1);
 }
 
-if (not defined($mapLang{$fileExt})) {
+if (not defined($blobLang)) {
     die "unknown file extension [$fileExt]";
 }
 
@@ -120,7 +122,7 @@ if (-f $filename) {
 
   my ($fout, $outfile) = mkstemp( "$buildDir/tmpfile-out-XXXXX" );
 
-  my $langOp = "--language=" . $mapLang{$fileExt};
+  my $langOp = "--language=" . $blobLang;
 
   open(PROC, "cd \"$wd\" && $tokenizeCmd $langOp \"$inName\" |") or die "unable to execute $tokenizeCmd (verify variable BFG_TOKENIZE_CMD) [$tokenizeCmd]";
 

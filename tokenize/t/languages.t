@@ -220,4 +220,25 @@ if ($have_srcml and $have_s2t) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# .C and .H are C++ by the GNU convention, and their lowercase forms are C
+# ---------------------------------------------------------------------------
+
+is(CregitLanguages::language_for_ext('C'), 'C++', ".C routes to C++");
+is(CregitLanguages::language_for_ext('H'), 'C++', ".H routes to C++");
+is(CregitLanguages::language_for_ext('c'), 'C',   ".c routes to C");
+is(CregitLanguages::language_for_ext('h'), 'C',   ".h routes to C");
+
+# The mask selects both cases, so the routing above decides what parses them.
+ok("src/Matrix.C" =~ /$mask/, "the mask selects .C");
+ok("src/Matrix.H" =~ /$mask/, "the mask selects .H");
+
+# Case-insensitive for every other extension.
+is(CregitLanguages::language_for_ext('CPP'), 'C++', ".CPP still routes to C++");
+is(CregitLanguages::language_for_ext('Java'), 'Java', ".Java still routes to Java");
+is(CregitLanguages::language_for_ext('RS'), 'Rust', ".RS still routes to Rust");
+
+is(CregitLanguages::language_for_ext('zzz'), undef, "an unknown extension routes nowhere");
+is(CregitLanguages::language_for_ext(''), undef, "an empty extension routes nowhere");
+
 done_testing();

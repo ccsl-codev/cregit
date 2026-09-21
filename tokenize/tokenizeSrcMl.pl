@@ -81,7 +81,8 @@ if ($language eq "") {
     # autodetect
     Usage("File has no extension. You must provide one [$filename]") unless $filename =~ /(\.[a-z\+]+)$/i;
     my $ext = lc($1);
-    $language = $extensions{$ext};
+    $language = CregitLanguages::language_for_ext( substr($1, 1) );
+    $language = undef unless defined $language and exists $extensions{ lc($1) };
     Usage("Unknown extension [$ext] in file [$filename]. You must provide language using --language option") unless defined $language and $language ne "";
 }
 
