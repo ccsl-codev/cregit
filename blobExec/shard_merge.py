@@ -55,6 +55,10 @@ import time
 BLOBEXEC_TIMEOUT_RC = 4
 BLOBEXEC_STALL_RC = 5
 
+# Written into final/ when the re-fold stops on a resumable status, so the next
+# run folds on instead of rebuilding the union from the shards.
+REFOLD_INCOMPLETE_MARKER = "REFOLD-INCOMPLETE"
+
 
 def run(cmd, **kw):
     return subprocess.run(cmd, check=True, **kw)
@@ -143,7 +147,7 @@ def parse_stats(stdout):
 
 
 def refold(java, jar, src, final_git, final_db, command, mask, tok_cmd, memo,
-           blob_timeout=None, stall_timeout=None):
+           blob_timeout=None, stall_timeout=None, marker=None):
     env = dict(os.environ)
     env["BFG_TOKENIZE_CMD"] = tok_cmd
     env["BFG_MEMO_DIR"] = memo
@@ -162,6 +166,10 @@ def refold(java, jar, src, final_git, final_db, command, mask, tok_cmd, memo,
     if r.stderr:
         sys.stderr.write(r.stderr)
     if r.returncode in (BLOBEXEC_TIMEOUT_RC, BLOBEXEC_STALL_RC):
+        if marker:
+            with open(marker, "w") as fh:
+                fh.write(f"re-fold exited {r.returncode}; blobmap.db and dst.git are kept "
+                         "so the next run resumes the fold instead of redoing the union.\n")
         log(f"re-fold exited {r.returncode} (incomplete but resumable) after {dt:.1f}s")
         sys.exit(r.returncode)
     r.check_returncode()
@@ -220,28 +228,41 @@ def main():
     os.makedirs(final_dir, exist_ok=True)
     final_db = os.path.join(final_dir, "blobmap.db")
     final_git = os.path.join(final_dir, "dst.git")
-    for stale in (final_db, final_git):
-        if os.path.isdir(stale):
-            shutil.rmtree(stale)
-        elif os.path.exists(stale):
-            os.remove(stale)
+    marker = os.path.join(final_dir, REFOLD_INCOMPLETE_MARKER)
 
+    resuming = (
+        os.path.exists(marker)
+        and os.path.isfile(final_db)
+        and os.path.isdir(final_git)
+    )
     t0 = time.time()
-    build_final_db(final_db, shard_dbs, args.warm_db)
+    if resuming:
+        log(f"resuming the re-fold: {marker} says the last one stopped part-way")
+        union_dt = 0.0
+    else:
+        for stale in (final_db, final_git):
+            if os.path.isdir(stale):
+                shutil.rmtree(stale)
+            elif os.path.exists(stale):
+                os.remove(stale)
+        build_final_db(final_db, shard_dbs, args.warm_db)
 
-    object_dirs = []
-    if args.warm_git:
-        object_dirs.append(os.path.join(os.path.abspath(args.warm_git), "objects"))
-    object_dirs += [os.path.join(g, "objects") for g in shard_gits]
-    union_objects(final_git, object_dirs)
-    union_dt = time.time() - t0
+        object_dirs = []
+        if args.warm_git:
+            object_dirs.append(os.path.join(os.path.abspath(args.warm_git), "objects"))
+        object_dirs += [os.path.join(g, "objects") for g in shard_gits]
+        union_objects(final_git, object_dirs)
+        union_dt = time.time() - t0
 
     refold_dt, stats = refold(
         args.java, os.path.abspath(args.jar), os.path.abspath(args.src),
         final_git, final_db, os.path.abspath(args.command), args.mask,
         args.tok_cmd, os.path.abspath(args.memo),
         blob_timeout=args.blob_timeout, stall_timeout=args.stall_timeout,
+        marker=marker,
     )
+    if os.path.exists(marker):
+        os.remove(marker)
     finalize_repo(final_git)
 
     log(f"MERGE COMPLETE: union={union_dt:.1f}s refold={refold_dt:.1f}s")

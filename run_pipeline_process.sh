@@ -198,7 +198,7 @@ resume_instructions() {
      it to retry a handful of blobs. Step 2 retries exactly what failed and needs
      no database surgery:
        runner:  $0 --repo-url <url> --work $WORK [same flags] 2
-       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2"
+       ctp.py (the external driver):  python3 ctp.py run [same flags] --from-step 2"
 }
 
 timeout_knob() {
@@ -499,7 +499,7 @@ if [ "$FROM_STEP" = "1" ] && [ -d "$WORK" ] && [ -n "$WORK" ] && [ "$WORK" != "/
      retry only the blobs that failed.
      Resume (keeps the directory, retries the failed blobs):
        runner:  $0 --repo-url <url> --work $WORK [same flags] 2
-       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2
+       ctp.py (the external driver):  python3 ctp.py run [same flags] --from-step 2
      Start over and lose that work, deliberately:
        $0 --force-clean [same flags]
      (or remove $marker by hand)"
