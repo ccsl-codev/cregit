@@ -194,9 +194,7 @@ REPO_NAME=""
 REPO_COMMIT_URL=""
 MASK=""
 WORK="../cregit-files"
-# Empty means "<work>/memo", resolved after argument parsing because it depends on
-# --work. A caller that wants the memo to survive a FROM_STEP=1 wipe passes a
-# directory outside $WORK; nothing else about the run changes.
+# Empty means "<work>/memo"; resolved after parsing because it depends on --work.
 MEMO_DIR=""
 SKIP_HTML=0
 GC_MODE="plain"
@@ -229,31 +227,21 @@ keep_markers_present() {
 TOKENIZE_TIMEOUT_STATUS=4
 TOKENIZE_STALLED_STATUS=5
 
-# How many memoized tokenizations make a memo directory too expensive to delete
-# on a default flag. A memo hit returns without invoking srcml at all
-# (tokenizeByBlobId/tokenBySha.pl), so the entries ARE the tokenizing already
-# done. 10,000 sits above a small project's whole memo and far below a large
-# one's. Overridable so the guard can be tested without planting 10,000 files.
+# Memo entries below which a step-1 wipe is allowed. Overridable for tests.
 MEMO_KEEP_THRESHOLD="${CREGIT_MEMO_KEEP_THRESHOLD:-10000}"
 
-# Canonical form of a path, whether or not it exists yet. Used to decide whether
-# the memo sits inside $WORK: a textual comparison answers that wrongly whenever
-# the two are spelled differently (one relative, one absolute), and the wrong
-# answer here is a silently deleted memo.
+# Canonical form of a path, existing or not, for the inside-$WORK comparison.
 canonical_path() {
     readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"
 }
 
-# memo_entries_at_least <dir> <n>: true when <dir> holds at least <n> entries.
-# Counts at most <n> and stops: a large memo holds millions of files, and a full
-# count would be minutes of stat() before the run has even started.
+# True when <dir> holds at least <n> entries. Counts at most <n> and stops: a
+# large memo holds millions of files.
 # find dies of SIGPIPE when head closes the pipe, which `|| true` absorbs so
 # `set -o pipefail` does not abort the script.
 memo_entries_at_least() {
     local dir=$1 n=$2 count
     [ -d "$dir" ] || return 1
-    # Entries are <memo>/xx/yy/<sha1-of-contents>, so depth 3 counts memoized
-    # tokenizations and nothing else.
     count=$( { find "$dir" -mindepth 3 -maxdepth 3 -type f -print 2>/dev/null || true; } \
              | head -n "$n" | wc -l )
     [ "$count" -ge "$n" ]
@@ -271,9 +259,7 @@ memo_inside_work() {
 }
 
 # Prints the memo directory and returns 0 when deleting $WORK would destroy a
-# memo worth keeping. The partner's instruction was "create exceptions for the
-# rm -rf for the Linux run": losing 2.6 million memoized tokenizations must not
-# be possible by leaving a flag off.
+# memo worth keeping.
 memo_at_risk() {
     [ -n "$MEMO_DIR" ] || return 1
     memo_inside_work || return 1
@@ -281,7 +267,6 @@ memo_at_risk() {
     printf '%s' "$MEMO_DIR"
 }
 
-# The recovery the guard prints, and the whole reason --memo-dir exists.
 memo_rescue_advice() {
     cat <<EOF
      Move it out of the way first, then this run keeps every memo hit:

@@ -27,10 +27,7 @@ final case class WalkStats(
     /** Mask-matched blobs JGit would not materialise. Reported, not gating. */
     blobsOversized: Long,
     /** Distinct mask-matched blobs excluded because they are on the shipped blob
-      * denylist ([[BlobDenylist]]): srcML 1.1.0 does not terminate on them, the
-      * defect is diagnosed and cited, and excluding them is deterministic. Like
-      * [[blobsOversized]] and unlike [[blobsTimedOut]] this is reported but does
-      * not block publication. */
+      * denylist. Reported, not gating. */
     blobsDenylisted: Long,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
@@ -59,9 +56,6 @@ final class Walker(
     destinationMayContainObjects: Boolean = true,
     blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
     stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
-    // The shipped list by default, so a caller cannot forget it and hand a known
-    // non-terminating blob to srcml. A parameter only so a test can supply its
-    // own fixture; nothing at run time chooses a different list.
     denylist: BlobDenylist = BlobDenylist.shipped
 ) {
   import Walker._
@@ -833,10 +827,6 @@ final class Walker(
     * into dst). Never touches `mapping`, keeping the hot path lock-free. */
   private def executeBlobTask(task: BlobMissTask): BlobResult =
     readBlob(task) match {
-      // None means "excluded from the rewrite": too large for jgit to
-      // materialise, or on the blob denylist. Both take the same downstream path
-      // — no id, no tree entry, no blob_map row — which is why one result covers
-      // them. readBlob has already counted and explained whichever it was.
       case None        => BlobResult.Oversized(task.origId)
       case Some(bytes) => executeBlobTask(task, bytes)
     }
@@ -1048,8 +1038,6 @@ final class Walker(
   }
 
   private def readBlob(task: BlobMissTask): Option[Array[Byte]] = {
-    // Checked before anything is read or opened. The map lookup replaces a whole
-    // timeout budget and an exit 4 with a logged exclusion.
     val denied = denylist.entryFor(task.origId.name)
     if (denied.isDefined) { noteDenylisted(task, denied.get); return None }
 
