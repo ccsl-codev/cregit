@@ -108,5 +108,6 @@ in
   enterTest = ''
     git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -S error
     echo "shellcheck: no errors"
+    pytest -q generate_dataset
   '';
 }

@@ -80,6 +80,9 @@ jobs:
       - name: Pipeline tests (shell)
         run: devenv shell -- bash -c 'tests/tokenize_gate.sh && tests/pipeline_workdir_guard.sh'
 
+      - name: Dataset tests (pytest)
+        run: devenv shell -- bash -c 'pytest -q generate_dataset'
+
       - name: Build & test legacy onejar modules (sbt test one-jar, Scala 2.10 / JDK 8)
         run: |
           devenv shell -- bash -c '
