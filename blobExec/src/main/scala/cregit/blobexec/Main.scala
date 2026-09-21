@@ -335,8 +335,8 @@ object Main {
         s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsTimedOut} blob(s) timed out this " +
           s"run ($timedOutEver ever for this memo, see meta['$BlobsTimedOutMetaKey'] in $dbPath). " +
           "Their files would carry raw source instead of tokens, so the walk stopped at that " +
-          s"commit and recorded nothing for it: no blob row, no tree row, no commit row. " +
-          s"Exiting $TimedOutExitStatus. Recovery is another blobExec run over this same memo: it " +
+          "commit and recorded nothing for it: no blob row, no tree row, no commit row. " +
+          "Recovery is another blobExec run over this same memo: it " +
           "retries exactly those blobs and needs no changes to the database. Driven from " +
           "run_pipeline_process.sh, that means resuming at step 2 (trailing '2', or ctp.py " +
           "--from-step 2) — a step-1 run deletes the work directory first, memo included. " +
