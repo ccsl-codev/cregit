@@ -71,14 +71,11 @@ final class Walker(
 
   // -- stall watchdog ------------------------------------------------------
   //
-  // The consumer's `Await.result` calls are unbounded again, and deliberately.
-  // A duration budget cannot tell a wedged run from an honestly large one: a
-  // first-import commit alone can justify weeks. The watchdog asserts that work
-  // is *happening* instead: every blob, tree, commit and original-blob copy
-  // stamps `lastProgressNanos`, and if nothing at all completes within
-  // `stallTimeoutSeconds` it kills the process. Safe because GNU `timeout`
-  // hard-bounds every child at `blobTimeoutSeconds`, so a healthy run always
-  // completes *something* well inside the window.
+  // The consumer's `Await.result` calls are unbounded on purpose: a duration
+  // budget cannot tell a wedged run from an honestly large one, and a
+  // first-import commit alone can justify weeks. The watchdog asserts completed
+  // work instead, which is safe because `ChildRunner` bounds every child at
+  // `blobTimeoutSeconds`.
 
   private val lastProgressNanos = new AtomicLong(System.nanoTime())
   private val lastProgressWhat  = new AtomicReference[String]("startup")
@@ -146,10 +143,7 @@ final class Walker(
           catch { case _: InterruptedException => interrupted = true }
           if (!done.get() && !interrupted) stalled().foreach { stalledNanos =>
             System.err.println(watchdogReport(stalledNanos))
-            // Halting leaves nothing behind to reap the children, and an
-            // orphaned srcml tree is what survived its parent by 51 hours in
-            // the incident this work comes from. Kill the whole descendant
-            // tree first — `timeout`, the shell, the tokenizer, all of it.
+            // Halting reaps nothing, so kill the descendant tree first.
             val killed = killDescendants()
             System.err.println(s"blobExec: killed $killed leftover child process(es) before exiting")
             System.err.flush()
@@ -1453,11 +1447,6 @@ object Walker {
     * memory stays modest. */
   private val PipelineWindow = 32
 
-  /** Window with no completed work of any kind after which the run is declared
-    * stalled. Generous because it is a watchdog, not a schedule: every child is
-    * separately hard-bounded at `--blob-timeout`. */
-  private[blobexec] val DefaultStallTimeoutSeconds = 1800
-
   /** Exit status when the watchdog kills a stalled run. Distinct from 4 (a blob
     * timed out but the walk finished) so the runner can tell them apart. */
   private[blobexec] val StalledExitStatus = 5
@@ -1466,17 +1455,26 @@ object Walker {
     * most, and the progress stamp lands only after the killed child is reaped. */
   private val StallFloorMarginSeconds = 60
 
-  /** Smallest stall window that cannot fire while a single blob is still inside
-    * its own budget.
-    *
-    * The watchdog measures completed work, and one blob is the smallest unit
-    * that completes, so a commit whose last miss is slow makes the whole run
-    * quiet for that blob's lifetime. A window below this floor therefore kills
-    * healthy runs — and it is the trap the "raise --blob-timeout" advice walks
-    * straight into, because raising the budget lengthens exactly that quiet
-    * period. */
+  /** How much longer than the blob budget a defaulted window runs. */
+  private val StallTimeoutMultiple = 3
+
+  /** Smallest stall window that cannot fire on healthy work: the watchdog counts
+    * completed work, and a commit whose last blob is slow completes nothing
+    * until that blob's child is killed and reaped. */
   private[blobexec] def stallFloorFor(blobTimeoutSeconds: Int): Int =
-    BlobExec.maxChildLifetimeSeconds(blobTimeoutSeconds) + StallFloorMarginSeconds
+    ChildRunner.maxLifetimeSeconds(blobTimeoutSeconds) + StallFloorMarginSeconds
+
+  /** The window that goes with a blob budget when the operator sets neither. */
+  private[blobexec] def stallTimeoutFor(blobTimeoutSeconds: Int): Int =
+    math.max(
+      math.max(1, blobTimeoutSeconds) * StallTimeoutMultiple,
+      stallFloorFor(blobTimeoutSeconds)
+    )
+
+  /** Derived, so the two defaults cannot drift: the blob budget is the only
+    * number an operator has to think about. */
+  private[blobexec] val DefaultStallTimeoutSeconds: Int =
+    stallTimeoutFor(BlobExec.DefaultTimeoutSeconds)
 
   /** Pure form of the watchdog's decision, so it can be tested without halting
     * a JVM: has more than `stallTimeoutSeconds` passed with no progress? */
