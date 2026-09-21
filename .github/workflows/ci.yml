@@ -77,6 +77,9 @@ jobs:
       - name: "Pipeline runner: artifact staleness guard"
         run: devenv shell -- bash test_ensure_artifacts.sh
 
+      - name: "Pipeline runner: cache-invalidation passthrough"
+        run: devenv shell -- bash test_retokenize_passthrough.sh
+
       - name: Perl tests (prove)
         run: devenv shell -- bash -c 'prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t'
 

@@ -177,6 +177,34 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     }
   }
 
+  // The ineffective-invalidation status needs the same treatment, and for the
+  // same reason: run_pipeline_process.sh maps blobExec's statuses onto different
+  // remedies and different marker files, so a collision sends the operator to the
+  // wrong one. This status specifically must not be 0 — "--retokenize did
+  // nothing" reported as success is the failure the flag exists to prevent — and
+  // must not be 3, which means the run never started.
+  test("the ineffective-retokenize status collides with no other blobExec exit status") {
+    val others = Map(
+      "clean"        -> 0,
+      "usage"        -> 1,
+      "aborted"      -> 2,
+      "maskChanged"  -> 3,
+      "timedOut"     -> Main.TimedOutExitStatus,
+      "stalled"      -> Walker.StalledExitStatus,
+      "parserCrash"  -> Main.ParserCrashedExitStatus
+    )
+    others.foreach { case (name, status) =>
+      withClue(s"ineffective-retokenize status must differ from $name ($status): ") {
+        Main.RetokenizeIneffectiveExitStatus should not equal status
+      }
+    }
+  }
+
+  test("an ineffective --retokenize is not reported as a clean walk") {
+    // Belt and braces on the one collision that would actually lose data.
+    Main.RetokenizeIneffectiveExitStatus should not equal 0
+  }
+
   // -- the watchdog's decision ------------------------------------------------
 
   private val second = 1000000000L

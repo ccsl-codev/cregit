@@ -116,6 +116,7 @@ prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t
 
 # the pipeline runner's own guards (stubbed builds and a stubbed java, seconds)
 bash test_ensure_artifacts.sh
+bash test_retokenize_passthrough.sh
 
 for module in slickGitLog persons remapCommits; do
   (cd "$module" && sbt --java-home "$LEGACY_JAVA_HOME" -batch test one-jar)
@@ -201,6 +202,62 @@ rebuilding the jar.
 Example run (cregit run on itself):
 ![Example cregit run](cregit.gif)
 p.s.: long pauses are trimmed.
+
+### When a tokenizer is corrected: `--retokenize`
+
+A corrected tokenizer does **not** by itself produce corrected tokens on a
+resume. blobExec decides whether to reuse a cached tokenization from the
+recorded `command` and `mask`. `command` is the constant path
+`tokenizeByBlobId/tokenBySha.pl`, and `mask` says *which* files to tokenize,
+never *how* — so rebuilding a tokenizer moves neither value, every cached row for
+that language stays a cache hit, and the run reproduces the old tokenizer's
+output and exits 0. Measured, for the Rust fix in `729643e`: 741,869 `.rs`
+(blob, path) pairs across 45 projects.
+
+Two mechanisms close that:
+
+1. **Every run reports a tokenizer identity** — one opaque digest per file
+   extension, covering that extension's whole parser toolchain
+   (`tokenize/tokenizerIdentity.pl`). blobExec records it in the blob map's
+   `meta` table and compares it on every later run. A mismatch, on an extension
+   that actually has cached rows, **refuses the run** (exit 3) and names the flag
+   to fix it. Nothing is invalidated automatically.
+2. **`--retokenize EXTS` is the opt-in past that refusal**, and it is selective:
+   re-tokenizing is 88% of total pipeline time, so a `.rs`-only defect costs
+   `.rs` entries only.
+
+To re-tokenize only the `.rs` entries of one project, after rebuilding the
+tokenizer:
+
+```sh
+# 1. make sure the binary is actually current (this also proves the identity moved)
+./run_pipeline_process.sh --ensure-artifacts
+
+# 2. resume that project at step 2 — never step 1, which deletes the work
+./run_pipeline_process.sh \
+  --repo-url <url> --repo-name <name> \
+  --work ../cregit-files-<name> \
+  --retokenize rs \
+  2
+```
+
+`--retokenize` needs `FROM_STEP=2` exactly: step 1 deletes the work directory
+(so there would be nothing cached to invalidate) and step 3 or later skips the
+invalidation entirely. It is not available with `--mode sharded`.
+
+What it does, in one transaction: drops the `blob_map` rows for those extensions,
+purges **their entries in the memo** (which is keyed on `sha1` of the file's
+content with no tokenizer in the key, so dropping only the `blob_map` row would
+let the memo answer with the same stale tokens), and drops `tree_map`,
+`commit_map` and `ref_map` because a tree names its blobs. Every other
+extension's tokenizations survive.
+
+It cannot quietly do nothing. blobExec refuses, **before changing anything**, if
+no cached row carries a named extension, if the memo held none of the affected
+blobs (which means `--memo-dir` is not this project's), if another extension's
+tokenizer also changed and was not named, or if a retained `new_blob` id is
+missing from the cregit repository. An ineffective `--retokenize` exits 7, never
+0.
 
 ### Outputs
 

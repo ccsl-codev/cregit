@@ -62,6 +62,52 @@ Target repository:
                     reusing the row would leave RAW SOURCE in the tokenized repo.
                     Not available with --mode sharded: each shard builds a fresh
                     blob map, so there is no recorded mask to widen.
+  --retokenize EXTS comma-separated extensions whose CACHED TOKENIZATIONS are to
+                    be thrown away and redone, because the tokenizer that made
+                    them has changed: --retokenize rs, --retokenize c,h.
+                    Lowercase, no dots, as spelled in tokenize/CregitLanguages.pm.
+                    REQUIRES FROM_STEP=2 exactly: step 1 deletes $WORK, so there
+                    would be nothing cached left to invalidate, and step 3 or
+                    later skips the invalidation entirely and would run the rest
+                    of the pipeline over the poisoned tokens. Not available with
+                    --mode sharded.
+
+                    Why it exists. blobExec decides whether to reuse a cached
+                    tokenization from the recorded command and mask. The command
+                    is the constant path tokenizeByBlobId/tokenBySha.pl and the
+                    mask says WHICH files to tokenize, never HOW — so when a
+                    tokenizer is corrected, neither value moves and every cached
+                    row for that language stays a cache hit. Measured: a
+                    rustTokenizer binary 16 days older than its own source kept
+                    emitting a line:col prefix, and 741,869 .rs entries across
+                    45 projects carried it with no error anywhere.
+
+                    Every run now reports a per-extension tokenizer identity
+                    (tokenize/tokenizerIdentity.pl: a digest of that extension's
+                    whole parser toolchain). blobExec records it and compares it,
+                    and a mismatch REFUSES the run, naming the extensions and
+                    this flag. Nothing is invalidated without this flag, so the
+                    186 published projects are untouched.
+
+                    SELECTIVE, on measurement: re-tokenizing is 88% of total
+                    pipeline time, so a .rs-only defect costs .rs entries only.
+                    Everything else in blob_map survives. tree_map, commit_map
+                    and ref_map do not — a tree names its blobs, and a kept
+                    tree_map row would short-circuit the re-walk — but rebuilding
+                    those is a walk, not a tokenize.
+
+                    BOTH cache layers go together, and neither can be done
+                    without the other: the blob_map rows AND their entries in the
+                    memo, which is keyed on sha1 of the file's CONTENT with no
+                    tokenizer in the key. Dropping only the blob_map row would
+                    make the walker re-run the tokenizer command and the memo
+                    would answer it with the same stale tokens.
+
+                    It CANNOT quietly do nothing: blobExec refuses, before
+                    changing anything, if no cached row carries a named
+                    extension, if the memo held none of the affected blobs, if
+                    another extension's tokenizer also changed and was not named,
+                    or if a retained new_blob id is missing from cregit.git.
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
@@ -279,6 +325,11 @@ FORCE_CLEAN=0
 # refusal is correct for every case except a verified widening, and blobExec does
 # the verifying against the rows rather than trusting this flag.
 MASK_WIDENED=0
+# Empty means "do not pass --retokenize", so no cached tokenization is ever
+# invalidated unless an operator asked for it by extension. Off by default and it
+# must stay that way: 186 projects are published against the caches this would
+# delete.
+RETOKENIZE=""
 # Empty means "do not pass the flag", so blobExec keeps its own defaults (600s
 # per blob, 1800s stall window). The CREGIT_* environment fallbacks exist so the
 # values are reachable through ctp.py, which has no passthrough of its own but
@@ -449,6 +500,24 @@ $resume_lines
      and reported without blocking publication.
      If you do denylist them, resume at step 2 to keep the memo:
 $resume_lines"
+    elif [ "$rc" -eq 7 ]; then
+        # No marker file, deliberately. The markers mean "work in $WORK is
+        # incomplete but resumable and a step-1 wipe would destroy it". This is the
+        # opposite situation: nothing was started and nothing was changed. The run
+        # simply must not be read as a success, which is what the non-zero exit and
+        # this message are for.
+        die "$what refused the invalidation and changed nothing (exit 7).
+     --retokenize was asked for and would have invalidated NOTHING, so blobExec
+     stopped instead of running the walk and exiting 0. The Error line above this
+     says which of the reasons it was: no cached row carries a named extension, or
+     the memo at --memo-dir held none of the affected blobs.
+     The point of the refusal: an invalidation that quietly invalidates nothing is
+     indistinguishable in a log from one that worked, and the dataset then ships
+     with the tokens the flag was meant to remove.
+     Check the extension spelling (lowercase, no dot, as in
+     tokenize/CregitLanguages.pm), that --memo-dir names THIS project's memo
+     ($MEMO_DIR), and that this work directory is the one holding the poisoned
+     entries. Nothing in $WORK has been modified."
     else
         die "$what failed (exit $rc)"
     fi
@@ -472,6 +541,7 @@ while [ $# -gt 0 ]; do
         --skip-html)  SKIP_HTML=1; shift ;;
         --force-clean) FORCE_CLEAN=1; shift ;;
         --mask-widened) MASK_WIDENED=1; shift ;;
+        --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
@@ -527,6 +597,70 @@ if [ "$MASK_WIDENED" = 1 ] && [ "$MODE" = "sharded" ]; then
      blob map, so no recorded mask exists to widen. Reuse a prior run's
      tokenizations with shard_build.sh --warm-db instead." >&2
     exit 2
+fi
+
+# --retokenize invalidates CACHED work, so like --mask-widened it only means
+# anything on a resume that keeps the work directory. A step-1 run deletes $WORK —
+# blob map, memo and cregit.git — so there would be nothing left to invalidate and
+# the flag would be a quiet no-op while the operator believed the poisoned entries
+# had been removed. That is the one thing this flag must never be.
+#
+# And it must be EXACTLY 2, not "2 or more": the invalidation happens inside step
+# 2, so --retokenize with FROM_STEP=3 would skip it entirely, run steps 3-10 over
+# the poisoned tokens and exit 0. A flag that cannot quietly do nothing cannot be
+# allowed to be skipped either.
+if [ -n "$RETOKENIZE" ] && [ "$FROM_STEP" != "2" ]; then
+    echo "--retokenize needs FROM_STEP=2 exactly (got $FROM_STEP).
+     Step 1 deletes $WORK, so the blob map and memo whose poisoned entries this flag
+     removes are gone before blobExec starts — and a from-scratch run re-tokenizes
+     everything anyway, with the current tokenizer, which is the same outcome at
+     full cost.
+     Step 3 or later never reaches the invalidation at all: it lives in step 2, so
+     the flag would be skipped, steps 3-10 would run over the poisoned tokens, and
+     the run would exit 0.
+     Resume at step 2:
+       runner:  $0 --repo-url <url> --work $WORK --retokenize $RETOKENIZE [same flags] 2
+       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2" >&2
+    exit 2
+fi
+
+# Each shard builds its own fresh dst.git and blobmap.db, so a shard has no cached
+# tokenization to invalidate. blobExec refuses the combination too; catching it
+# here means the operator hears about it before the clone.
+if [ -n "$RETOKENIZE" ] && [ "$MODE" = "sharded" ]; then
+    echo "--retokenize is not available with --mode sharded: every shard builds a fresh
+     blob map, so there are no cached tokenizations for it to invalidate. Retokenize
+     the merged result in a non-sharded step-2 resume, or drop the shards' warm db." >&2
+    exit 2
+fi
+
+# One verified invalidation per run. Each of the two verifies its own precondition
+# against the rows themselves, and run together each would be verifying against a
+# state the other is about to change: a widening reasons about identity rows on the
+# assumption the tokenizations are valid, an invalidation reasons about which
+# tokenizations to drop on the assumption the mask has not moved. blobExec refuses
+# the combination too; catching it here means it is caught before the clone.
+if [ -n "$RETOKENIZE" ] && [ "$MASK_WIDENED" = 1 ]; then
+    echo "--mask-widened and --retokenize cannot be used in the same run. Each verifies its
+     own precondition against the blob map's rows, and together each would verify
+     against a state the other is about to change.
+     Do them one at a time: widen first, then resume again with --retokenize." >&2
+    exit 2
+fi
+
+# Refuse a malformed extension list here rather than after the clone. Same
+# alphabet blobExec's TokenizerIdentity accepts, and the same reason: a typo that
+# silently selected nothing would be a no-op invalidation.
+if [ -n "$RETOKENIZE" ]; then
+    for _ext in ${RETOKENIZE//,/ }; do
+        case "$_ext" in
+            ''|*[!a-z0-9+]*)
+                echo "invalid --retokenize: '$_ext' is not an extension. Want lowercase names
+     without a leading dot, comma-separated, as spelled in tokenize/CregitLanguages.pm:
+     --retokenize rs   --retokenize c,h" >&2
+                exit 2 ;;
+        esac
+    done
 fi
 
 # Reject a bad --gc value now, not after tokenizing. pack_cregit_repo runs at the
@@ -940,11 +1074,14 @@ echo "████████████████████████�
 echo ""
 
 # ---------------------------------------------------------------------------
-# --mask-widened: drop what a re-fold invalidates, keep what it reuses
+# --mask-widened / --retokenize: drop what a re-fold invalidates, keep what it
+# reuses
 # ---------------------------------------------------------------------------
 #
-# A widening re-folds the whole history: every tree gains entries, so every
-# rewritten commit gets a new sha. Steps 3-10 are all derived from those shas,
+# Both flags re-fold the whole history. A widening because every tree gains
+# entries; an invalidation because a re-tokenized blob changes the tree above it,
+# and blobExec empties tree_map and commit_map for exactly that reason. Either way
+# every rewritten commit gets a new sha. Steps 3-10 are all derived from those shas,
 # and two of them do NOT rebuild themselves, which makes this mandatory rather
 # than tidy:
 #
@@ -968,11 +1105,12 @@ echo ""
 #
 # Named paths only. No globs, and never $WORK itself — the wipe of $WORK is the
 # expensive mistake this whole script is defended against.
-if [ "$MASK_WIDENED" = 1 ]; then
-    log "--mask-widened: dropping the artifacts derived from the tokenized repo,"
+drop_refold_derived_artifacts() {  # $1 = which flag is asking, for the log
+    log "$1: dropping the artifacts derived from the tokenized repo,"
     log "  because the re-fold gives every cregit commit a new sha."
     log "  KEEPING: $REPO_PATH_ORIGINAL_BARE, $REPO_PATH_CREGIT_BARE,"
     log "           $DB_PATH_BLOBMAP, $MEMO_DIR"
+    local _stale
     for _stale in \
         "$WORK/blame" \
         "$WORK/html" \
@@ -990,11 +1128,21 @@ if [ "$MASK_WIDENED" = 1 ]; then
             rm -rf -- "$_stale"
         fi
     done
-    # blame/ is recreated below for the normal case, but this runs after that
-    # mkdir, so put it back.
     mkdir -p "$WORK/blame"
     [ "$SKIP_HTML" = 1 ] || mkdir -p "$WORK/html"
+}
+
+if [ "$MASK_WIDENED" = 1 ]; then
+    drop_refold_derived_artifacts "--mask-widened"
 fi
+
+# --retokenize does the same drop, but AFTER step 2 has actually invalidated
+# something — see the end of step 2. blobExec refuses a --retokenize that would
+# invalidate nothing, and doing the drop up front would mean a refused request had
+# already deleted the blame output. Blame is this pipeline's bottleneck (measured:
+# 8 files a minute, 5.6 days for the largest project), so destroying it to answer
+# a request that was then rejected is the most expensive possible way to handle a
+# typo in an extension name.
 
 # ---------------------------------------------------------------------------
 # Step 1 — clone bare original repo
@@ -1025,6 +1173,26 @@ export BFG_TOKENIZE_CMD="${CREGIT}/tokenize/tokenize.pl \
   --srcml=$(which srcml) \
   --ctags=$(which ctags)"
 
+# Which tokenizer produced which extension's tokens, so blobExec can refuse to
+# reuse a cache built by a different one. Computed from the same three binaries
+# BFG_TOKENIZE_CMD above pins, plus each language's parser and the dispatcher, by
+# tokenize/tokenizerIdentity.pl. The failure it closes: `command` is the constant
+# path tokenizeByBlobId/tokenBySha.pl and `mask` says which files, not how, so a
+# rebuilt tokenizer moved neither and every cached row stayed a hit.
+#
+# Fatal if it cannot be computed. An empty identity would make the whole check a
+# no-op, and the pipeline would go back to reusing caches it cannot vouch for.
+TOKENIZER_IDENTITY=$(perl "${CREGIT}/tokenize/tokenizerIdentity.pl" \
+    --srcml2token="${SRCML2TOKEN}" \
+    --srcml="$(which srcml)" \
+    --ctags="$(which ctags)") \
+  || die "cannot compute the tokenizer identity (tokenize/tokenizerIdentity.pl).
+     blobExec needs it to tell a cache built by this tokenizer from one built by a
+     different one. Build the artifacts first: $0 --ensure-artifacts"
+[ -n "$TOKENIZER_IDENTITY" ] \
+  || die "tokenize/tokenizerIdentity.pl printed nothing; refusing to run with no tokenizer identity"
+log "tokenizer identity: $TOKENIZER_IDENTITY"
+
 TOKENIZE_RC=0
 if [ "$MODE" = "sharded" ]; then
   # Memory-bounded path: N tree-only shards in parallel, then merge + serial
@@ -1042,13 +1210,30 @@ if [ "$MODE" = "sharded" ]; then
     ${BLOB_TIMEOUT:+--blob-timeout "$BLOB_TIMEOUT"} \
     ${STALL_TIMEOUT:+--stall-timeout "$STALL_TIMEOUT"} || TOKENIZE_RC=$?
   tokenize_gate "$TOKENIZE_RC" "sharded tokenize (shard_build.sh)"
+  # Said out loud rather than left to be discovered. The tokenizer identity is not
+  # plumbed through shard_build.sh / shard_merge.py, so the merged blobmap.db a
+  # sharded build produces carries no tokenizer_id.* rows. A later non-sharded
+  # resume over that database records the identity of whatever tokenizer is then
+  # current, without being able to check it against the one that built it.
+  log "note: --mode sharded does not record a tokenizer identity in the merged blob map."
+  log "      A later resume cannot detect a tokenizer change against it. Non-sharded"
+  log "      modes record and check it; see --retokenize."
 else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
   WIDENED_FLAG=""
   [ "$MASK_WIDENED" = 1 ] && WIDENED_FLAG="--mask-widened"
+  # --retokenize carries --memo-dir with it, always, and blobExec refuses one
+  # without the other: the blob map and the memo are two caches of the same
+  # answer, and invalidating either alone invalidates nothing.
+  RETOKENIZE_FLAGS=()
+  if [ -n "$RETOKENIZE" ]; then
+      RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
+  fi
   java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG \
+    "--tokenizer-identity=$TOKENIZER_IDENTITY" \
+    ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
     ${STALL_TIMEOUT:+--stall-timeout=$STALL_TIMEOUT} \
     "$REPO_PATH_ORIGINAL_BARE" \
@@ -1070,6 +1255,17 @@ for _m in $KEEP_MARKERS; do
         rm -f "${WORK}/${_m}"
     fi
 done
+
+# Only now, with the invalidation verified and the re-fold done. blobExec refuses a
+# --retokenize that would invalidate nothing (exit 7) and changes nothing on that
+# path, so reaching here means the re-fold really happened and every cregit commit
+# really does have a new sha — which is what makes dropping the derived artifacts
+# mandatory rather than tidy. Step 6's clone fails outright on a directory that
+# exists, and step 7's blame silently keeps .blame files naming commits that no
+# longer exist.
+if [ -n "$RETOKENIZE" ]; then
+    drop_refold_derived_artifacts "--retokenize $RETOKENIZE"
+fi
 
 pack_cregit_repo
 fi

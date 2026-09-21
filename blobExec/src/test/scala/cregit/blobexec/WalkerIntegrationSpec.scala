@@ -86,20 +86,39 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       // to collide with the shipped list, and the shipped list must never be
       // exercised by accident. The denylist tests pass their own.
       denylist: BlobDenylist = BlobDenylist.empty,
-      maskWidened: Boolean = false
+      maskWidened: Boolean = false,
+      // Empty by default so every test written before the tokenizer-identity
+      // mechanism existed keeps its exact previous behaviour.
+      tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
+      retokenizeExtensions: Set[String] = Set.empty,
+      memoDir: Option[Path] = None
   ): WalkStats = {
     val destinationMayContainObjects = Files.isDirectory(dstPath)
     val dst = openBare(dstPath)
+    val resolvesInDst: String => Boolean = id => {
+      val r = dst.newObjectReader()
+      try r.has(ObjectId.fromString(id)) finally r.close()
+    }
     val widening =
       if (!maskWidened) None
-      else Some(Mapping.MaskWidening(
-        newBlobResolves = id => {
-          val r = dst.newObjectReader()
-          try r.has(ObjectId.fromString(id)) finally r.close()
+      else Some(Mapping.MaskWidening(newBlobResolves = resolvesInDst, report = _ => ()))
+    val retokenize =
+      if (retokenizeExtensions.isEmpty) None
+      else Some(Mapping.Retokenize(
+        extensions = retokenizeExtensions,
+        newBlobResolves = resolvesInDst,
+        purgeMemo = blobs => memoDir match {
+          case None => TokenizerMemo.PurgeReport(blobs.size.toLong, blobs.size.toLong, 0L, 0L)
+          case Some(root) => TokenizerMemo.purge(root, blobs, sha => {
+            val r = srcRepo.newObjectReader()
+            try Some(r.open(ObjectId.fromString(sha), OBJ_BLOB).getBytes)
+            catch { case _: Exception => None }
+            finally r.close()
+          })
         },
         report = _ => ()
       ))
-    val mapping = Mapping.open(dbPath, command, mask, None, widening)
+    val mapping = Mapping.open(dbPath, command, mask, None, widening, tokenizerIdentity, retokenize)
     try {
       val walker = new Walker(
         srcRepo, dst, mapping, mask.r, command, abortOnError, parallelism,
@@ -1010,6 +1029,147 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
 
     val dst = openBare(dstDir)
     try fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n") finally dst.close()
+  }
+
+  // -- tokenizer identity ----------------------------------------------------
+  //
+  // The defect, end to end. blob_map reuse was decided on `command` + `mask`, and
+  // `command` is the constant path tokenizeByBlobId/tokenBySha.pl. So correcting a
+  // tokenizer changed nothing either check looks at: every cached row for that
+  // language stayed a cache hit, and a run with the corrected tokenizer
+  // reproduced the OLD tokens exactly, with no error anywhere. Measured on the
+  // corpus for the Rust fix (729643e): 741,869 .rs (blob, path) pairs in 45
+  // projects would have been served from the poisoned cache.
+  //
+  // These two tests are the deliverable. The first says a changed tokenizer can
+  // no longer be silent. The second says the opt-in actually re-tokenizes the
+  // affected files, and ONLY those — re-tokenizing everything costs 88% of total
+  // pipeline time, so a `.rs`-only fix must not touch the C work.
+
+  test("a changed tokenizer identity refuses the incremental run instead of reusing its tokens") {
+    val w = freshWorkDir("tokid-refuse")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val mask   = """\.(c|rs)$"""
+    val v1     = shellScript(w, "tr a-z A-Z")
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map("a.c" -> "int a;\n", "b.rs" -> "fn b() {}\n"), "only commit")
+    runWalker(git.getRepository, dstDir, db, v1, mask,
+      tokenizerIdentity = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "1111111111")))
+
+    // Same content, same mask, same command path — only the Rust tokenizer's
+    // identity moved. Before this mechanism the run reused every .rs row and said
+    // nothing.
+    val ex = intercept[Mapping.TokenizerChangedException] {
+      runWalker(git.getRepository, dstDir, db, v1, mask,
+        tokenizerIdentity = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "2222222222")))
+    }
+    ex.getMessage should include("--retokenize=rs")
+
+    val dst = openBare(dstDir)
+    try fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+    finally dst.close()
+  }
+
+  test("--retokenize on one extension re-tokenizes that extension's files and reuses the rest") {
+    val w = freshWorkDir("tokid-retokenize")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val memo   = w.resolve("memo")
+    Files.createDirectories(memo)
+    val mask   = """\.(c|rs)$"""
+
+    // ONE command path whose behaviour changes between the two runs, because that
+    // is exactly the pipeline's situation: <command> is the constant path
+    // tokenizeByBlobId/tokenBySha.pl, which dispatches by extension to a tokenizer
+    // that can be rebuilt underneath it. Two different script paths would trip the
+    // existing `command` meta check and prove nothing — the defect is precisely
+    // that the command string does NOT change when the tokenizer does.
+    val cmd = w.resolve("tokenize.sh")
+    def writeTokenizer(rustBody: String): String = {
+      Files.writeString(cmd,
+        s"""#!/bin/sh
+           |case "$$BFG_FILENAME" in
+           |  *.rs) $rustBody ;;
+           |  *)    tr a-z A-Z ;;
+           |esac
+           |""".stripMargin)
+      cmd.toFile.setExecutable(true)
+      cmd.toAbsolutePath.toString
+    }
+    // v1 emits the `line:col<TAB>` prefix the real defect emitted; v2 does not.
+    val v1 = writeTokenizer("""sed 's/^/1:1\t/'""")
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map(
+      "a.c"       -> "int a;\n",
+      "b.rs"      -> "fn b() {}\n",
+      "c.rs"      -> "fn c() {}\n",
+      "README.md" -> "leave-me-alone\n"
+    ), "only commit")
+
+    val idV1 = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "1111111111"))
+    val idV2 = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "2222222222"))
+
+    val first = runWalker(git.getRepository, dstDir, db, v1, mask, tokenizerIdentity = idV1)
+    first.blobCommandExecutions shouldEqual 3L
+    locally {
+      val dst = openBare(dstDir)
+      try {
+        // The defect's signature: a line:col prefix the rest of the pipeline does
+        // not expect, shifting every later field by one.
+        fileAtHead(dst, "master", "b.rs") shouldBe Some("1:1\tfn b() {}\n")
+        fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+      } finally dst.close()
+    }
+
+    // Plant the memo entries the real tokenizeByBlobId/tokenBySha.pl would have
+    // written, so the purge has something to purge and the test can assert the
+    // .c entry survives.
+    val memoEntries = Map(
+      "fn b() {}\n"      -> "1:1\tfn b() {}\n",
+      "fn c() {}\n"      -> "1:1\tfn c() {}\n",
+      "int a;\n"         -> "INT A;\n"
+    ).map { case (content, tokens) =>
+      val p = TokenizerMemo.entryFor(memo, TokenizerMemo.sha1Hex(content.getBytes(UTF_8)))
+      Files.createDirectories(p.getParent)
+      Files.writeString(p, tokens)
+      content -> p
+    }
+
+    // The tokenizer is corrected in place. Same path, same mask, same everything
+    // the old checks looked at.
+    val v2 = writeTokenizer("cat")
+    v2 shouldEqual v1
+
+    val second = runWalker(git.getRepository, dstDir, db, v2, mask,
+      tokenizerIdentity = idV2, retokenizeExtensions = Set("rs"), memoDir = Some(memo))
+
+    // Two invocations, not three: the .rs files were re-tokenized and a.c was not.
+    // That ratio IS the requirement — a flag that re-tokenized a.c as well would
+    // cost the 88% this exists to avoid.
+    second.blobCommandExecutions shouldEqual 2L
+    second.blobsCacheHit shouldEqual 1
+
+    val dst = openBare(dstDir)
+    try {
+      // The assertion the whole task turns on: the corrected tokenizer's output,
+      // not the cached wrong one.
+      fileAtHead(dst, "master", "b.rs") shouldBe Some("fn b() {}\n")
+      fileAtHead(dst, "master", "c.rs") shouldBe Some("fn c() {}\n")
+      fileAtHead(dst, "master", "a.c")  shouldBe Some("INT A;\n")
+      fileAtHead(dst, "master", "README.md") shouldBe Some("leave-me-alone\n")
+    } finally dst.close()
+
+    // The memo, the second cache layer. Without purging it the walker would have
+    // re-run the command and tokenBySha.pl would have answered from sha1(contents)
+    // — the same stale tokens, through a different door.
+    Files.exists(memoEntries("fn b() {}\n")) shouldBe false
+    Files.exists(memoEntries("fn c() {}\n")) shouldBe false
+    Files.exists(memoEntries("int a;\n")) shouldBe true
   }
 
   private def deleteRecursive(p: Path): Unit = {

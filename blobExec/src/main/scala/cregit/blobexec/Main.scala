@@ -48,6 +48,19 @@ object Main {
     * the next free one. `parserCrashStatusIsUnique` in MainOptionsSpec pins that. */
   private[blobexec] val ParserCrashedExitStatus = 6
 
+  /** Exit status when `--retokenize` was asked for and would have invalidated
+    * nothing.
+    *
+    * Its own status, and not 3, because it is a different kind of answer. 3 means
+    * "this memo does not match this run, so the run did not start". This means
+    * "the run could have started, and the invalidation you asked for was a no-op".
+    * An operator scripting a corpus-wide re-tokenization needs to tell those
+    * apart: the first is a refusal to proceed, the second is a request that did
+    * nothing, and treating the second as success is how a poisoned cache gets
+    * published. 7 is the next free status after 1, 2, 3, 4, 5, 6;
+    * `retokenizeStatusIsUnique` in MainOptionsSpec pins that. */
+  private[blobexec] val RetokenizeIneffectiveExitStatus = 7
+
   /** The process exit status for a finished walk.
     *
     * A function, and taking the whole [[WalkStats]], so that "which counters gate
@@ -125,7 +138,7 @@ object Main {
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
@@ -162,6 +175,65 @@ object Main {
       |                    This is a step-2 resume that KEEPS the work directory,
       |                    never a fresh run — a fresh run deletes dst.git, and
       |                    check 2 then refuses.
+      |  --tokenizer-identity=<ext>=<value>[,<ext>=<value>...]
+      |                    which tokenizer produced the tokens for each file
+      |                    extension, as an opaque value per extension (a digest
+      |                    of the parser toolchain; tokenize/tokenizerIdentity.pl
+      |                    computes it). Recorded in the blob map's meta table on
+      |                    first sight and COMPARED on every later run.
+      |
+      |                    This closes a hole that <command> could not. <command>
+      |                    is the constant path tokenizeByBlobId/tokenBySha.pl, so
+      |                    when a tokenizer behind it is corrected, nothing the
+      |                    reuse decision looks at changes: every cached row for
+      |                    that language stays a cache hit and the run reproduces
+      |                    the OLD tokenizer's output with no error anywhere. That
+      |                    happened — a rustTokenizer binary 16 days older than
+      |                    its source kept emitting a `line:col<TAB>` prefix, and
+      |                    741,869 .rs entries in 45 projects carried it.
+      |
+      |                    A mismatch REFUSES the run (status 3) and names the
+      |                    flag to fix it. It never invalidates anything by
+      |                    itself, which is why comparing is safe as a default:
+      |                    the 186 published projects are not touched. An
+      |                    extension with nothing recorded is not a mismatch —
+      |                    that is what every blob map built before this flag
+      |                    looks like — so it is simply recorded.
+      |  --retokenize=<ext>[,<ext>...]
+      |                    the opt-in past that refusal: invalidate the cached
+      |                    tokenizations of these extensions and nothing else.
+      |                    Requires --tokenizer-identity and --memo-dir, and a
+      |                    step-2 resume (the ids live in <dst.git>).
+      |
+      |                    SELECTIVE on purpose. Re-tokenizing is 88% of total
+      |                    pipeline time, so a defect in one language's tokenizer
+      |                    must cost one language's entries. Deliberately NOT
+      |                    --drop-memo, which destroys 2.6 M memoized
+      |                    tokenizations wholesale, and deliberately not
+      |                    --mask-widened, which answers a different question.
+      |
+      |                    BOTH cache layers go, together, and neither can be
+      |                    done without the other:
+      |                      - blob_map's tokenized rows on those extensions, and
+      |                      - their entries in the memo under --memo-dir. The
+      |                        memo is keyed on sha1(contents) ALONE
+      |                        (tokenBySha.pl:76) with no tokenizer in the key, so
+      |                        dropping only the blob_map row just moves the stale
+      |                        answer one layer down.
+      |                    tree_map, commit_map and ref_map go too: a tree names
+      |                    its blobs, and a retained tree_map row short-circuits
+      |                    the re-walk of the subtree holding the file.
+      |
+      |                    IT CANNOT QUIETLY DO NOTHING. It refuses, before
+      |                    changing anything, when: another extension's tokenizer
+      |                    also changed and was not named; no tokenized row
+      |                    carries any named extension (status ${RetokenizeIneffectiveExitStatus}); the memo held
+      |                    none of the affected blobs (status ${RetokenizeIneffectiveExitStatus}, and that
+      |                    means the --memo-dir is not this project's); or a
+      |                    RETAINED new_blob id does not resolve in <dst.git>.
+      |  --memo-dir=<dir>  the memo directory ($$BFG_MEMO_DIR) whose entries
+      |                    --retokenize must purge. Only read with --retokenize;
+      |                    passing it alone is an error rather than a no-op.
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
@@ -196,9 +268,12 @@ object Main {
       |  unexplained timeout does.
       |
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
-      |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
+      |               3 = memo meta mismatch (including a changed tokenizer with
+      |               no --retokenize), ${TimedOutExitStatus} = completed
       |               but some blob timed out (output incomplete, re-run to
-      |               retry), ${Walker.StalledExitStatus} = killed by the stall watchdog.
+      |               retry), ${Walker.StalledExitStatus} = killed by the stall watchdog,
+      |               ${ParserCrashedExitStatus} = a tokenizer reported a parser crash,
+      |               ${RetokenizeIneffectiveExitStatus} = --retokenize would have invalidated nothing.
       |  --pipeline        use the look-ahead pipelined walker (producer runs
       |                    ahead so the blob-command pool stays saturated);
       |                    output is identical to the default serial walker
@@ -240,11 +315,38 @@ object Main {
     var stallTimeoutSeconds = Walker.DefaultStallTimeoutSeconds
     var stallExplicit = false
     var maskWidened = false
+    var tokenizerIdentity = TokenizerIdentity.empty
+    var retokenizeExtensions: Set[String] = Set.empty
+    var memoDir: Option[java.nio.file.Path] = None
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
       case "--pipeline"       => pipeline = true
       case "--pipeline-trees" => pipelineTrees = true
       case "--mask-widened"   => maskWidened = true
+      case t if t.startsWith("--tokenizer-identity=") =>
+        TokenizerIdentity.parse(t.stripPrefix("--tokenizer-identity=")) match {
+          case Right(id) => tokenizerIdentity = id
+          case Left(why) =>
+            System.err.println(s"Error: --tokenizer-identity: $why")
+            sys.exit(1)
+        }
+      case t if t.startsWith("--retokenize=") =>
+        TokenizerIdentity.parseExtensions(t.stripPrefix("--retokenize=")) match {
+          case Right(exts) => retokenizeExtensions = exts
+          case Left(why) =>
+            System.err.println(s"Error: --retokenize: $why")
+            sys.exit(1)
+        }
+      case t if t.startsWith("--memo-dir=") =>
+        val p = Paths.get(t.stripPrefix("--memo-dir="))
+        if (!Files.isDirectory(p)) {
+          System.err.println(
+            s"Error: --memo-dir [$p] is not a directory. It must be the SAME memo this project's " +
+              "tokenizations were written into, or the invalidation would leave the real memo's " +
+              "stale entries in place.")
+          sys.exit(1)
+        }
+        memoDir = Some(p)
       case s if s.startsWith("--shard=") =>
         val spec = s.stripPrefix("--shard=")
         spec.split("/", -1) match {
@@ -321,6 +423,56 @@ object Main {
       sys.exit(1)
     }
 
+    // Every way --retokenize could end up doing nothing, refused before the walk.
+    // A flag whose whole purpose is to force work must never be able to run and
+    // force none.
+    if (retokenizeExtensions.nonEmpty) {
+      if (tokenizerIdentity.isEmpty) {
+        System.err.println(
+          "Error: --retokenize needs --tokenizer-identity. Invalidating the entries without " +
+            "recording which tokenizer replaces them leaves nothing for the next run to detect a " +
+            "change against, so the next tokenizer defect would be just as silent as this one.")
+        System.err.println(Usage)
+        sys.exit(1)
+      }
+      if (memoDir.isEmpty) {
+        System.err.println(
+          "Error: --retokenize needs --memo-dir. There are two caches, not one: dropping a blob_map " +
+            "row makes the walker re-run <command>, and <command> is tokenizeByBlobId/tokenBySha.pl, " +
+            "which answers from $BFG_MEMO_DIR keyed on sha1(contents) with no tokenizer in the key. " +
+            "Invalidating one layer without the other invalidates nothing at all.")
+        System.err.println(Usage)
+        sys.exit(1)
+      }
+      val unknown = retokenizeExtensions -- tokenizerIdentity.extensions
+      if (unknown.nonEmpty) {
+        System.err.println(
+          s"Error: --retokenize names extension(s) --tokenizer-identity does not cover: " +
+            s"${unknown.toVector.sorted.mkString(", ")}. Known: " +
+            s"${tokenizerIdentity.extensions.toVector.sorted.mkString(", ")}.")
+        sys.exit(1)
+      }
+      if (maskWidened) {
+        System.err.println(
+          "Error: --mask-widened and --retokenize cannot be combined. Each verifies its own " +
+            "precondition against the rows, and together each would verify against a state the " +
+            "other is about to change. Widen first, then resume with --retokenize.")
+        sys.exit(1)
+      }
+      if (shard.isDefined) {
+        System.err.println(
+          "Error: --retokenize has nothing to do under --shard: each shard builds a fresh dst.git " +
+            "and blobmap.db, so there are no cached tokenizations to invalidate. Retokenize the " +
+            "merged result, or drop the shards' --warm=<db>.")
+        sys.exit(1)
+      }
+    } else if (memoDir.isDefined) {
+      System.err.println(
+        "Error: --memo-dir has no effect without --retokenize. Nothing else in blobExec reads the " +
+          "memo — tokenizeByBlobId/tokenBySha.pl takes it from $BFG_MEMO_DIR in the environment.")
+      sys.exit(1)
+    }
+
     if (shard.isDefined && (pipeline || pipelineTrees)) {
       System.err.println("Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
       System.err.println(Usage)
@@ -374,7 +526,10 @@ object Main {
         s"abortOnError=$abortOnError pipeline=$pipeline pipelineTrees=$pipelineTrees " +
         s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s " +
         s"stallTimeout=${stallTimeoutSeconds}s incremental=$incremental " +
-        s"maskWidened=$maskWidened denylistEntries=${denylist.size}"
+        s"maskWidened=$maskWidened denylistEntries=${denylist.size} " +
+        s"tokenizerIdentity=${if (tokenizerIdentity.isEmpty) "none" else tokenizerIdentity.render} " +
+        s"retokenize=${if (retokenizeExtensions.isEmpty) "none" else retokenizeExtensions.toVector.sorted.mkString(",")} " +
+        s"memoDir=${memoDir.map(_.toString).getOrElse("none")}"
     )
 
     val src: FileRepository = openSrc(srcPath)
@@ -395,7 +550,32 @@ object Main {
         report = msg => println(s"blobExec: $msg")
       ))
 
-    val mapping = try Mapping.open(dbPath, command, mask, warmPath, widening) catch {
+    // The invalidation, wired to the two things only this layer can supply: the
+    // dst reachability probe, and a memo purge that reads the original blobs out
+    // of src to recompute their content sha1 — the memo's only key
+    // (tokenizeByBlobId/tokenBySha.pl:76).
+    val retokenize =
+      if (retokenizeExtensions.isEmpty) None
+      else Some(Mapping.Retokenize(
+        extensions = retokenizeExtensions,
+        newBlobResolves = id => {
+          val reader = dst.newObjectReader()
+          try reader.has(org.eclipse.jgit.lib.ObjectId.fromString(id))
+          catch { case _: IllegalArgumentException => false }
+          finally reader.close()
+        },
+        purgeMemo = blobs => TokenizerMemo.purge(memoDir.get, blobs, sha => {
+          val reader = src.newObjectReader()
+          try Some(reader.open(org.eclipse.jgit.lib.ObjectId.fromString(sha),
+            org.eclipse.jgit.lib.Constants.OBJ_BLOB).getBytes)
+          catch { case _: Exception => None }
+          finally reader.close()
+        }),
+        report = msg => println(s"blobExec: $msg")
+      ))
+
+    val mapping = try Mapping.open(dbPath, command, mask, warmPath, widening,
+                                   tokenizerIdentity, retokenize) catch {
       case m: Mapping.MetaMismatchException =>
         System.err.println(s"Error: ${m.getMessage}")
         if (!maskWidened && m.getMessage.contains("mask"))
@@ -415,6 +595,23 @@ object Main {
         System.err.println(s"Error: ${d.getMessage}")
         src.close(); dst.close()
         sys.exit(3)
+      case t: Mapping.TokenizerChangedException =>
+        System.err.println(s"Error: ${t.getMessage}")
+        src.close(); dst.close()
+        sys.exit(3)
+      case n: Mapping.NothingInvalidatedException =>
+        // Deliberately NOT 0. The walk could have run; the invalidation asked for
+        // could not. Exiting 0 here would let a corpus script publish a project
+        // whose poisoned entries were never touched.
+        System.err.println(s"Error: ${n.getMessage}")
+        src.close(); dst.close()
+        sys.exit(RetokenizeIneffectiveExitStatus)
+      case i: IllegalArgumentException =>
+        // Mapping.open's own preconditions on the flag combinations, re-checked
+        // there so a library caller cannot bypass what main() validates.
+        System.err.println(s"Error: ${i.getMessage}")
+        src.close(); dst.close()
+        sys.exit(1)
     }
 
     // (stats, timeouts this memo has ever seen). The cumulative figure is kept
