@@ -371,16 +371,9 @@ def parse_memory_limit(text):
     return cleaned
 
 
-# The 29 per-project constants, in dataset order. This list mirrors META_FIELDS
-# in cregit-token-pipeline/project_meta.py, which writes the sidecar, and
-# EXPECTED_COLUMNS in cregit-token-pipeline/validate_schema.py, which gates the
-# corpus. All three must carry the same names in the same order; the pipeline
-# repo has a test (tests/test_meta_field_drift.py) that reads this tuple out of
-# this file and fails if it drifts, because the two copies live in different
-# repositories and nothing else keeps them in step.
-#
-# The sidecar is written with sort_keys=True, so it is alphabetical. Iterate this
-# tuple, never the JSON, or the columns come out in the wrong order.
+# Dataset column order. Mirrors META_FIELDS in cregit-token-pipeline/project_meta.py
+# and EXPECTED_COLUMNS in its validate_schema.py; tests/test_meta_field_drift.py
+# reads this tuple. The sidecar is alphabetical, so iterate this, never the JSON.
 PROJECT_META_FIELDS = (
     "clone_url", "provenance_status",
     "source", "stratum", "fact", "contested", "label_date",
@@ -530,8 +523,7 @@ def main():
     if not args.repo_name:
         args.repo_name = output_path.stem.replace("-dataset", "")
 
-    # Resolve the sidecar before Phase 1, for the same reason as the two caps
-    # above: a missing key must not surface after half an hour of inserts.
+    # Resolve before Phase 1: a bad key must not surface after the inserts.
     project_meta = load_project_meta(
         args.project_meta, args.project_key or args.repo_name)
 

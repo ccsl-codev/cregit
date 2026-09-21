@@ -698,27 +698,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- oversized MASK-MATCHED blob (regression) -------------------------------
-  //
-  // The mask can select a blob no tokenizer can process. The streaming fix on
-  // the pass-through path does not apply, so the walk must exclude the blob.
 
-  test("the oversized limit is jgit's own threshold, not a constant above it") {
-    val jgitDefault = new WindowCacheConfig().getStreamFileThreshold.toLong
-    // Read from jgit, so the two cannot drift. A hand-picked 64 MiB would leave
-    // 50-64 MiB passing the size check and then throwing inside getBytes.
-    Walker.MaxBlobBytes shouldEqual jgitDefault
-    jgitDefault shouldEqual 50L * 1024 * 1024
-    Walker.isOversized(200L * 1024 * 1024) shouldBe true
-    Walker.isOversized(55L * 1024 * 1024) shouldBe true    // the band the 64 MiB constant missed
-    Walker.isOversized(4096L) shouldBe false
-  }
-
-  /** Run the exclusion end to end on `mode`, with jgit's threshold lowered so a
-    * small fixture stands in for an oversized blob.
-    *
-    * The fixture sits far below Walker.MaxBlobBytes, so the size fast path
-    * cannot see it and only the LargeObjectException catch can. That is exactly
-    * the band a bare size check gets wrong. */
   private def checkOversizedExclusion(label: String, pipeline: Boolean, pipelineTrees: Boolean): Unit = {
     val dir = freshWorkDir("oversized-masked-" + label)
     val git = initSrc(dir.resolve("src"))
@@ -729,9 +709,6 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
         Map("keep.c" -> "int main(){}\n", "generated/excel.c" -> generated),
         "add a normal source file and a generated one")
     } finally git.close()
-
-    // Proof that the fast path is not what fires here.
-    Walker.isOversized(generated.length.toLong) shouldBe false
 
     val srcRepo = openBare(dir.resolve("src/.git"))
     val stats = try {

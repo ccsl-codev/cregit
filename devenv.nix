@@ -91,11 +91,7 @@ in
 
     perlEnv
 
-    # pytest belongs here, not on a PYTHONPATH bridge. The only other pytest on
-    # this box is under system python 3.9, whose duckdb build will not load, and
-    # pointing PYTHONPATH at it also replaces the one devenv sets, so duckdb
-    # disappears. Without pytest here, generate_dataset's duckdb tests skip
-    # silently and the Parquet column contract goes untested.
+    # pytest must come from this python: the system one's duckdb will not load.
     (pkgs.python3.withPackages (ps: [ ps.duckdb ps.pytest ]))
   ];
 
