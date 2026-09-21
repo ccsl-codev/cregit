@@ -52,16 +52,19 @@ object Main {
       blobTimeoutSeconds: Int,
       stallTimeoutSeconds: Int,
       stallExplicit: Boolean
-  ): Either[String, Int] =
-    if (stallTimeoutSeconds > blobTimeoutSeconds) Right(stallTimeoutSeconds)
+  ): Either[String, Int] = {
+    val floor = Walker.stallFloorFor(blobTimeoutSeconds)
+    if (stallTimeoutSeconds >= floor) Right(stallTimeoutSeconds)
     else if (stallExplicit)
       Left(
-        s"--stall-timeout=$stallTimeoutSeconds must be greater than --blob-timeout=$blobTimeoutSeconds. " +
-          "A blob completing or being killed is the only progress a pure-blob commit makes, so an " +
-          "equal or smaller stall window kills runs whose blobs are merely slow. Try " +
+        s"--stall-timeout=$stallTimeoutSeconds must be at least ${floor}s to go with " +
+          s"--blob-timeout=$blobTimeoutSeconds. A blob completing or being killed is the only " +
+          "progress a pure-blob commit makes, and killing one takes the budget plus the kill " +
+          "grace, so a smaller stall window kills runs whose blobs are merely slow. Try " +
           s"--stall-timeout=${Walker.stallTimeoutFor(blobTimeoutSeconds)} with --blob-timeout=$blobTimeoutSeconds."
       )
     else Right(Walker.stallTimeoutFor(blobTimeoutSeconds))
+  }
 
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.

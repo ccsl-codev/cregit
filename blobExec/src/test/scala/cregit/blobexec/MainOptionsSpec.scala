@@ -49,10 +49,36 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
 
   // -- the two timeouts are coupled -------------------------------------------
 
-  test("a window larger than the budget is accepted unchanged") {
+  test("a window at or above the floor is accepted unchanged") {
     Main.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
     Main.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
-    Main.resolveStallTimeout(600, 601, stallExplicit = true) shouldEqual Right(601)
+    Main.resolveStallTimeout(600, Walker.stallFloorFor(600), stallExplicit = true) shouldEqual
+      Right(Walker.stallFloorFor(600))
+  }
+
+  test("the floor is the child's whole lifetime, not just the budget") {
+    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
+    Main.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
+    Main.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
+  }
+
+  test("a refusal names the floor it wants, and the suggestion clears it") {
+    val why = Main.resolveStallTimeout(600, 601, stallExplicit = true).swap.getOrElse("")
+    why should include(Walker.stallFloorFor(600).toString)
+    val suggested = Walker.stallTimeoutFor(600)
+    Main.resolveStallTimeout(600, suggested, stallExplicit = true) shouldEqual Right(suggested)
+  }
+
+  test("a small budget is widened past the fixed kill overhead, not just tripled") {
+    Main.resolveStallTimeout(5, 3, stallExplicit = false)
+      .getOrElse(0) should be >= Walker.stallFloorFor(5)
+    Main.resolveStallTimeout(1, 1, stallExplicit = false)
+      .getOrElse(0) should be >= Walker.stallFloorFor(1)
+  }
+
+  test("the floor cannot overflow into a guard that always passes") {
+    Walker.stallFloorFor(Int.MaxValue) should be > 0
+    ChildRunner.maxLifetimeSeconds(Int.MaxValue) should be > 0
   }
 
   test("the defaults satisfy the relationship") {
