@@ -18,11 +18,9 @@ import java.nio.file.{Files, Path}
  * reports it and refuses to publish, but simply running again retries the blob
  * with no surgery on the mapping database.
  *
- * Three durable writes each independently hide such a blob from the next run —
- * its own `blob_map` row, any `tree_map` row above it (a tree hit short-circuits
- * the whole subtree), and its commit's `commit_map` row — so all three are
- * asserted absent here. The blobs that tokenized correctly in the same commit
- * are content-addressed and must survive, or every retry would redo the commit.
+ * Three writes would each hide such a blob from the next run: its `blob_map` row,
+ * any `tree_map` row above it, and its commit's `commit_map` row. All three are
+ * asserted absent, and the commit's successful tokenizations asserted present.
  */
 class TimeoutRetrySpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
@@ -81,9 +79,7 @@ class TimeoutRetrySpec extends AnyFunSuite with Matchers with BeforeAndAfterAll 
     try body(m) finally m.close()
   }
 
-  // All three walkers persist a commit in their own way, so all three have to
-  // suppress the same three rows. `--shard` shares resolveMisses with the serial
-  // walker and writes no commit rows at all.
+  // Each walker persists a commit its own way, so each must suppress all three.
   for (mode <- Seq("serial", "pipeline", "pipeline-trees"))
   test(s"[$mode] a timed-out blob is retried by simply running again, and good work is kept") {
     val dir = Files.createTempDirectory(workRoot, "fixture-")

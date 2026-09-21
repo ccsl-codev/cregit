@@ -240,9 +240,8 @@ object Main {
         sys.exit(3)
     }
 
-    // (stats, timeouts this memo has ever seen). The cumulative figure is kept
-    // for forensics only — it must NOT gate the exit status, or a blob that
-    // times out once could never be retried to a clean run.
+    // The cumulative figure is forensic only: gating on it would make one past
+    // timeout permanent.
     val (stats, timedOutEver) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
       val walker = new Walker(
@@ -293,10 +292,7 @@ object Main {
       )
     }
 
-    // Always exit explicitly. A timed-out blob abandons its (daemon) reader
-    // threads while they are blocked on a pipe, and on the pre-fix build the
-    // JVM outlived the finished walk on exactly those threads — a silent stall
-    // behind a done-line that read `aborted=false`.
+    // Exit explicitly: abandoned daemon readers must not decide JVM exit.
     sys.exit(
       if (stats.aborted) 2
       else if (stats.blobsTimedOut > 0) TimedOutExitStatus

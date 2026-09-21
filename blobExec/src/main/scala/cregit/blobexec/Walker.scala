@@ -71,11 +71,9 @@ final class Walker(
 
   // -- stall watchdog ------------------------------------------------------
   //
-  // The consumer's `Await.result` calls are unbounded on purpose: a duration
-  // budget cannot tell a wedged run from an honestly large one, and a
-  // first-import commit alone can justify weeks. The watchdog asserts completed
-  // work instead, which is safe because `ChildRunner` bounds every child at
-  // `blobTimeoutSeconds`.
+  // `Await.result` is unbounded on purpose: a duration budget cannot tell a wedged
+  // run from an honestly large one. The watchdog asserts completed work instead,
+  // which is safe because ChildRunner bounds every child.
 
   private val lastProgressNanos = new AtomicLong(System.nanoTime())
   private val lastProgressWhat  = new AtomicReference[String]("startup")
@@ -125,9 +123,8 @@ final class Walker(
   }
 
   /** Run `body` under the stall watchdog. The watchdog is a daemon so it can
-    * never keep the JVM alive, and it halts rather than exiting: a stalled run
-    * may well have a shutdown hook that would block on the same wedged thread,
-    * and an exit path that can hang is not a fix for a hang. */
+    * never keep the JVM alive, and it halts rather than exits: a shutdown hook
+    * could block on the same wedged thread. */
   private def withStallWatchdog[A](body: => A): A = {
     val done = new AtomicBoolean(false)
     val tick = math.max(1L, math.min(30L, math.max(1, stallTimeoutSeconds).toLong / 4L))
@@ -135,10 +132,7 @@ final class Walker(
       () => {
         var interrupted = false
         while (!done.get() && !interrupted) {
-          // Leave the loop on an interrupt instead of re-arming the flag: a set
-          // flag makes the next `sleep` throw at once, which turns the wait into
-          // a spin on a core for the rest of the walk. The only interrupt this
-          // thread ever gets is the one below, after `done` is already true.
+          // Exit on interrupt: a set flag makes every later sleep throw at once.
           try Thread.sleep(tick * 1000L)
           catch { case _: InterruptedException => interrupted = true }
           if (!done.get() && !interrupted) stalled().foreach { stalledNanos =>
@@ -304,8 +298,6 @@ final class Walker(
         if (misses.abort) {
           aborted = true
         } else if (misses.timedOutKeys.nonEmpty) {
-          // Same rule as the full walk: no tree rows for a commit that carries
-          // raw source, so the next shard run retries the blob.
           timedOut = true
           persistRetryableBlobs(misses, rc.getId.name)
         } else {
@@ -345,16 +337,12 @@ final class Walker(
 
   /** Persist only what a commit containing a timed-out blob may leave behind.
     *
-    * Three durable writes each independently hide a timeout from the next run:
-    * the blob's own `blob_map` row (a `getBlob` hit), any `tree_map` row on the
-    * path above it (a `getTree` hit short-circuits the *entire* subtree, so the
-    * re-run never reaches the blob), and the commit's `commit_map` row (which
-    * marks the commit done and is what `markUninteresting` walks). All three are
-    * suppressed. The blobs that tokenized correctly are content-addressed and
-    * already in dst, so they are kept — otherwise every retry would re-tokenize
-    * a whole commit to get at one blob. Identity rows for unmasked blobs are
-    * *not* kept: their bytes are copied during tree assembly, which we skip
-    * here, and a row without the bytes would leave dst inconsistent.
+    * Three writes would each hide the retry: the blob's `blob_map` row, any
+    * `tree_map` row above it (a tree hit short-circuits the whole subtree), and
+    * the commit's `commit_map` row. All three are suppressed. Successful
+    * tokenizations are kept, because they are content-addressed and already in
+    * dst; identity rows are not, because their bytes are copied during the tree
+    * assembly this path skips.
     */
   private def persistRetryableBlobs(misses: MissResolution, origCommitSha: String): Unit = {
     val keep = misses.persistable
@@ -380,8 +368,7 @@ final class Walker(
   private def markUninteresting(revWalk: RevWalk): Unit = {
     mapping.allCommitOrigShas.foreach { sha =>
       val id = ObjectId.fromString(sha)
-      // Scanning a large memo's frontier happens before any blob runs, and on a
-      // long history it is not fast; it must not look like a stall.
+      // The frontier scan is slow but healthy; stamp it.
       progress(s"frontier $sha")
       try {
         val rc = revWalk.parseCommit(id)
@@ -445,11 +432,8 @@ final class Walker(
         if (misses.abort) {
           aborted = true
         } else if (misses.timedOutKeys.nonEmpty) {
-          // Retryable failure: keep the tokenizations that succeeded (they are
-          // content-addressed and already in dst), but persist no tree and no
-          // commit for this one. Recording any of those three would make the
-          // next run skip straight past the raw-source substitution. Stop here
-          // so no descendant commit is folded onto a parent we did not record.
+          // Keep the successful tokenizations; persist no tree and no commit, and
+          // stop, so no descendant is folded onto a parent we did not record.
           timedOut = true
           persistRetryableBlobs(misses, origCommitSha)
         } else {
@@ -527,9 +511,7 @@ final class Walker(
     val inFlight = new ConcurrentHashMap[(String, String), Future[BlobResult]]()
 
     val aborted       = new AtomicBoolean(false)
-    // Set when a commit contained a timed-out blob: like `aborted` it stops the
-    // producer and makes the consumer drain, but it is not an abort — the run
-    // keeps everything it earned and simply stops folding here.
+    // Stops the producer and drains the consumer, without aborting the run.
     val timedOutStop  = new AtomicBoolean(false)
     val producerError = new AtomicReference[Throwable](null)
 

@@ -5,11 +5,8 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.jdk.CollectionConverters._
 
-/** One run of an external command under a wall-clock budget.
-  *
-  * Owns the child's environment, its pipes, its budget and its kill. Nothing
-  * here knows what the command is for.
-  */
+/** One run of an external command under a wall-clock budget. Owns the child's
+  * environment, its pipes, its budget and its kill. */
 final class ChildRunner(budgetSeconds: Int) {
 
   import ChildRunner._
@@ -39,10 +36,8 @@ final class ChildRunner(budgetSeconds: Int) {
 
     if (!exited) kill(child, s"no exit within ${budget}s")
     else if (!readers.await(DrainGraceSeconds.toLong, TimeUnit.SECONDS))
-      // The child is gone but something it left behind still holds a pipe, so
-      // its output is incomplete. Waiting for that writer is the hang this
-      // class exists to prevent, and `stdout` is not safe to read until the
-      // reader thread has stopped touching it.
+      // A surviving grandchild still holds a pipe, so the output is incomplete
+      // and the buffers are not safe to read.
       kill(child, s"output still open ${DrainGraceSeconds}s after exit")
     else Outcome.Exited(child.exitValue, stdout.toByteArray, stderr.toString)
   }
@@ -71,15 +66,13 @@ object ChildRunner {
 
   private val StdoutBufferBytes: Int = 1024
 
-  /** Longest one [[ChildRunner.run]] can take. This is the quiet period a
-    * healthy but slow blob creates, which the stall watchdog's window has to
-    * clear — see [[Walker.stallFloorFor]]. */
+  /** Longest one [[ChildRunner.run]] can take; see [[Walker.stallFloorFor]]. */
   private[blobexec] def maxLifetimeSeconds(budgetSeconds: Int): Int =
     math.max(1, budgetSeconds) + DrainGraceSeconds + KillSettleSeconds
 
   /** Kill the child and every process beneath it, and report how many were
-    * signalled. The tokenizer chain is `tokenBySha.pl` -> `sh` -> `srcml`, so
-    * signalling the direct child alone leaves grandchildren holding the pipes. */
+    * signalled. Signalling the direct child alone leaves grandchildren holding
+    * this JVM's pipes. */
   private[blobexec] def killTree(child: Process): Int = {
     val handle = child.toHandle
     // Snapshot before killing anything: a dead parent's children are reparented
@@ -87,22 +80,18 @@ object ChildRunner {
     val tree   = handle.descendants().iterator().asScala.toVector
     val parent = if (handle.destroyForcibly()) 1 else 0
     val known  = tree.count(_.destroyForcibly())
-    // A process forked between the snapshot and the kill is reachable only from
-    // its own parent.
     val late = tree.flatMap(_.descendants().iterator().asScala).count(_.destroyForcibly())
     parent + known + late
   }
 
   private def pump(name: String, body: () => Unit): Unit = {
     val t = new Thread(() => body(), s"blobexec-$name")
-    // Daemon: an abandoned reader must never keep the JVM alive.
-    t.setDaemon(true)
+    t.setDaemon(true)   // an abandoned reader must never keep the JVM alive
     t.start()
   }
 
   private def writeThenClose(out: OutputStream, bytes: Array[Byte]): Unit =
-    // A command that ignores its input, or dies early, breaks this pipe. That is
-    // the child's business, not a failure of the run.
+    // A command that ignores its input breaks this pipe; that is not a failure.
     try { out.write(bytes); out.flush() }
     catch { case _: java.io.IOException => () }
     finally closeQuietly(out)
