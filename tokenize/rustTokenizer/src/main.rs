@@ -21,7 +21,7 @@ static KEYWORDS: phf::Set<&'static str> = phf::phf_set! {
 };
 
 fn main() {
-    let (path, position) = parse_args();
+    let (path, emit_positions) = parse_args();
     let src = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -29,18 +29,15 @@ fn main() {
             exit(1);
         }
     };
-    tokenize_source(&src, position);
+    print_pipe_separated_tokens(&src, emit_positions);
 }
 
 fn parse_args() -> (String, bool) {
     let mut path: Option<String> = None;
-    // Positions are OFF unless asked for, exactly as tokenizeSrcMl.pl gates them. This
-    // flag used to be swallowed and positions emitted unconditionally; see
-    // tokenize_source for why that corrupted every downstream row.
-    let mut position = false;
+    let mut emit_positions = false;
     for arg in env::args().skip(1) {
         if arg == "--position" {
-            position = true;
+            emit_positions = true;
             continue;
         }
         if arg.starts_with("--language=") || arg == "--verbose" {
@@ -61,28 +58,19 @@ fn parse_args() -> (String, bool) {
         eprintln!("Usage: rust_tokenizer [--language=Rust] [--position] <source.rs>");
         exit(2);
     });
-    (path, position)
+    (path, emit_positions)
 }
 
-// Emits the cregit FINAL token format, defined by tokenizeSrcMl.pl: pipe-separated,
-// with a `line:col` prefix only under --position. The golden streams are
-// tests/t/expected/main.c.token and main.c.nopos.token.
-//
-// Not the TAB form in tokenize/srcMLtoken/tests/expected/*.token: that is
-// srcml2token's intermediate output, which tokenizeSrcMl.pl re-emits with `|`.
-// Consumers split on `|` with a non-greedy first group, so an extra leading field
-// shifts every later column.
-fn tokenize_source(src: &str, position: bool) {
-    // A line with no source position of its own: `-:-|` under --position, bare otherwise.
-    let marker = |body: &str| {
-        if position {
+fn print_pipe_separated_tokens(src: &str, emit_positions: bool) {
+    let print_positionless_line = |body: &str| {
+        if emit_positions {
             println!("-:-|{}", body);
         } else {
             println!("{}", body);
         }
     };
 
-    marker(&format!(
+    print_positionless_line(&format!(
         "begin_unit|revision:{};language:Rust;cregit-version:{}",
         REVISION, CREGIT_VERSION
     ));
@@ -96,7 +84,7 @@ fn tokenize_source(src: &str, position: bool) {
         let slice = &src[byte..end];
 
         if let Some(out) = classify(&tok.kind, slice) {
-            if position {
+            if emit_positions {
                 println!("{}:{}|{}", line, col, out);
             } else {
                 println!("{}", out);
@@ -115,9 +103,8 @@ fn tokenize_source(src: &str, position: bool) {
         byte = end;
     }
 
-    marker("end_unit");
-    // tokenizeSrcMl.pl prints a bare marker after every `end_*` token.
-    marker("");
+    print_positionless_line("end_unit");
+    print_positionless_line("");
 }
 
 // None skips output (whitespace / Eof); the caller still advances the cursor. Every

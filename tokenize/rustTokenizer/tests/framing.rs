@@ -33,31 +33,30 @@ fn rust_tokenize(args: &[&str]) -> String {
     String::from_utf8(out.stdout).expect("stdout is not utf-8")
 }
 
-// --- the contract ------------------------------------------------------------------
-
-/// Whether a stream carries a `line:col` / `-:-` position prefix on its lines.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     Bare,
     Positioned,
 }
 
-/// Check one token stream against the FINAL framing rules. Written against the
-/// format, not a tokenizer, so adding a tokenizer means calling this.
+/// A TAB is srcml2token's intermediate separator and must never reach a consumer.
+fn reject_intermediate_tab_separator(lines: &[&str]) -> Result<(), String> {
+    for (i, l) in lines.iter().enumerate() {
+        if l.contains('\t') {
+            return Err(format!("line {} contains a TAB: {:?}", i + 1, l));
+        }
+    }
+    Ok(())
+}
+
 fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
     let lines: Vec<&str> = stream.lines().collect();
     if lines.len() < 3 {
         return Err(format!("stream has only {} lines", lines.len()));
     }
 
-    // 1. A TAB is srcml2token's intermediate separator and must not reach a consumer.
-    for (i, l) in lines.iter().enumerate() {
-        if l.contains('\t') {
-            return Err(format!("line {} contains a TAB: {:?}", i + 1, l));
-        }
-    }
+    reject_intermediate_tab_separator(&lines)?;
 
-    // 2. The stream opens with the begin_unit record, carrying revision/language/version.
     let first = lines[0];
     let (prefix, body) = split_prefix(first, mode)?;
     if prefix != "-:-" && mode == &Mode::Positioned {
@@ -72,8 +71,6 @@ fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
         }
     }
 
-    // 3. The stream closes with `end_unit` followed by a bare end-of-unit marker line
-    //    (tokenizeSrcMl.pl prints one after every `end_*` token).
     let n = lines.len();
     let (end_prefix, end_body) = split_prefix(lines[n - 2], mode)?;
     if end_body != "end_unit" {
@@ -93,7 +90,6 @@ fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
         return Err(format!("end_unit prefix is {:?}, expected \"-:-\"", end_prefix));
     }
 
-    // 4. Every line obeys the mode's prefix rule, `|`-separated from the body.
     for (i, l) in lines.iter().enumerate() {
         if l.is_empty() || *l == "-:-|" {
             continue;
@@ -104,7 +100,6 @@ fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
         }
         match mode {
             Mode::Bare => {
-                // A bare stream must not lead with a position field.
                 if looks_like_position(b.split('|').next().unwrap_or("")) {
                     return Err(format!(
                         "line {} leads with a position field {:?} in a bare stream: {:?}",
@@ -124,8 +119,6 @@ fn check_framing(stream: &str, mode: &Mode) -> Result<(), String> {
     Ok(())
 }
 
-/// Split a line into (position-prefix, body) according to the mode. In Bare mode the
-/// prefix is empty and the whole line is the body.
 fn split_prefix<'a>(line: &'a str, mode: &Mode) -> Result<(&'a str, &'a str), String> {
     match mode {
         Mode::Bare => Ok(("", line)),
@@ -147,8 +140,6 @@ fn looks_like_position(s: &str) -> bool {
         None => false,
     }
 }
-
-// --- the tests ---------------------------------------------------------------------
 
 #[test]
 fn srcml_golden_streams_satisfy_the_contract() {
@@ -194,38 +185,32 @@ fn the_two_tokenizers_use_the_same_separator_and_markers() {
 
 #[test]
 fn the_contract_check_rejects_the_defect_it_was_written_for() {
-    // Negative control: the exact shapes rust_tokenizer emitted before the fix.
-    let old_bare = "-:-\tbegin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1\n\
+    let tab_separated_and_always_positioned = "-:-\tbegin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1\n\
                     1:1\tkeyword|fn\n\
                     -:-\tend_unit\n";
     assert!(
-        check_framing(old_bare, &Mode::Bare).is_err(),
+        check_framing(tab_separated_and_always_positioned, &Mode::Bare).is_err(),
         "the TAB-separated, unconditionally-positioned stream must be rejected"
     );
     assert!(
-        check_framing(old_bare, &Mode::Positioned).is_err(),
+        check_framing(tab_separated_and_always_positioned, &Mode::Positioned).is_err(),
         "the TAB-separated stream must be rejected in positioned mode too"
     );
-    // A pipe-separated stream that still leaks a position field into a bare stream is
-    // also wrong: it would put `1:1` in token_type instead of `keyword`.
-    let leaked = "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1\n\
+    let bare_stream_leaking_a_position = "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1\n\
                   1:1|keyword|fn\n\
                   end_unit\n\n";
     assert!(
-        check_framing(leaked, &Mode::Bare).is_err(),
+        check_framing(bare_stream_leaking_a_position, &Mode::Bare).is_err(),
         "a bare stream carrying position fields must be rejected"
     );
-    // And a stream that drops the trailing end-of-unit marker.
-    let no_marker = "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1\n\
+    let missing_end_of_unit_marker = "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1\n\
                      keyword|fn\n\
                      end_unit\n";
     assert!(
-        check_framing(no_marker, &Mode::Bare).is_err(),
+        check_framing(missing_end_of_unit_marker, &Mode::Bare).is_err(),
         "a stream with no end-of-unit marker line must be rejected"
     );
 }
-
-// --- exhaustiveness: every tokenizer the mask can route must be covered above -------
 
 /// Extract a Perl `our %NAME = ( 'k' => 'v', … );` block as key/value pairs.
 /// One pair per line only: a `map`/`qw` one-liner reads as an empty hash here.
@@ -250,10 +235,6 @@ fn perl_hash(src: &str, name: &str) -> Vec<(String, String)> {
 
 #[test]
 fn every_masked_language_routes_to_a_tokenizer_this_file_pins() {
-    // The mask in CregitLanguages.pm decides which tokenizers' output actually reaches
-    // the dataset. Each of those tokenizers needs a framing assertion above. If someone
-    // widens the mask (e.g. adds M4) this test fails until the framing is pinned too —
-    // which is the drift this whole file exists to prevent.
     let pm = read(LANGUAGES_PM);
     let masked: BTreeSet<String> = perl_hash(&pm, "MASKED_LANGUAGES")
         .into_iter()
@@ -262,7 +243,6 @@ fn every_masked_language_routes_to_a_tokenizer_this_file_pins() {
         .collect();
     let parsers: Vec<(String, String)> = perl_hash(&pm, "LANG_PARSER_REL");
 
-    // The tokenizers whose framing is asserted in this file.
     let pinned = [
         "tokenizeSrcMl.pl",
         "rustTokenizer/target/release/rust_tokenizer",
@@ -285,8 +265,6 @@ fn every_masked_language_routes_to_a_tokenizer_this_file_pins() {
         );
     }
 
-    // Guard the other direction too: the tokenizers known to use the INTERMEDIATE TAB
-    // framing must stay out of the mask until they are converted.
     for (lang, parser) in &parsers {
         if parser.contains("m4Tokenizer") || parser.contains("goTokenizer") {
             assert!(

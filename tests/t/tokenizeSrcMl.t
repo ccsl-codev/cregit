@@ -22,10 +22,6 @@ plan skip_all => "srcml2token not built (cd tokenize/srcMLtoken && make)"
 
 plan tests => 21;
 
-# Exit status tokenizeSrcMl.pl uses for "srcML died / this tokenization is
-# unusable". Must match $PARSER_CRASH_EXIT there and BlobExec.ParserCrashExitCode.
-my $PARSER_CRASH_EXIT = 33;
-
 my $workdir = tempdir(CLEANUP => 1);
 
 sub slurp {
@@ -35,6 +31,9 @@ sub slurp {
     my $content = <$fh>;
     return defined $content ? $content : '';
 }
+
+my ($PARSER_CRASH_EXIT) = slurp($script) =~ /\$PARSER_CRASH_EXIT\s*=\s*(\d+)/
+    or die "no \$PARSER_CRASH_EXIT in $script";
 
 sub run_tokenizer {
     my (@args) = @_;

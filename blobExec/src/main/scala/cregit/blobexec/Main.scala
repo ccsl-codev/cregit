@@ -37,8 +37,9 @@ object Main {
     * succeeded, but the output is incomplete and must not be validated. */
   private[blobexec] val TimedOutExitStatus = 4
 
-  /** srcML died on a signal, or produced no tokens. Distinct from
-    * [[TimedOutExitStatus]] because --blob-timeout does nothing for a segfault. */
+  /** Any tokenizer reported no usable tokenization: it exited
+    * [[BlobExec.ParserCrashExitCode]], or exited 0 with no output for a non-empty blob.
+    * Distinct from [[TimedOutExitStatus]] because more time does not help a crash. */
   private[blobexec] val ParserCrashedExitStatus = 6
 
   /** Upper bound on either timeout flag. A week is already far past any real
@@ -333,38 +334,15 @@ object Main {
     if (stats.blobsTimedOut > 0) {
       System.err.println(
         s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsTimedOut} blob(s) timed out this " +
-          s"run ($timedOutEver ever for this memo, see meta['$BlobsTimedOutMetaKey'] in $dbPath). " +
-          "Their files would carry raw source instead of tokens, so the walk stopped at that " +
-          "commit and recorded nothing for it: no blob row, no tree row, no commit row. " +
-          "Recovery is another blobExec run over this same memo: it " +
-          "retries exactly those blobs and needs no changes to the database. Driven from " +
-          "run_pipeline_process.sh, that means resuming at step 2 (trailing '2', or ctp.py " +
-          "--from-step 2) — a step-1 run deletes the work directory first, memo included. " +
-          "If the same blobs keep failing, check which kind of failure it is: a child killed on " +
-          s"its budget is slowness, and the knob is --blob-timeout (currently ${blobTimeoutSeconds}s; " +
-          "run_pipeline_process.sh --blob-timeout N, or CREGIT_BLOB_TIMEOUT=N in the environment). " +
-          "A child reporting status 137 was SIGKILLed, which on a memory-tight host usually means " +
-          "the kernel's OOM killer took it — more time will not help; give the run more memory or " +
-          "exclude that blob via the mask."
+          s"run ($timedOutEver ever for this memo). Resume at step 2 to retry exactly those " +
+          s"blobs, or raise --blob-timeout (currently ${blobTimeoutSeconds}s)."
       )
     }
 
     if (stats.blobsParserCrashed > 0) {
       System.err.println(
-        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsParserCrashed} blob(s) had their " +
-          "tokenizer report a parser crash this run. Each one is named on a 'reported a parser " +
-          "crash' line above, with the failing stage and signal. This is srcML dying on a signal " +
-          "(SIGSEGV or SIGABRT) on a C/C++ input, or returning no tokens at all; before this was " +
-          "detected such a blob became a silent 0-byte tokenization and the file simply vanished " +
-          "from the dataset with nothing counting it. Nothing was recorded for the containing " +
-          "commit: no blob row, no tree row, no commit row. " +
-          "Unlike a timeout this is deterministic, so re-running alone will NOT clear it and " +
-          "--blob-timeout is irrelevant — more time does not help a segfault. The two real " +
-          "remedies are: fix or upgrade srcML (1.1.0 faults in its C/C++ position tracking, and " +
-          "tokenizeSrcMl.pl cannot drop --position: it parses srcml2token's line:col prefix), or, once a " +
-          "specific blob is diagnosed, add it to the blob denylist with its reason and citation " +
-          s"(${BlobDenylist.ResourcePath}) so it is excluded deterministically and reported " +
-          "without blocking publication."
+        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsParserCrashed} blob(s) crashed " +
+          "their tokenizer; each is named above. Deterministic, so re-running will not clear it."
       )
     }
 
