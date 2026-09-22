@@ -228,6 +228,7 @@ fn the_contract_check_rejects_the_defect_it_was_written_for() {
 // --- exhaustiveness: every tokenizer the mask can route must be covered above -------
 
 /// Extract a Perl `our %NAME = ( 'k' => 'v', … );` block as key/value pairs.
+/// One pair per line only: a `map`/`qw` one-liner reads as an empty hash here.
 fn perl_hash(src: &str, name: &str) -> Vec<(String, String)> {
     let start = src
         .find(&format!("our %{} = (", name))
