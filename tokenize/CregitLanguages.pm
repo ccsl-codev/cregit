@@ -40,7 +40,12 @@ our %EXT_LANG = (
 );
 
 # M4 is missing on purpose: m4.py raises StopIteration on real autotools quoting.
-our %MASKED_LANGUAGES = map { $_ => 1 } qw(C C++ Java Rust);
+our %MASKED_LANGUAGES = (
+    'C'    => 1,
+    'C++'  => 1,
+    'Java' => 1,
+    'Rust' => 1,
+);
 
 our %LANG_PARSER_REL = (
     'C'    => 'tokenizeSrcMl.pl',
