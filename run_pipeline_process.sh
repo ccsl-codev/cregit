@@ -20,18 +20,9 @@ Target repository:
   --commit-url URL  base URL for the commit links in the generated HTML
                     (default: derived from --repo-url as <url minus .git>/commit/,
                     which is correct for GitHub/GitLab-style hosts)
-  --mask REGEX      regex selecting the files to tokenize; quote it.
-                    Default: the universal mask, every extension the tokenizer
-                    can parse (C, C++, Java, Rust), case-insensitively. It is
-                    derived from tokenize/CregitLanguages.pm rather than written
-                    out here; print it with `perl tokenize/fileMask.pl`.
-                    Note .am/.ac are routed to the m4 parser but are NOT in the
-                    default mask — m4Tokenizer/m4.py mis-lexes real autotools
-                    quoting; see %MASKED_LANGUAGES in CregitLanguages.pm.
-                    Changing the mask forces a full rebuild: blobExec records the
-                    mask in its blob map and refuses to resume against a
-                    different one, because the old tree_map entries would omit
-                    the newly selected files.
+  --mask REGEX      regex selecting the files to tokenize; quote it
+                    (default: `perl tokenize/fileMask.pl`, every extension
+                    cregit can parse). A different mask forces a full rebuild.
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
@@ -183,7 +174,6 @@ BUILD_ONLY=0
 REPO_GIT_URL=""
 REPO_NAME=""
 REPO_COMMIT_URL=""
-# Empty means "derive it from tokenize/fileMask.pl after parsing", so --mask wins.
 MASK=""
 WORK="../cregit-files"
 SKIP_HTML=0
