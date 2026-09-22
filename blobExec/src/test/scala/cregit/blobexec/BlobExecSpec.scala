@@ -259,6 +259,17 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     timeouts.get shouldEqual 1
   }
 
+  test("the crash status blobExec recognises is the one tokenizeSrcMl.pl exits with") {
+    // Two languages, one number. A comment saying "must match" does not run, and a
+    // drift is silent: the crash would fall through to the generic non-zero arm, never
+    // reach onParserCrash, and the run would exit 0 with an incomplete project.
+    val perl = new String(Files.readAllBytes(Paths.get("../tokenize/tokenizeSrcMl.pl")), UTF_8)
+    val declared = """\$PARSER_CRASH_EXIT\s*=\s*(\d+)""".r.findFirstMatchIn(perl)
+      .getOrElse(fail("no $PARSER_CRASH_EXIT in tokenize/tokenizeSrcMl.pl"))
+      .group(1).toInt
+    declared shouldEqual BlobExec.ParserCrashExitCode
+  }
+
   // tiny `inside` helper to keep the test bodies readable
   private def inside[T](v: T)(pf: PartialFunction[T, Unit]): Unit =
     if (pf.isDefinedAt(v)) pf(v) else fail(s"value did not match: $v")

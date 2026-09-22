@@ -324,44 +324,28 @@ write_resume_marker() {
 }
 
 tokenize_gate() {
-    local status=$1 stage=$2 marker detail summary remedy
+    local status=$1 stage=$2 marker summary
     [ "$status" -eq 0 ] && return 0
     case "$status" in
         "$TOKENIZE_TIMEOUT_STATUS")
             marker="TOKENIZE-TIMEOUTS"
-            detail="at least one blob timed out; see the blobsTimedOut count and the
-     'will retry on the next run' lines in this step's log. Nothing was recorded
-     for the containing commit."
-            summary="$stage left blobs untokenized (exit $status). Refusing to continue: the
-     dataset would carry raw source in place of tokens."
-            remedy="If the same blobs keep failing: $(timeout_knob)" ;;
+            summary="$stage left blobs untokenized, so the dataset would carry raw source.
+     $(timeout_knob)" ;;
         "$TOKENIZE_STALLED_STATUS")
             marker="TOKENIZE-STALLED"
-            detail="the stall watchdog fired. The STALLED line in this step's log names
-     the work that was in flight."
-            summary="$stage stalled and was killed by blobExec's watchdog (exit $status). The
-     memo in $WORK is durable, so resuming picks up where it stopped — but only
-     at step 2."
-            remedy="If one of the blobs in flight is pathological: $(timeout_knob)" ;;
+            summary="$stage stalled and the watchdog killed it.
+     $(timeout_knob)" ;;
         "$TOKENIZE_PARSER_CRASH_STATUS")
             marker="TOKENIZE-PARSER-CRASHES"
-            detail="at least one blob's tokenizer reported a parser crash (srcML died on a
-     signal, or produced no tokens). Nothing was recorded for the containing
-     commit, and re-running alone will NOT clear it: the crash is deterministic."
-            summary="$stage hit a parser crash (exit $status). Refusing to continue: before this
-     was detected, such a blob became a silent 0-byte tokenization and the file
-     vanished from the dataset with nothing counting it."
-            remedy="This is NOT slowness and --blob-timeout will not help. The remedies are a
-     fixed srcML, or a denylist entry for the diagnosed blob (see the 'reported a
-     parser crash' lines in this step's log for each one)." ;;
+            summary="$stage hit a parser crash: deterministic, so --blob-timeout will not help.
+     Fix srcML, or denylist the diagnosed blob." ;;
         *) die "$stage failed (exit $status)" ;;
     esac
 
-    write_resume_marker "$marker" "$stage" "$status" "$detail"
-    die_status "$status" "$summary
-     Marker written to ${WORK}/${marker}.
-     $(resume_instructions)
-     $remedy"
+    write_resume_marker "$marker" "$stage" "$status" "$summary"
+    die_status "$status" "$summary (exit $status)
+     Marker: ${WORK}/${marker}
+     $(resume_instructions)"
 }
 
 # need_val <flag> <value...>: refuse a value-taking flag with no value.
