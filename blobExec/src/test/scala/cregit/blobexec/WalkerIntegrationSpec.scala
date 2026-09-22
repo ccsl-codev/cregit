@@ -793,9 +793,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     } finally git.close()
 
     val denied = blobIdOf(hangs)
-    val denylist = BlobDenylist.parse(
-      Vector(s"${denied.name}\tsrcML/srcML#2361\tsrcML 1.1.0 does not terminate on it"),
-      "fixture")
+    val denylist = BlobDenylist(Map(denied.name ->
+      BlobDenylist.Entry("srcML/srcML#2361", "srcML 1.1.0 does not terminate on it")))
 
     // Every invocation of the tokenizer records the blob it was given. "Excluded in
     // milliseconds, never handed to the tokenizer" is only checkable from the

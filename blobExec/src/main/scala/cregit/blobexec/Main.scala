@@ -82,13 +82,13 @@ object Main {
       |                    needs setting: the window follows the budget, and a
       |                    window that one blob's lifetime could trip is refused.
       |
-      |  Blobs on the shipped denylist (${BlobDenylist.ResourcePath} inside this
-      |  jar) are never handed to <command>: they are dropped from the rewritten
-      |  trees, counted as blobsDenylisted, named with their reason and citation on
-      |  an EXCLUDED line, and they do NOT change the exit status. srcML 1.1.0 does
-      |  not terminate on the four listed blobs, the defect is diagnosed and cited
-      |  upstream, and a diagnosed exclusion must not block publication the way an
-      |  unexplained timeout does.
+      |  Blobs on the shipped denylist (${BlobDenylist.EntriesSource}) are never
+      |  handed to <command>: they are dropped from the rewritten trees, counted as
+      |  blobsDenylisted, named with their reason and citation on an EXCLUDED line,
+      |  and they do NOT change the exit status. srcML 1.1.0 does not terminate on
+      |  the listed blobs, the defect is diagnosed and cited upstream, and a
+      |  diagnosed exclusion must not block publication the way an unexplained
+      |  timeout does.
       |
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
@@ -237,14 +237,7 @@ object Main {
     val dbParent = dbPath.getParent
     if (dbParent != null && !Files.isDirectory(dbParent)) Files.createDirectories(dbParent)
 
-    // Eagerly, so a jar built without the resource fails now, not mid-walk.
-    val denylist =
-      try BlobDenylist.shipped
-      catch {
-        case e: Exception =>
-          System.err.println(s"Error: cannot read the blob denylist: ${e.getMessage}")
-          sys.exit(1)
-      }
+    val denylist = BlobDenylist.shipped
 
     val incremental = Files.isDirectory(dstPath)
     val shardStr = shard.map { case (k, n) => s"$k/$n" }.getOrElse("none")
@@ -313,7 +306,7 @@ object Main {
       // Reported, never fatal.
       System.err.println(
         s"blobExec: ${stats.blobsDenylisted} blob(s) were excluded by the blob denylist " +
-          s"(${BlobDenylist.ResourcePath} in this jar, ${denylist.size} entr" +
+          s"(${BlobDenylist.EntriesSource}, ${denylist.size} entr" +
           s"${if (denylist.size == 1) "y" else "ies"}). Each one is named with its sha, path, " +
           "reason and upstream citation on an 'EXCLUDED denylisted blob' line above; those " +
           "lines and that file are the record of what this project's dataset does not contain. " +

@@ -1068,7 +1068,7 @@ final class Walker(
       System.err.println(
         s"blobExec: EXCLUDED denylisted blob: sha=${task.origId.name} " +
           s"path=${task.fullPath} reason=${entry.reason} citation=${entry.citation}. " +
-          s"See ${BlobDenylist.ResourcePath} in the blobExec jar. Reported, never fatal."
+          s"See ${BlobDenylist.EntriesSource}. Reported, never fatal."
       )
     }
   }

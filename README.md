@@ -174,7 +174,7 @@ names neither repository nor extension). The runner refuses a step-1 wipe that
 would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 
 Four blobs in one corpus project are on a **blob denylist**
-(`blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv`): srcML 1.1.0 does
+(`blobExec/src/main/scala/cregit/blobexec/BlobDenylistEntries.scala`): srcML 1.1.0 does
 not terminate on them (upstream srcML/srcML#2361, open). They are never handed to
 the tokenizer, are dropped from the rewritten trees rather than kept as raw
 source, are counted as `blobsDenylisted` and named with a reason and a citation —
