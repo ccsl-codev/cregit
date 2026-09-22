@@ -6,7 +6,9 @@ use Test::More;
 use FindBin;
 use File::Temp qw(tempdir);
 
-my $script = "$FindBin::Bin/../text/simpleTokenizer.pl";
+my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
+
+my $script = "$root/tokenize/text/simpleTokenizer.pl";
 my $workdir = tempdir(CLEANUP => 1);
 
 sub slurp {

@@ -6,9 +6,11 @@ use Test::More;
 use FindBin;
 use File::Temp qw(tempdir);
 
-my $script      = "$FindBin::Bin/../tokenizeSrcMl.pl";
-my $srcml2token = "$FindBin::Bin/../srcMLtoken/srcml2token";
-my $fixtures    = "$FindBin::Bin/../srcMLtoken/tests";
+my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
+
+my $script      = "$root/tokenize/tokenizeSrcMl.pl";
+my $srcml2token = "$root/tokenize/srcMLtoken/srcml2token";
+my $fixtures    = "$root/tokenize/srcMLtoken/tests";
 my $expected    = "$FindBin::Bin/expected";
 
 plan skip_all => "srcml not on PATH"

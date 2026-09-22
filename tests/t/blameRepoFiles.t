@@ -6,7 +6,9 @@ use Test::More;
 use FindBin;
 use File::Temp qw(tempdir);
 
-my $script  = "$FindBin::Bin/../blameRepoFiles.pl";
+my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
+
+my $script  = "$root/blameRepo/blameRepoFiles.pl";
 my $workdir = tempdir(CLEANUP => 1);
 
 $ENV{GIT_CONFIG_NOSYSTEM} = 1;

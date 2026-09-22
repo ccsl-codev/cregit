@@ -7,7 +7,9 @@ use FindBin;
 use File::Temp qw(tempdir);
 use Digest::SHA qw(sha1_hex);
 
-my $script  = "$FindBin::Bin/../tokenBySha.pl";
+my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
+
+my $script  = "$root/tokenizeByBlobId/tokenBySha.pl";
 my $workdir = tempdir(CLEANUP => 1);
 
 my $stub = "$workdir/stub-tokenizer.sh";
