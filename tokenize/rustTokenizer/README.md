@@ -63,8 +63,8 @@ to, and its committed golden output is the reference:
 
 | file | shape |
 | --- | --- |
-| `tokenize/t/expected/main.c.nopos.token` | `begin_unit\|…`, `comment\|/* … */` |
-| `tokenize/t/expected/main.c.token` | `-:-\|begin_unit\|…`, `1:1\|comment\|/* … */` |
+| `tests/t/expected/main.c.nopos.token` | `begin_unit\|…`, `comment\|/* … */` |
+| `tests/t/expected/main.c.token` | `-:-\|begin_unit\|…`, `1:1\|comment\|/* … */` |
 
 Both downstream consumers split on `|`:
 
