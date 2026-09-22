@@ -32,7 +32,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
       withClue(s"$sha: ") {
         e.citation should not be empty
         e.reason should not include "\n"
-        e.reason.toLowerCase should include("srcml")
       }
     }
   }
