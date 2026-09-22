@@ -158,6 +158,18 @@ Output:
                     them. NOTE: the HTML views are the fallback output when
                     python3+duckdb is missing, so --skip-html without duckdb
                     leaves the run with no final artifact.
+  --reblame         re-blame every file in step 7, replacing the existing
+                    .blame output. Needed because blameRepoFiles.pl skips a
+                    file whose .blame already exists, so FROM_STEP=7 alone
+                    re-runs step 7 and blames NOTHING: it reports every file as
+                    already done, exits 0, and step 10 then rebuilds the
+                    Parquet from the old blame. That is not a hypothetical — a
+                    three-project pilot changed 0 of 15,036,195 tokens before
+                    this flag existed. Pass it whenever the blame itself
+                    changed (a git blame flag, a formatBlame.pl fix). Do NOT
+                    pass it to resume an interrupted run: the skip is what
+                    makes a resume cheap, and torvalds__linux costs 4.6 h of
+                    blame to redo.
   --gc MODE         how to pack the generated cregit repo after tokenizing
                     (default: plain)
                       none        do not pack at all. Fastest, but every later
@@ -303,6 +315,7 @@ WORK="../cregit-files"
 # directory outside $WORK; nothing else about the run changes.
 MEMO_DIR=""
 SKIP_HTML=0
+REBLAME=0
 GC_MODE="plain"
 # Empty means "do not pass the flag", so generate_dataset.py keeps its own
 # default. Step 10 settles at about 1.4x the limit, so a corpus run with N
@@ -539,6 +552,7 @@ while [ $# -gt 0 ]; do
         --work)       need_val "$@"; WORK="$2"; shift 2 ;;
         --memo-dir)   need_val "$@"; MEMO_DIR="$2"; shift 2 ;;
         --skip-html)  SKIP_HTML=1; shift ;;
+        --reblame)    REBLAME=1; shift ;;
         --force-clean) FORCE_CLEAN=1; shift ;;
         --mask-widened) MASK_WIDENED=1; shift ;;
         --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
@@ -621,6 +635,20 @@ if [ -n "$RETOKENIZE" ] && [ "$FROM_STEP" != "2" ]; then
      Resume at step 2:
        runner:  $0 --repo-url <url> --work $WORK --retokenize $RETOKENIZE [same flags] 2
        ctp.py:  python3 ./ctp.py run [same flags] --from-step 2" >&2
+    exit 2
+fi
+
+# --reblame only acts inside step 7, so a run that starts after step 7 would accept
+# the flag, skip it, rebuild the Parquet from the old blame and exit 0. That is the
+# same silent no-op --reblame exists to close, so refuse it here rather than let an
+# operator believe a re-blame happened.
+if [ "$REBLAME" = 1 ] && [ "$FROM_STEP" -gt 7 ]; then
+    echo "--reblame needs FROM_STEP<=7 (got $FROM_STEP). The re-blame happens inside
+     step 7. From step 8 onward the flag is skipped, step 10 rebuilds the Parquet from
+     the blame files already on disk, and the run exits 0 having changed nothing.
+     Resume at step 7:
+       runner:  $0 --repo-url <url> --work $WORK --reblame [same flags] 7
+       ctp.py:  python3 ./ctp.py run [same flags] --reblame --from-step 7" >&2
     exit 2
 fi
 
@@ -1325,9 +1353,17 @@ end_step
 step "blame"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_CREGIT" ] || die "step 6 did not produce $REPO_PATH_CREGIT"
+# blameRepoFiles.pl skips a file whose .blame output already exists. That makes a
+# resume cheap, and it makes a re-blame a silent no-op: without --overwrite this
+# step reports every file as already done and exits 0. An array, so the flag is
+# absent rather than empty when it is off.
+REBLAME_OPTS=()
+[ "$REBLAME" = 1 ] && REBLAME_OPTS+=(--overwrite)
+[ "$REBLAME" = 1 ] && log "--reblame: replacing every .blame file, not resuming"
 perl $CREGIT/blameRepo/blameRepoFiles.pl \
   --jobs="$JOBS" \
   --formatBlame=$CREGIT/blameRepo/formatBlame.pl \
+  ${REBLAME_OPTS[@]+"${REBLAME_OPTS[@]}"} \
   $REPO_PATH_CREGIT $WORK/blame "$MASK"
 fi
 end_step
