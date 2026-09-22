@@ -37,17 +37,12 @@ use File::Path qw(make_path);
 use File::Copy;
 use FindBin qw($RealBin);
 use lib "$FindBin::RealBin/../tokenize";
-# One table, shared with tokenize.pl. This used to be a separate literal that
-# mapped go/md/yaml, for which tokenize.pl has no parser: such a blob passed this
-# gate and died at the next one. See CregitLanguages.pm.
 use CregitLanguages;
 
 # build/ tempdir anchored to the script's dir, not the caller's CWD.
 my $buildDir = "$RealBin/build";
 make_path($buildDir) if not -d $buildDir;
 
-
-my %mapLang = %CregitLanguages::EXT_LANG;
 
 
 if (not defined($ENV{BFG_MEMO_DIR}) ||  $ENV{BFG_MEMO_DIR} eq "") {

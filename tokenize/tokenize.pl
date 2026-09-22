@@ -17,15 +17,10 @@ use strict;
 use File::Basename;
 use FindBin;
 use lib $FindBin::Bin;
-# The extension table and the language->parser table both come from here, and so
-# does tokenizeByBlobId/tokenBySha.pl's. They used to be separate literals that
-# disagreed; see CregitLanguages.pm.
 use CregitLanguages;
 
 my %declarations;
 my %listDeclarations;
-
-my %extensions = CregitLanguages::extensions_by_dot();
 
 my $basedir = dirname($0);
 $basedir = "." if ($basedir eq "");
