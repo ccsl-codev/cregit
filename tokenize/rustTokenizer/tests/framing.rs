@@ -16,8 +16,8 @@ fn bin() -> &'static str {
 }
 
 // Paths are relative to the crate root, which is cargo's CWD for integration tests.
-const SRCML_GOLDEN_NOPOS: &str = "../t/expected/main.c.nopos.token";
-const SRCML_GOLDEN_POS: &str = "../t/expected/main.c.token";
+const SRCML_GOLDEN_NOPOS: &str = "../../tests/t/expected/main.c.nopos.token";
+const SRCML_GOLDEN_POS: &str = "../../tests/t/expected/main.c.token";
 const LANGUAGES_PM: &str = "../CregitLanguages.pm";
 
 fn read(path: &str) -> String {

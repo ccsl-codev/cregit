@@ -66,7 +66,7 @@ fn parse_args() -> (String, bool) {
 
 // Emits the cregit FINAL token format, defined by tokenizeSrcMl.pl: pipe-separated,
 // with a `line:col` prefix only under --position. The golden streams are
-// tokenize/t/expected/main.c.token and main.c.nopos.token.
+// tests/t/expected/main.c.token and main.c.nopos.token.
 //
 // Not the TAB form in tokenize/srcMLtoken/tests/expected/*.token: that is
 // srcml2token's intermediate output, which tokenizeSrcMl.pl re-emits with `|`.
