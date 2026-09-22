@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 12;
+use Test::More tests => 16;
 use FindBin;
 use File::Temp qw(tempdir);
 
@@ -92,4 +92,48 @@ my $cid2 = commit_as($repo, "Bob", "second");
        "pre-rename lines carry the original filename");
     is($lines[2], "$cid2;f.c;\tint three;",
        "all pre-rename commits report the old name");
+}
+
+# Content moved OUT of one file and INTO another, in one commit. A whole-file
+# rename is already covered above; this is the different case, and it is the one
+# `git blame -C100` exists for. Without copy detection every moved line is
+# credited to whoever moved it, which silently over-credits refactorers,
+# file-movers and header-splitters across a whole corpus.
+#
+# The moved block is deliberately well over the 100-character minimum score that
+# `-C100` requires, so the test measures the flag and not the threshold.
+{
+    my $repo2 = "$workdir/moved";
+    mkdir $repo2 or die $!;
+    git($repo2, "init -q -b main");
+
+    my $block = join('', map {
+        "    total = total + value_$_ * multiplier_$_ + offset_$_;\n"
+    } 1 .. 6);
+
+    write_file("$repo2/origin.c", "int helper(void)\n{\n$block    return total;\n}\n");
+    git($repo2, "add origin.c");
+    my $author = commit_as($repo2, "Author", "write the helper");
+
+    # One commit: the block leaves origin.c and arrives in moved.c.
+    write_file("$repo2/origin.c", "int helper(void)\n{\n    return 0;\n}\n");
+    write_file("$repo2/moved.c", "int helper(void)\n{\n$block    return total;\n}\n");
+    git($repo2, "add origin.c moved.c");
+    my $mover = commit_as($repo2, "Mover", "move the helper into its own file");
+
+    my $dest = tempdir(CLEANUP => 1);
+    my $status = system("perl '$script' '$repo2' moved.c '$dest' 2>/dev/null");
+    is($status, 0, "formatBlame.pl on the destination of a move succeeds");
+
+    my @lines = slurp_lines("$dest/moved.c.blame");
+    is(scalar(@lines), 10, "the moved file has ten blame lines");
+
+    # Lines 3..8 are the moved block. They are the author's work, not the mover's.
+    my @moved = @lines[2 .. 7];
+    my @wrong = grep { /^\Q$mover\E;/ } @moved;
+    is(scalar(@wrong), 0,
+       "no moved line is credited to the mover");
+    my @right = grep { /^\Q$author\E;origin\.c;/ } @moved;
+    is(scalar(@right), 6,
+       "all six moved lines are credited to the author, naming origin.c");
 }
