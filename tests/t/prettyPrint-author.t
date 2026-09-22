@@ -9,7 +9,9 @@ use File::Path qw(make_path);
 use File::Temp qw(tempdir);
 use DBI;
 
-my $script = "$FindBin::Bin/../prettyPrint-author.pl";
+my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
+
+my $script = "$root/prettyPrint/prettyPrint-author.pl";
 my $workdir = tempdir(CLEANUP => 1);
 my $cid = 'a' x 40;
 my $original_cid = 'b' x 40;

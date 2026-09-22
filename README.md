@@ -112,7 +112,9 @@ cd ../tokenize/srcMLtoken && make && make test
 cd ../rustTokenizer && make && make test
 
 cd ../..
-prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t
+prove tests/t
+pytest -q
+tests/tokenize_gate.sh && tests/pipeline_workdir_guard.sh
 
 for module in slickGitLog persons remapCommits; do
   (cd "$module" && sbt --java-home "$LEGACY_JAVA_HOME" -batch test one-jar)

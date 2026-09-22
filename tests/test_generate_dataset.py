@@ -5,7 +5,7 @@ They must agree, and when the source runs out first they must stop rather than
 crash: the dataset step runs last, so a crash here throws away the whole
 project's work.
 
-Run with:  python3 -m pytest generate_dataset/test_generate_dataset.py
+Run with:  python3 -m pytest tests/test_generate_dataset.py
 """
 from __future__ import annotations
 

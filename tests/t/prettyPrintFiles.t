@@ -8,7 +8,9 @@ use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use File::Temp qw(tempdir);
 
-my $script = "$FindBin::Bin/../prettyPrintFiles.pl";
+my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
+
+my $script = "$root/prettyPrint/prettyPrintFiles.pl";
 my $workdir = tempdir(CLEANUP => 1);
 my $repo = "$workdir/repo";
 my $blame_dir = "$workdir/blame";

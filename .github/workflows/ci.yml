@@ -75,13 +75,13 @@ jobs:
         run: devenv shell -- bash -c 'cd tokenize/rustTokenizer && make && make test'
 
       - name: Perl tests (prove)
-        run: devenv shell -- bash -c 'prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t'
+        run: devenv shell -- bash -c 'prove tests/t'
 
       - name: Pipeline tests (shell)
         run: devenv shell -- bash -c 'tests/tokenize_gate.sh && tests/pipeline_workdir_guard.sh'
 
       - name: Dataset tests (pytest)
-        run: devenv shell -- bash -c 'pytest -q generate_dataset'
+        run: devenv shell -- bash -c 'pytest -q'
 
       - name: Build & test legacy onejar modules (sbt test one-jar, Scala 2.10 / JDK 8)
         run: |
