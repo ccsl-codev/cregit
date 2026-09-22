@@ -21,12 +21,9 @@ output of the CreGit pipeline (Step 10).
 `repo_name` is column 1 and the 29 provenance columns are 2-30, so `file_path` is
 column 31.
 
-The contract is **not this document**: it is `EXPECTED_COLUMNS` in
-`cregit-token-pipeline/validate_schema.py`, which every project's Parquet is
-checked against by name, by type and in order, and a drift is a non-zero exit.
-If you change the generator's output, change that file in the same commit and
-this one immediately after.  `cregit-token-pipeline/docs/DATASET-SCHEMA.md` draws
-the same 67 columns beside the on-disk schema they collapse from.
+The count is pinned by `TOTAL_COLUMNS` in `tests/test_generate_dataset.py`, which
+asserts it against a real Parquet: change the generator's output and that test
+fails.
 
 ## Quick start
 
@@ -121,15 +118,9 @@ numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
 
 ### Commit trailers (footers)
 
-Fifteen columns, all `LIST(TEXT)` — `VARCHAR[]` as DuckDB and the Parquet report
-them.  They are **never NULL**: a commit with no trailer of that key gets an
-empty list, through `coalesce(…, [])`, so `len(footer_reviewed_by) = 0` is the
-test for absence and a NULL check is not needed.
-
-Source: the `footers` table of `cregit.db` (one row per trailer occurrence, with
-`cid`, `idx`, `key`, `value`), grouped by commit.  Keys are matched
-**case-insensitively** (`LOWER(f.key) = 'signed-off-by'`), and each list keeps the
-order the trailers appeared in the message, by `footers.idx`.
+Fifteen `LIST(TEXT)` columns, never NULL: absence is an empty list, so test with
+`len(footer_reviewed_by) = 0`. Source is `cregit.db`'s `footers` table, grouped by
+commit, keys matched case-insensitively, each list in `footers.idx` order.
 
 | Column | Trailer key |
 |--------|-------------|
@@ -147,29 +138,16 @@ order the trailers appeared in the message, by `footers.idx`.
 | `footer_assisted_by` | `Assisted-by` |
 | `footer_thanks_to` | `Thanks-to` |
 
-Each value is the raw trailer text as the commit wrote it — typically
-`Name <email>` — not a resolved identity.  Two further columns resolve them:
+Values are raw trailer text, typically `Name <email>`. Two columns resolve them:
 
 | Column | Meaning |
 |--------|---------|
 | `footer_personids` | the distinct `personid`s behind **every** trailer on the commit: the address inside `<…>` is pulled out of the trailer text with `regexp_extract` and matched against `emails.emailaddr` |
 | `footer_person_names` | the resolved names for those ids, `coalesce(personname, personid)` |
 
-Those two are `DISTINCT` and sorted: they are a **set over all trailers**, not a
-list aligned with the 13 typed columns, and they cannot be zipped with them.  A
-trailer whose address matches no `emails` row contributes nothing to either, so
-`footer_signed_off_by` can be non-empty while `footer_personids` is empty.
-
-Both bracketed and bare addresses resolve: `Reviewed-by: Bob <b@x.com>` and
-`Reviewed-by: bob@example.com` both reach `footer_personids`.  A trailer carrying
-no address at all contributes nothing, which is why `nullif` wraps both
-extractions — DuckDB's `regexp_extract` returns the empty string rather than NULL
-on no match, and an empty join key would otherwise match every `Name <>` row in
-`emails`.
-
-These columns are why the dataset can say anything about contribution that is not
-authorship.  `Signed-off-by`, `Reviewed-by` and `Co-authored-by` carry attribution
-that the author fields do not, and in a mailing-list project they carry most of it.
+Those two are a **set over all trailers**, not a list aligned with the 13 typed
+columns, so they cannot be zipped with them. Bracketed and bare addresses both
+resolve; a trailer with no address resolves to nothing.
 
 ```sql
 -- Reviewers by review count, independent of who authored the code
@@ -179,9 +157,8 @@ FROM (SELECT DISTINCT original_commit_sha, unnest(footer_reviewed_by) AS r
 GROUP BY r ORDER BY reviews DESC;
 ```
 
-Note the `DISTINCT original_commit_sha` in that query: the grain of this table is
-the **token**, so a commit's trailers repeat on every token it touched.  Any
-commit-level count over `footer_*` must deduplicate by commit first.
+The grain is the **token**, so a commit's trailers repeat on every token it
+touched: any commit-level count must deduplicate by commit first.
 
 ## token_type domain
 
@@ -309,27 +286,17 @@ ORDER BY tokens DESC;
 
 ### `person_email` is published, and there is no anonymiser — an open decision
 
-`person_email` and `person_domain` are real columns of the output, so **writing a
-Parquet and publishing it publishes contributors' e-mail addresses.**  The design
-for this corpus names a weak anonymiser for exactly this purpose
-(`cregit-token-pipeline/docs/DESIGN.md` §7, stage 2: `anonymize.py`, a salted
-stable hash with the salt and the reverse mapping kept local) and **it has not
-been written.**  Nothing in this generator drops, hashes or redacts the column,
-and there is no flag that does.
-
-Recorded here as an **open decision that blocks publication, not the pipeline.**
-Drop the column, hash it, or publish it deliberately with an ethics statement —
-those are three different positions and none of them is the default.  Note that
-`person_domain` is what an affiliation study resolves through, so removing
-`person_email` alone does not remove domain-level identifiability.
+`person_email` and `person_domain` are real columns, so publishing a Parquet
+publishes contributors' e-mail addresses. Nothing here drops, hashes or redacts
+them, and no flag does. Removing `person_email` alone leaves `person_domain`,
+which is still identifying.
 
 ### Files that produce no rows at all
 
-The generator writes a row for every token it is given, so what is missing from
-the Parquet is whatever never reached the tokenizer.  Three mechanisms upstream
-(in `blobExec`, step 2) exclude a blob, and in all three cases the file is
-**absent from the tokenized repository rather than present as raw source** — so it
-produces no blame and no dataset row, rather than rows of unparsed text:
+What is missing from the Parquet is whatever never reached the tokenizer. Three
+mechanisms in `blobExec` (step 2) exclude a blob, and in all three the file is
+**absent from the tokenized repository rather than present as raw source**, so it
+produces no blame and no dataset row rather than rows of unparsed text:
 
 | Mechanism | Recorded as | Effect here |
 |---|---|---|
@@ -337,13 +304,13 @@ produces no blame and no dataset row, rather than rows of unparsed text:
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
 | a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
 
-The denylist currently holds **four blob ids, and they are four blobs of one
-file** — `TestNewCastArray.java`, an OpenJDK langtools regression test, at two
-paths (the path moved in a repository reorganisation) across four revisions.  It
-is keyed by content rather than by path on purpose.  srcML 1.1.0 does not
-terminate on it: 0 bytes of output at every budget from 5 s to 600 s, upstream
-`srcML/srcML#2361`, open, no patch, no newer release.  Read the header of the
-denylist file; it carries the measurements and the citation.
+One example, so the shape is clear: [`2ee2673a`](https://github.com/tencent/tencentkona-21/blob/2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65/test/langtools/tools/javac/annotations/typeAnnotations/newlocations/TestNewCastArray.java)
+— srcML 1.1.0's Java parser does not terminate on type-annotated array types
+(upstream [`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361), open).
+The list is keyed by content, not path: this file moved in a repository
+reorganisation, so its four revisions at two paths are four entries. Failure is
+non-termination, not slowness — 0 bytes out, one core at 100%, at every budget
+from 5 s to 600 s.
 
 Also outside the dataset, by mask rather than by exclusion: M4 (`.am`, `.ac`),
 whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,
