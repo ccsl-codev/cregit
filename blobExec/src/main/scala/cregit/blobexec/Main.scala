@@ -51,14 +51,28 @@ object Main {
     * within [[MaxTimeoutSeconds]], else None. Zero is rejected rather than read
     * as "no limit". */
 
-  /** The process exit status for a finished walk.
-    * Only an abort, a killed tokenizer and a parser crash gate publication;
-    * blobsOversized and blobsDenylisted do not. */
-  private[blobexec] def exitStatus(stats: WalkStats): Int =
+  /** Fraction of tokenized blobs allowed to crash before the run is unpublishable.
+    * A rate, not a count, so it holds for a 5,000-blob project and a 500,000-blob one.
+    * A few pathological inputs land far below it; an srcML that has stopped parsing C
+    * lands far above. */
+  private[blobexec] val ToleratedCrashRate = 0.01
+
+  /** Crashes allowed for this walk. Always at least one below the rate, so a small
+    * project is not gated by rounding, and never zero-tolerance on an empty walk. */
+  private[blobexec] def toleratedCrashes(blobsTokenized: Long): Long =
+    math.max(1L, (blobsTokenized * ToleratedCrashRate).toLong)
+
+  /** The process exit status for a finished walk. An abort or a killed tokenizer gates
+    * publication outright. A crash gates only past [[ToleratedCrashRate]]: the blob is
+    * excluded either way, so one pathological input must not cost a whole project.
+    * blobsOversized and blobsDenylisted never gate. */
+  private[blobexec] def exitStatus(stats: WalkStats): Int = {
+    val tokenized = stats.blobsRunThroughCommand.toLong + stats.blobsCacheHit.toLong
     if (stats.aborted) 2
     else if (stats.blobsTimedOut > 0) TimedOutExitStatus
-    else if (stats.blobsParserCrashed > 0) ParserCrashedExitStatus
+    else if (stats.blobsParserCrashed > toleratedCrashes(tokenized)) ParserCrashedExitStatus
     else 0
+  }
 
   /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
     * positive whole number, else None (which the caller reports and exits 1 on).
@@ -99,7 +113,11 @@ object Main {
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch, ${TimedOutExitStatus} = completed
       |               but some blob timed out (output incomplete, re-run to
-      |               retry), ${Walker.StalledExitStatus} = killed by the stall watchdog.
+      |               retry), ${Walker.StalledExitStatus} = killed by the stall watchdog,
+      |               ${ParserCrashedExitStatus} = tokenizer crashes past ${(ToleratedCrashRate * 100).toInt}% of the blobs
+      |               tokenized. Below that the blob is excluded and the run
+      |               still publishes: a crash is deterministic, so one
+      |               pathological input must not cost a whole project.
       |  --pipeline        use the look-ahead pipelined walker (producer runs
       |                    ahead so the blob-command pool stays saturated);
       |                    output is identical to the default serial walker
@@ -340,9 +358,14 @@ object Main {
     }
 
     if (stats.blobsParserCrashed > 0) {
+      val tokenized = stats.blobsRunThroughCommand.toLong + stats.blobsCacheHit.toLong
+      val gated = stats.blobsParserCrashed > toleratedCrashes(tokenized)
       System.err.println(
-        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsParserCrashed} blob(s) crashed " +
-          "their tokenizer; each is named above. Deterministic, so re-running will not clear it."
+        s"blobExec: ${stats.blobsParserCrashed} of $tokenized blob(s) crashed their tokenizer " +
+          s"and were excluded; each is named above. " +
+          (if (gated) s"That is past the ${ToleratedCrashRate * 100}% this run tolerates: " +
+             "DO NOT PUBLISH. Deterministic, so re-running will not clear it."
+           else "Within tolerance, so the run still publishes.")
       )
     }
 

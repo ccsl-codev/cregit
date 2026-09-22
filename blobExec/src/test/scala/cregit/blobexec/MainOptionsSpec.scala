@@ -155,9 +155,10 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
       blobsTimedOut: Long = 0L,
       blobsOversized: Long = 0L,
       blobsDenylisted: Long = 0L,
-      blobsParserCrashed: Long = 0L
+      blobsParserCrashed: Long = 0L,
+      blobsTokenized: Int = 1
   ) = WalkStats(
-    commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = 1,
+    commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = blobsTokenized,
     blobsCacheHit = 0, refsProjected = 1, aborted = aborted,
     blobsTimedOut = blobsTimedOut, blobsOversized = blobsOversized,
     blobsDenylisted = blobsDenylisted, blobsParserCrashed = blobsParserCrashed,
@@ -194,18 +195,26 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
   }
 
-  // A parser crash is a defect nobody has explained — srcML 1.1.0 dying on a
-  // signal — so it gates publication the way a timeout does, and unlike an
-  // oversized or denylisted blob. It gets its OWN status because the remedies
-  // differ: --blob-timeout does nothing for a segfault.
-
-  test("a parser crash blocks publication, with its own status") {
-    Main.exitStatus(stats(blobsParserCrashed = 1)) shouldEqual Main.ParserCrashedExitStatus
-    Main.exitStatus(stats(blobsParserCrashed = 36)) shouldEqual Main.ParserCrashedExitStatus
+  test("a crash rate past tolerance blocks publication, with its own status") {
+    // 2 of 100 is 2%, past the 1% tolerated.
+    Main.exitStatus(stats(blobsParserCrashed = 2, blobsTokenized = 100)) shouldEqual
+      Main.ParserCrashedExitStatus
   }
 
-  test("a parser crash still blocks alongside explained exclusions") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
+  test("a crash rate within tolerance still publishes: the blob is excluded either way") {
+    Main.exitStatus(stats(blobsParserCrashed = 1, blobsTokenized = 100)) shouldEqual 0
+    Main.exitStatus(stats(blobsParserCrashed = 500, blobsTokenized = 500000)) shouldEqual 0
+  }
+
+  test("one crash in a tiny project does not gate, so rounding cannot zero the tolerance") {
+    Main.exitStatus(stats(blobsParserCrashed = 1, blobsTokenized = 1)) shouldEqual 0
+    Main.exitStatus(stats(blobsParserCrashed = 2, blobsTokenized = 1)) shouldEqual
+      Main.ParserCrashedExitStatus
+  }
+
+  test("a crash past tolerance still blocks alongside explained exclusions") {
+    Main.exitStatus(stats(blobsParserCrashed = 9, blobsTokenized = 100,
+                          blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
       Main.ParserCrashedExitStatus
   }
 
