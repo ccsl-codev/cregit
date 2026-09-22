@@ -117,6 +117,7 @@ prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t
 # the pipeline runner's own guards (stubbed builds and a stubbed java, seconds)
 bash test_ensure_artifacts.sh
 bash test_retokenize_passthrough.sh
+bash test_reblame_passthrough.sh
 
 for module in slickGitLog persons remapCommits; do
   (cd "$module" && sbt --java-home "$LEGACY_JAVA_HOME" -batch test one-jar)
@@ -165,6 +166,20 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--memo-dir`          | where to memoize tokenized blobs; outside `--work` it survives the full-run wipe | `<work>/memo` |
 | `--mode` / `--shards` | tokenizer walk mode / shard count for `sharded`            | `pipeline` / `4`                 |
 | `--jobs`              | concurrent blame/HTML processes                            | `CREGIT_JOBS` or up to `4` CPUs  |
+| `--reblame`           | re-blame every file in step 7, replacing existing `.blame` output | off — a resume skips files already blamed |
+
+**`git blame` runs with `-C100` copy detection** (`blameRepo/formatBlame.pl:73`), so a
+token moved between files keeps its original author. Upstream shipped that commented
+out. Enabling it changed the author of up to 25% of a project's tokens, so blame output
+produced before 2026-09-22 is not comparable with output produced after it.
+
+**Pass `--reblame` whenever the blame itself changed**, not the file list.
+`blameRepoFiles.pl` skips any file whose `.blame` output already exists. That skip makes
+a resume cheap, and it makes a re-blame a silent no-op: step 7 reports every file as
+already done and exits 0, then step 10 rebuilds from the old blame. One pilot changed
+**0 of 15,036,195 tokens** that way, with identical row counts and `rc=0`. Read step 7's
+summary to confirm a real re-blame — `Already done [0]` is the proof. Do **not** pass the
+flag to resume an interrupted run.
 
 A full run starts by **deleting the work directory** — to keep several target
 repositories side by side, give each its own `--work`. To resume a failed run
