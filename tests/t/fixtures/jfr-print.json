@@ -1,0 +1,68 @@
+{
+  "recording": {
+    "events": [
+      {
+        "type": "jdk.ExecutionSample",
+        "values": {
+          "stackTrace": {
+            "frames": [
+              { "method": { "type": { "name": "cregit.blobexec.Walker" }, "name": "tokenizeBlob" } },
+              { "method": { "type": { "name": "cregit.blobexec.Walker" }, "name": "runPipeline" } },
+              { "method": { "type": { "name": "cregit.blobexec.Main" }, "name": "main" } }
+            ]
+          }
+        }
+      },
+      {
+        "type": "jdk.ExecutionSample",
+        "values": {
+          "stackTrace": {
+            "frames": [
+              { "method": { "type": { "name": "cregit.blobexec.Walker" }, "name": "tokenizeBlob" } },
+              { "method": { "type": { "name": "cregit.blobexec.Walker" }, "name": "runPipeline" } },
+              { "method": { "type": { "name": "cregit.blobexec.Main" }, "name": "main" } }
+            ]
+          }
+        }
+      },
+      {
+        "type": "jdk.JavaMonitorEnter",
+        "values": {
+          "duration": "3.5 ms",
+          "stackTrace": {
+            "frames": [
+              { "method": { "type": { "name": "cregit.blobexec.Mapping" }, "name": "getBlob" } },
+              { "method": { "type": { "name": "cregit.blobexec.Walker" }, "name": "runPipeline" } }
+            ]
+          }
+        }
+      },
+      {
+        "type": "jdk.ThreadPark",
+        "values": {
+          "duration": 12000000,
+          "stackTrace": {
+            "frames": [
+              { "method": { "type": { "name": "java.util.concurrent.ArrayBlockingQueue" }, "name": "take" } }
+            ]
+          }
+        }
+      },
+      {
+        "type": "jdk.ObjectAllocationSample",
+        "values": {
+          "weight": 4096,
+          "stackTrace": {
+            "frames": [
+              { "method": { "type": { "name": "java.lang.String" }, "name": "valueOf" } }
+            ]
+          }
+        }
+      },
+      {
+        "type": "jdk.ThreadStart",
+        "values": {}
+      }
+    ]
+  }
+}

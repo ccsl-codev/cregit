@@ -353,6 +353,52 @@ need_val() {
     [ $# -ge 2 ] || { echo "missing value for $1" >&2; usage; exit 2; }
 }
 
+# Profiling, off unless CREGIT_PROFILE names a step. See PROFILING.md.
+#
+#   CREGIT_PROFILE=tokenize|blame|both   which hot step to record
+#   CREGIT_PROFILE_DIR=<absolute path>   where recordings go, never inside $WORK
+#
+# Unset, this costs one string comparison per hot step and changes nothing else:
+# no flag moves, no command line changes, no file is written. Both profilers are
+# reached through environment variables that the JDK launcher and perl read for
+# themselves, so neither the java invocation in step 2 nor the perl invocation in
+# step 7 is touched.
+profile_enable() {
+    local want=$1
+    case "${CREGIT_PROFILE:-}" in
+        "$want"|both) : ;;
+        "") return 0 ;;
+        tokenize|blame) return 0 ;;
+        *) die "CREGIT_PROFILE must be tokenize, blame or both (got '$CREGIT_PROFILE')" ;;
+    esac
+
+    local dir=${CREGIT_PROFILE_DIR:-}
+    [ -n "$dir" ] || die "CREGIT_PROFILE is set but CREGIT_PROFILE_DIR is not"
+    case "$dir" in
+        /*) : ;;
+        *) die "CREGIT_PROFILE_DIR must be an absolute path (got '$dir')" ;;
+    esac
+    # Step 1 deletes $WORK. A recording written there is a recording lost.
+    case "$dir/" in
+        "$WORK"/*) die "CREGIT_PROFILE_DIR must not be inside the work directory $WORK" ;;
+    esac
+    mkdir -p "$dir" || die "cannot create CREGIT_PROFILE_DIR $dir"
+
+    # shellcheck source=profiling/lib.sh
+    . "$CREGIT/profiling/lib.sh"
+    case "$want" in
+        tokenize) prof_jfr_env "$dir" tokenize ;;
+        blame)
+            if prof_nytprof_available perl; then
+                prof_nytprof_env "$dir" blame
+            else
+                log "profiling: Devel::NYTProf absent; step 7 runs unprofiled (see PROFILING.md)"
+            fi
+            ;;
+    esac
+    log "profiling: $want recording into $dir"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-only) BUILD_ONLY=1; shift ;;
@@ -714,6 +760,10 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_ORIGINAL_BARE" ] || die "step 1 did not produce $REPO_PATH_ORIGINAL_BARE"
 [ -f "$BFG" ] || die "blobExec jar not found: $BFG (run: ./run_pipeline_process.sh --build-only)"
 
+# Records every JVM from here on, one .jfr per pid, not step 2 alone: the JDK
+# launcher reads JDK_JAVA_OPTIONS and this script does not re-export per step.
+profile_enable tokenize
+
 export BFG_MEMO_DIR="$MEMO_DIR"
 
 # Route through the tokenize.pl dispatcher (not tokenizeSrcMl.pl directly) so it can
@@ -821,6 +871,7 @@ end_step
 step "blame"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_CREGIT" ] || die "step 6 did not produce $REPO_PATH_CREGIT"
+profile_enable blame
 perl $CREGIT/blameRepo/blameRepoFiles.pl \
   --jobs="$JOBS" \
   --formatBlame=$CREGIT/blameRepo/formatBlame.pl \
