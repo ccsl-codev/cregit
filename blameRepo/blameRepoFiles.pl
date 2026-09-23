@@ -101,6 +101,27 @@ foreach (@trackedFiles) {
     push @filesToBlame, $name;
 }
 
+# Largest first. One blame is one process, so a run ends no earlier than its
+# longest single file: start that file last and every other job slot drains while
+# it runs alone. Size is the only cost proxy available up front, and a fair one --
+# blame cost grows with lines x revisions. It matters because the distribution is
+# skewed: in googleapis/google-cloud-java the median masked file is 4.9 KB, the
+# largest is 6.6 MB, and the top 1% hold 19.2% of all bytes, while git ls-files
+# order is alphabetical. Ties keep that order, so uniform input is unaffected.
+{
+    my %sizeOf;
+    foreach my $name (@filesToBlame) {
+        $sizeOf{$name} = -s "$repoDir/$name" || 0;
+    }
+    my $i = 0;
+    my %order = map { $_ => $i++ } @filesToBlame;
+    @filesToBlame = sort {
+        $sizeOf{$b} <=> $sizeOf{$a}
+            or
+        $order{$a} <=> $order{$b}
+    } @filesToBlame;
+}
+
 # Before the first fork, so two workers cannot race to create the same directory.
 make_output_dirs($outputDir, $blameExtension, \@filesToBlame);
 
