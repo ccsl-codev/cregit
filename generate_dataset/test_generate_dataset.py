@@ -264,7 +264,7 @@ def test_a_non_string_value_is_still_quoted():
 
 
 def test_the_field_list_is_twenty_nine_names_ending_in_the_manifest_pair():
-    """Task 6's sidecar carries 29 fields. manifest_category and file_mask come
+    """The project-metadata sidecar carries 29 fields. manifest_category and file_mask come
     last, and file_mask is the regex the project was actually tokenized with."""
     assert len(PROJECT_META_FIELDS) == 29
     assert len(set(PROJECT_META_FIELDS)) == 29

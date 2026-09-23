@@ -838,7 +838,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   // but answers it with exit 4, "incomplete, do not publish", which would leave
   // that project permanently unpublishable over a diagnosed third-party defect.
   //
-  // So a denylisted blob takes Task 5's EXCLUSION path instead: dropped in
+  // So a denylisted blob takes the EXCLUSION path instead: dropped in
   // microseconds, never handed to the tokenizer, counted on its own, and NOT
   // gating the exit status. A timeout still gates it, because a timeout is a hang
   // nobody has explained yet.

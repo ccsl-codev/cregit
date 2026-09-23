@@ -80,8 +80,53 @@ jobs:
       - name: "Pipeline runner: cache-invalidation passthrough"
         run: devenv shell -- bash test_retokenize_passthrough.sh
 
+      - name: "Pipeline runner: re-blame passthrough"
+        run: devenv shell -- bash test_reblame_passthrough.sh
+
+      - name: "Pipeline runner: tokenize crash gate"
+        run: devenv shell -- bash test_tokenize_gate.sh
+
+      - name: "Pipeline runner: workdir recovery guard"
+        run: devenv shell -- bash test_run_pipeline_workdir_guard.sh
+
       - name: Perl tests (prove)
         run: devenv shell -- bash -c 'prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t'
+
+      # Without this step the coverage rule never reaches the dataset code.
+      # devenv.nix already supplies pytest (see the comment beside
+      # python3.withPackages), so only the CI step was missing.
+      - name: Python tests (pytest, generate_dataset)
+        run: devenv shell -- pytest generate_dataset -q --junitxml=junit-generate-dataset.xml
+
+      # `devenv shell -- pytest` does not flush its summary line, so the printed
+      # count is not trustworthy. Read the counts from the XML instead, and fail
+      # on failures or errors rather than trusting the exit status alone. The
+      # checker uses only the standard library, so it runs on the runner's own
+      # python3 and does not need the devenv shell.
+      - name: Re-check the pytest JUnit counts
+        if: always()
+        shell: bash
+        run: |
+          f=junit-generate-dataset.xml
+          [ -f "$f" ] || { echo "no $f: pytest did not get far enough to write one"; exit 1; }
+          python3 - "$f" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          s = root.find("testsuite") if root.tag == "testsuites" else root
+          a = s.attrib
+          print(f"tests={a['tests']} failures={a['failures']} "
+                f"errors={a['errors']} skipped={a['skipped']}")
+          if int(a["failures"]) or int(a["errors"]):
+              sys.exit("failures or errors in the suite")
+          PY
+
+      - name: Upload the pytest JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-generate-dataset
+          path: junit-generate-dataset.xml
+          if-no-files-found: warn
 
       - name: Build & test legacy onejar modules (sbt test one-jar, Scala 2.10 / JDK 8)
         run: |
