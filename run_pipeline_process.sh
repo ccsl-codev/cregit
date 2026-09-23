@@ -353,50 +353,73 @@ need_val() {
     [ $# -ge 2 ] || { echo "missing value for $1" >&2; usage; exit 2; }
 }
 
-# Profiling, off unless CREGIT_PROFILE names a step. See PROFILING.md.
+# Profiling, off unless CREGIT_PROFILE selects steps. See PROFILING.md.
 #
-#   CREGIT_PROFILE=tokenize|blame|both   which hot step to record
+#   CREGIT_PROFILE=all                   every step
+#   CREGIT_PROFILE=2,7,10                these step numbers
+#   CREGIT_PROFILE=tokenize|blame|both   the two hot steps, by name
 #   CREGIT_PROFILE_DIR=<absolute path>   where recordings go, never inside $WORK
 #
-# Unset, this costs one string comparison per hot step and changes nothing else:
-# no flag moves, no command line changes, no file is written. Both profilers are
-# reached through environment variables that the JDK launcher and perl read for
-# themselves, so neither the java invocation in step 2 nor the perl invocation in
-# step 7 is touched.
-profile_enable() {
-    local want=$1
+# The hooks live in step() and end_step(), so coverage is by construction: a step
+# added later is profiled without editing this block. Unset, each step pays one
+# string comparison and nothing is written.
+PROFILE_STEPS=
+PROFILE_DIR=
+PROFILE_TAG=
+
+profile_init() {
     case "${CREGIT_PROFILE:-}" in
-        "$want"|both) : ;;
         "") return 0 ;;
-        tokenize|blame) return 0 ;;
-        *) die "CREGIT_PROFILE must be tokenize, blame or both (got '$CREGIT_PROFILE')" ;;
+        all)      PROFILE_STEPS="1 2 3 4 5 6 7 8 9 10" ;;
+        tokenize) PROFILE_STEPS="2" ;;
+        blame)    PROFILE_STEPS="7" ;;
+        both)     PROFILE_STEPS="2 7" ;;
+        *[!0-9,]*) die "CREGIT_PROFILE must be all, tokenize, blame, both, or step numbers like 2,7,10 (got '$CREGIT_PROFILE')" ;;
+        *) PROFILE_STEPS=$(echo "$CREGIT_PROFILE" | tr ',' ' ') ;;
     esac
 
-    local dir=${CREGIT_PROFILE_DIR:-}
-    [ -n "$dir" ] || die "CREGIT_PROFILE is set but CREGIT_PROFILE_DIR is not"
-    case "$dir" in
+    PROFILE_DIR=${CREGIT_PROFILE_DIR:-}
+    [ -n "$PROFILE_DIR" ] || die "CREGIT_PROFILE is set but CREGIT_PROFILE_DIR is not"
+    case "$PROFILE_DIR" in
         /*) : ;;
-        *) die "CREGIT_PROFILE_DIR must be an absolute path (got '$dir')" ;;
+        *) die "CREGIT_PROFILE_DIR must be an absolute path (got '$PROFILE_DIR')" ;;
     esac
     # Step 1 deletes $WORK. A recording written there is a recording lost.
-    case "$dir/" in
+    case "$PROFILE_DIR/" in
         "$WORK"/*) die "CREGIT_PROFILE_DIR must not be inside the work directory $WORK" ;;
     esac
-    mkdir -p "$dir" || die "cannot create CREGIT_PROFILE_DIR $dir"
+    mkdir -p "$PROFILE_DIR" || die "cannot create CREGIT_PROFILE_DIR $PROFILE_DIR"
 
     # shellcheck source=profiling/lib.sh
     . "$CREGIT/profiling/lib.sh"
-    case "$want" in
-        tokenize) prof_jfr_env "$dir" tokenize ;;
-        blame)
-            if prof_nytprof_available perl; then
-                prof_nytprof_env "$dir" blame
-            else
-                log "profiling: Devel::NYTProf absent; step 7 runs unprofiled (see PROFILING.md)"
-            fi
-            ;;
-    esac
-    log "profiling: $want recording into $dir"
+    log "profiling: steps [$PROFILE_STEPS] recording into $PROFILE_DIR"
+    prof_nytprof_available perl ||
+        log "profiling: Devel::NYTProf absent; the perl steps record wall and cpu only (see PROFILING.md)"
+}
+
+profile_step_selected() {
+    [ -n "$PROFILE_STEPS" ] || return 1
+    case " $PROFILE_STEPS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# Tag every recording with its step, so a file names the step it came from. The
+# JDK launcher keeps reading JDK_JAVA_OPTIONS for the whole run, so re-exporting
+# per step is what stops step 3's jar landing in a file labelled step 2.
+profile_step_begin() {
+    profile_step_selected "$1" || return 0
+    PROFILE_TAG="step$1-$(printf '%s' "$2" | tr -cs 'A-Za-z0-9' '-' | sed 's/-*$//')"
+    prof_jfr_env "$PROFILE_DIR" "$PROFILE_TAG"
+    if prof_nytprof_available perl; then
+        prof_nytprof_env "$PROFILE_DIR" "$PROFILE_TAG"
+    fi
+}
+
+profile_step_end() {
+    profile_step_selected "$1" || return 0
+    prof_report_times "$PROFILE_DIR" "$PROFILE_TAG" "$2"
+    unset JDK_JAVA_OPTIONS PERL5OPT NYTPROF
+    PROFILE_TAG=
 }
 
 while [ $# -gt 0 ]; do
@@ -546,12 +569,14 @@ step() {
     echo "═══════════════════════════════════════════════════════════════════"
     echo "  Step $STEP_NUM — $1"
     echo "═══════════════════════════════════════════════════════════════════"
+    profile_step_begin "$STEP_NUM" "$1"
 }
 
 end_step() {
     [ "$STEP_NUM" -lt "$FROM_STEP" ] && return 0
     local elapsed=$(( $(date +%s) - STEP_START ))
     echo "  ✓ completed in ${elapsed}s"
+    profile_step_end "$STEP_NUM" "$elapsed"
 }
 
 CREGIT=$(pwd)
@@ -741,6 +766,8 @@ echo "  Log: $LOG_FILE"
 echo "████████████████████████████████████████████████████████████████████████"
 echo ""
 
+profile_init
+
 # ---------------------------------------------------------------------------
 # Step 1 — clone bare original repo
 # ---------------------------------------------------------------------------
@@ -759,10 +786,6 @@ step "tokenize [$MODE] (src→dst)"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_ORIGINAL_BARE" ] || die "step 1 did not produce $REPO_PATH_ORIGINAL_BARE"
 [ -f "$BFG" ] || die "blobExec jar not found: $BFG (run: ./run_pipeline_process.sh --build-only)"
-
-# Records every JVM from here on, one .jfr per pid, not step 2 alone: the JDK
-# launcher reads JDK_JAVA_OPTIONS and this script does not re-export per step.
-profile_enable tokenize
 
 export BFG_MEMO_DIR="$MEMO_DIR"
 
@@ -871,7 +894,6 @@ end_step
 step "blame"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_CREGIT" ] || die "step 6 did not produce $REPO_PATH_CREGIT"
-profile_enable blame
 perl $CREGIT/blameRepo/blameRepoFiles.pl \
   --jobs="$JOBS" \
   --formatBlame=$CREGIT/blameRepo/formatBlame.pl \
@@ -921,7 +943,14 @@ DATASET_SCRIPT="$CREGIT/generate_dataset/generate_dataset.py"
 [ -f "$DATASET_SCRIPT" ] || die "dataset generator not found: $DATASET_SCRIPT"
 if [ -n "$PYTHON" ] && "$PYTHON" -c 'import duckdb' 2>/dev/null; then
 build_dataset_argv
-"$PYTHON" "$DATASET_SCRIPT" "${DATASET_ARGV[@]}"
+if [ -n "$PROFILE_TAG" ]; then
+    # cProfile has no environment hook, so this step is the one place the
+    # command line changes, and only when this step was selected.
+    "$PYTHON" -m cProfile -o "$PROFILE_DIR/$PROFILE_TAG.pstats" \
+        "$DATASET_SCRIPT" "${DATASET_ARGV[@]}"
+else
+    "$PYTHON" "$DATASET_SCRIPT" "${DATASET_ARGV[@]}"
+fi
 log "dataset written: $DATASET_PATH"
 elif [ "$SKIP_HTML" = 1 ]; then
 die "python3 with the duckdb module is unavailable (provided by devenv shell) and --skip-html suppressed the HTML views — this run produced no final artifact"
