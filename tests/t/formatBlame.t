@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 16;
+use Test::More tests => 20;
 use FindBin;
 use File::Temp qw(tempdir);
 
@@ -130,4 +130,45 @@ my $cid2 = commit_as($repo, "Bob", "second");
     my @right = grep { /^\Q$author\E;origin\.c;/ } @moved;
     is(scalar(@right), 6,
        "all six moved lines are credited to the author, naming origin.c");
+}
+
+# A commit that owns two NON-CONTIGUOUS groups of lines, in a file that has since
+# been renamed. git blame --porcelain prints a commit's header once and then
+# suppresses it, so the second group arrives with no `filename` line to read --
+# while --line-porcelain repeated it for every line. The filename is not
+# decoration: it is the second output field, and it holds the name of the file a
+# line came FROM, which is what -C100 is for. A reader that does not remember the
+# suppressed value silently drops it on every group after the first.
+#
+# Line 2 below belongs to a different commit than lines 1 and 3, which is what
+# splits the first commit into two groups and makes the suppression happen.
+{
+    my $repo3 = "$workdir/suppressed";
+    mkdir $repo3 or die $!;
+    git($repo3, "init -q -b main");
+
+    write_file("$repo3/old.c", "int one;\nint two;\nint three;\n");
+    git($repo3, "add old.c");
+    my $first = commit_as($repo3, "Alice", "write three lines");
+
+    write_file("$repo3/old.c", "int one;\nint TWO;\nint three;\n");
+    git($repo3, "add old.c");
+    my $second = commit_as($repo3, "Bob", "change only the middle line");
+
+    git($repo3, "mv old.c new.c");
+    commit_as($repo3, "Carol", "rename the file");
+
+    my $dest = tempdir(CLEANUP => 1);
+    my $status = system("perl '$script' '$repo3' new.c '$dest' 2>/dev/null");
+    is($status, 0, "formatBlame.pl succeeds on a split-commit renamed file");
+
+    my @lines = slurp_lines("$dest/new.c.blame");
+    is($lines[0], "$first;old.c;\tint one;",
+       "the first group of the split commit names the old filename");
+    is($lines[1], "$second;old.c;\tint TWO;",
+       "the intervening commit names the old filename");
+
+    # The regression: this is the group whose header git suppressed.
+    is($lines[2], "$first;old.c;\tint three;",
+       "the second group of the same commit still names the old filename");
 }
