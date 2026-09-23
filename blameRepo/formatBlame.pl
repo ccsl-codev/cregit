@@ -62,8 +62,8 @@ if ($verbose) {
     print STDERR "$0 processing repo [$repo] file [$file] [$dest]\n";
 }
 
-#open(IN, "git -C '$repo' blame  -C100 --line-porcelain '$file'|" ) or "unable to execute git ";
-open(IN, "git -C '$repo' blame --line-porcelain '$file'|" ) or "unable to execute git ";
+# -C100: credit a line moved in from another file to its author, not the mover.
+open(IN, "git -C '$repo' blame -C100 --line-porcelain '$file'|" ) or "unable to execute git ";
 while (my $l = Read_Record()) {
     print $fh $l;
     print $fh "\n";
