@@ -111,11 +111,7 @@ STUB
          "invalid jobs reports a useful error");
 }
 
-# A run cannot finish before its single longest file does, so the largest file
-# must not be the last one started: every other job slot would drain while it
-# runs alone. git ls-files order is alphabetical, which puts big files wherever
-# their names fall. Dispatch order is reported on STDERR as "N: name", so assert
-# on that rather than on timing, which would make the test flaky.
+# Dispatch order is reported on STDERR as "N: name"; assert on that, not timing.
 {
     my $sized = "$workdir/sized";
     mkdir $sized or die $!;
@@ -141,8 +137,7 @@ STUB
               "files are dispatched largest first, not alphabetically");
 }
 
-# Equal sizes must not reshuffle the queue: ties keep git ls-files order, so a
-# corpus of uniform files is dispatched exactly as it was before this change.
+# Ties keep ls-files order, so uniform input is dispatched as it was before.
 {
     my $tied = "$workdir/tied";
     mkdir $tied or die $!;

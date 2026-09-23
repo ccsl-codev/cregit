@@ -132,16 +132,8 @@ my $cid2 = commit_as($repo, "Bob", "second");
        "all six moved lines are credited to the author, naming origin.c");
 }
 
-# A commit that owns two NON-CONTIGUOUS groups of lines, in a file that has since
-# been renamed. git blame --porcelain prints a commit's header once and then
-# suppresses it, so the second group arrives with no `filename` line to read --
-# while --line-porcelain repeated it for every line. The filename is not
-# decoration: it is the second output field, and it holds the name of the file a
-# line came FROM, which is what -C100 is for. A reader that does not remember the
-# suppressed value silently drops it on every group after the first.
-#
-# Line 2 below belongs to a different commit than lines 1 and 3, which is what
-# splits the first commit into two groups and makes the suppression happen.
+# Two non-contiguous groups from one commit, in a renamed file: --porcelain
+# suppresses the second group's header, and field 2 must survive that.
 {
     my $repo3 = "$workdir/suppressed";
     mkdir $repo3 or die $!;

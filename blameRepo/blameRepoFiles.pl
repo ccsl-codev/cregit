@@ -101,13 +101,8 @@ foreach (@trackedFiles) {
     push @filesToBlame, $name;
 }
 
-# Largest first. One blame is one process, so a run ends no earlier than its
-# longest single file: start that file last and every other job slot drains while
-# it runs alone. Size is the only cost proxy available up front, and a fair one --
-# blame cost grows with lines x revisions. It matters because the distribution is
-# skewed: in googleapis/google-cloud-java the median masked file is 4.9 KB, the
-# largest is 6.6 MB, and the top 1% hold 19.2% of all bytes, while git ls-files
-# order is alphabetical. Ties keep that order, so uniform input is unaffected.
+# Largest first: a run ends no earlier than its longest single file, and ls-files
+# order is alphabetical. Ties keep that order.
 {
     my %sizeOf;
     foreach my $name (@filesToBlame) {
