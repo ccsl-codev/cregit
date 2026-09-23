@@ -183,10 +183,7 @@ sub Verify_Parse
     if (defined $srcmlStatus and $srcmlStatus > 128) {
         my $signal = $srcmlStatus - 128;
         Parser_Crash($filename,
-            "srcml was killed by signal $signal (shell status $srcmlStatus). "
-            . "srcML 1.1.0 dies on a signal on some C/C++ inputs when --position "
-            . "is given; --position cannot be dropped because the token format "
-            . "depends on it.");
+            "srcml was killed by signal $signal (shell status $srcmlStatus).");
     }
     if (defined $srcmlStatus and $srcmlStatus != 0) {
         Parser_Crash($filename, "srcml exited $srcmlStatus.");
