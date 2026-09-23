@@ -23,8 +23,6 @@ object BlobExec {
   /** Per-blob wall-clock budget for the external command, in seconds. */
   val DefaultTimeoutSeconds: Int = 600
 
-  /** Tokenizer status meaning "no usable tokenization". Any tokenizer may use it;
-    * only tokenizeSrcMl.pl does today. tests/t/tokenizeSrcMl.t holds the two in step. */
   val ParserCrashExitCode: Int = 33
 
   sealed trait Outcome
