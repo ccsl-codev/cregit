@@ -1,12 +1,3 @@
-// Cross-tokenizer framing contract: every tokenizer must emit the same line
-// framing, because one downstream parser reads all of their output. Consumers
-// split on `|` with a non-greedy first group, so an extra leading field silently
-// shifts every column instead of failing.
-//
-// The reference is tokenizeSrcMl.pl's committed golden output, so these tests need
-// neither srcml nor a C compiler. srcMLtoken's expected/*.token files are NOT the
-// reference: they are srcml2token's TAB-separated intermediate output.
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::process::Command;
@@ -15,7 +6,6 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_rust_tokenizer")
 }
 
-// Paths are relative to the crate root, which is cargo's CWD for integration tests.
 const SRCML_GOLDEN_NOPOS: &str = "../../tests/t/expected/main.c.nopos.token";
 const SRCML_GOLDEN_POS: &str = "../../tests/t/expected/main.c.token";
 const LANGUAGES_PM: &str = "../CregitLanguages.pm";
@@ -39,7 +29,6 @@ enum Mode {
     Positioned,
 }
 
-/// A TAB is srcml2token's intermediate separator and must never reach a consumer.
 fn reject_intermediate_tab_separator(lines: &[&str]) -> Result<(), String> {
     for (i, l) in lines.iter().enumerate() {
         if l.contains('\t') {
@@ -129,8 +118,6 @@ fn split_prefix<'a>(line: &'a str, mode: &Mode) -> Result<(&'a str, &'a str), St
     }
 }
 
-/// A position prefix is `LINE:COL`, each component digits or a literal `-`.
-/// All three of `N:N`, `N:-` and `-:-` occur in tokenizeSrcMl.pl's output.
 fn looks_like_position(s: &str) -> bool {
     fn component(c: &str) -> bool {
         c == "-" || (!c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))

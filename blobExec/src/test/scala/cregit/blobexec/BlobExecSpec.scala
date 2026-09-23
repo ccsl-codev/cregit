@@ -123,7 +123,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   test("the parser-crash exit status is Skip, counted, and never a Replace") {
     val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
-    // Output first, so the status is what rejects it, not the emptiness check.
     val cmd = shellScript(s"echo 'partial tokens'; exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
                  abortOnError = false, inserter,
@@ -133,8 +132,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("a parser crash skips one blob even with abortOnError, like a timeout") {
-    // One crashing blob must not end the run. It gates publication through the exit
-    // status instead (Main.exitStatus), which is where a timeout gates it too.
     val cmd = shellScript(s"exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
                  abortOnError = true, inserter) shouldBe BlobExec.Outcome.Skip
@@ -157,8 +154,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     timeouts.get shouldEqual 1
     crashes.get  shouldEqual 1   // a timeout is not a crash
 
-    // A healthy blob and an ordinary failure must leave both counts alone, or a
-    // project would be held back from publication for nothing.
     run(shellScript("tr a-z A-Z"))
     run(shellScript("exit 7"))
     crashes.get  shouldEqual 1
@@ -260,9 +255,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("the crash status blobExec recognises is the one tokenizeSrcMl.pl exits with") {
-    // Two languages, one number. A comment saying "must match" does not run, and a
-    // drift is silent: the crash would fall through to the generic non-zero arm, never
-    // reach onParserCrash, and the run would exit 0 with an incomplete project.
     val perl = new String(Files.readAllBytes(Paths.get("../tokenize/tokenizeSrcMl.pl")), UTF_8)
     val declared = """\$PARSER_CRASH_EXIT\s*=\s*(\d+)""".r.findFirstMatchIn(perl)
       .getOrElse(fail("no $PARSER_CRASH_EXIT in tokenize/tokenizeSrcMl.pl"))
