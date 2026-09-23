@@ -348,11 +348,17 @@ def build_tiny_project(tmp_path):
     return blame, src, cregit_db, persons_db
 
 
-def generate(monkeypatch, tmp_path, repo_name="proj", argv_extra=()):
-    """Run main() for real and return the Parquet path."""
+def generate(monkeypatch, tmp_path, repo_name="proj", argv_extra=(), seed=None):
+    """Run main() for real and return the Parquet path.
+
+    `seed(cregit_db, persons_db)` runs between the fixture and main(), for the
+    tests that need a trailer or a person in the input.
+    """
     import generate_dataset as gd
 
     blame, src, cregit_db, persons_db = build_tiny_project(tmp_path)
+    if seed is not None:
+        seed(cregit_db, persons_db)
     out = tmp_path / "out" / "proj-dataset.parquet"
     monkeypatch.setattr(gd.sys, "argv", [
         "generate_dataset.py",
@@ -440,3 +446,49 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
         generate(monkeypatch, tmp_path,
                  argv_extra=("--project-meta", str(meta)))
     assert not (tmp_path / "out" / "proj-dataset.parquet").exists()
+
+
+# --------------------------------------------------------------------------- #
+# footer trailers resolve to personids
+
+
+def seed_trailer(value, *, email_rows=()):
+    """Give the tiny project one Reviewed-by trailer and the emails rows given."""
+    def seed(cregit_db, persons_db):
+        con = sqlite3.connect(cregit_db)
+        con.execute("INSERT INTO footers VALUES (?,?,?,?)",
+                    (SHA, 0, "Reviewed-by", value))
+        con.commit()
+        con.close()
+
+        con = sqlite3.connect(persons_db)
+        for personid, emailaddr, emailname in email_rows:
+            con.execute(
+                "INSERT INTO emails (personid, fullemail, emailaddr, emailname, "
+                "lcemail, userid, domain) VALUES (?,?,?,?,?,?,?)",
+                (personid, f"{emailname} <{emailaddr}>", emailaddr, emailname,
+                 emailaddr.lower(), personid, emailaddr.partition("@")[2]))
+            con.execute("INSERT INTO persons VALUES (?,?)", (personid, emailname))
+        con.commit()
+        con.close()
+    return seed
+
+
+def footer_personids(duckdb, out):
+    return duckdb.sql("select footer_personids from read_parquet(?)",
+                      params=[str(out)]).fetchall()[0][0]
+
+
+def test_a_trailer_carrying_a_bare_address_resolves_to_its_person(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_trailer(
+        "Bob bob@example.com", email_rows=[("p_bob", "bob@example.com", "Bob")]))
+    assert footer_personids(duckdb, out) == ["p_bob"]
+
+
+def test_a_trailer_with_no_address_does_not_match_an_empty_emails_row(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_trailer(
+        "Former-commit-id: 0123456789abcdef0123456789abcdef01234567",
+        email_rows=[("p_empty", "", "Nameless")]))
+    assert footer_personids(duckdb, out) == []
