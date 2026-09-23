@@ -26,8 +26,6 @@ fn run_pos(fixture: &str) -> String {
     String::from_utf8(out.stdout).expect("stdout is not utf-8")
 }
 
-// Assert on WHOLE lines, not substrings. The bug this file failed to catch was an extra
-// leading `line:col<TAB>` field, and a substring assertion cannot see a line's prefix.
 #[track_caller]
 fn assert_has_line(s: &str, expected: &str) {
     assert!(
@@ -42,12 +40,10 @@ fn assert_has_line(s: &str, expected: &str) {
 fn hello_has_unit_markers_and_expected_tokens() {
     let s = run("hello.rs");
     let mut lines = s.lines();
-    // No position prefix without --position: this is the format the pipeline consumes.
     assert_eq!(
         lines.next().unwrap(),
         "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1"
     );
-    // ... and it closes with `end_unit` plus the bare end-of-unit marker line.
     let tail: Vec<&str> = s.lines().rev().take(2).collect();
     assert_eq!(tail, vec!["", "end_unit"]);
     // values are emitted raw (no quoting), matching what prettyPrint expects
@@ -133,9 +129,6 @@ fn no_path_prints_usage_and_exits_2() {
 
 #[test]
 fn dispatcher_flags_are_accepted() {
-    // tokenize.pl passes these; the binary must accept them and still succeed. Note
-    // --position is HONORED, not ignored: tokenizeSrcMl.pl gates its position prefix on
-    // the same flag, and the pipeline (run_pipeline_process.sh:891) passes neither.
     let out = run_args(&["--language=Rust", "--position", "--verbose", "tests/fixtures/hello.rs"]);
     assert!(out.status.success(), "binary exited with {}", out.status);
     assert_has_line(&String::from_utf8_lossy(&out.stdout), "2:1|keyword|fn");

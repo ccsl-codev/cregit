@@ -115,10 +115,6 @@ for rc in 4 5; do
 done
 
 echo "case 5bis: serial branch, blobExec exits 6 - parser-crash marker written"
-# The silent-empty defect: srcML dies on a signal, the wrapper used to report
-# success with zero bytes, and a 0-byte tokenization was published. Exit 6 is that
-# failure made visible, and it must keep the work rather than wipe it: the fix is a
-# denylist entry or a fixed srcML, not a re-run, so the memo has to survive.
 W=$(fixture)
 OUT=$(STUB_RC=6 run_step2 "$W"); RC=$?
 [ "$RC" -ne 0 ]; check "step 2 refuses to continue (exit $RC)" $?
@@ -136,8 +132,6 @@ OUT=$(STUB_RC=6 run_step2 "$W" --mode sharded --shards 2); RC=$?
 rm -rf "$W"
 
 echo "case 5quater: shard_build.sh propagates 6 rather than collapsing to 1"
-# Without this a parser crash in a sharded build exits 1, the marker is never
-# written, and a later step-1 run deletes a days-long build to rediscover it.
 O=$(mktemp -d "${TMPDIR:-/tmp}/shardout-XXXXXX")
 S=$(mktemp -d "${TMPDIR:-/tmp}/shardsrc-XXXXXX")
 PATH="$BIN:$PATH" STUB_RC=6 timeout 300 "$SHARD_BUILD" \

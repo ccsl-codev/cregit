@@ -196,7 +196,6 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("a crash rate past tolerance blocks publication, with its own status") {
-    // 2 of 100 is 2%, past the 1% tolerated.
     Main.exitStatus(stats(blobsParserCrashed = 2, blobsTokenized = 100)) shouldEqual
       Main.ParserCrashedExitStatus
   }
@@ -218,11 +217,6 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
       Main.ParserCrashedExitStatus
   }
 
-  // Regression: this status was first written as 5, which is already
-  // Walker.StalledExitStatus — so a parser crash would have been reported to
-  // run_pipeline_process.sh as a stall, sending the operator to --blob-timeout for
-  // a segfault and writing the wrong marker file. Every status blobExec can exit
-  // with must be distinct, so assert the whole set rather than just one pair.
   test("the parser-crash status collides with no other blobExec exit status") {
     val others = Map(
       "clean"       -> 0,

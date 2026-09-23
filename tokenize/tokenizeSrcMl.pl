@@ -20,8 +20,6 @@ use FindBin;
 use lib $FindBin::Bin;
 use CregitLanguages;
 
-# Exit status for "no usable tokenization". Below 128, and clear of blobExec's
-# 2, 3 and 4 and of GNU timeout's 124 and 137.
 our $PARSER_CRASH_EXIT = 33;
 
 my %declarations;
@@ -112,9 +110,6 @@ sub Tokenize
     chomp $saveDir;
     my ($filename) = @_;
 
-    # `close` reports only the LAST stage's status, and srcml2token exits 0 on the
-    # truncated XML a crashed srcML leaves behind. PIPESTATUS is the only way to
-    # see both stages; it encodes a signal death as 128+signal, not a wait status.
     my ($statusFh, $statusFile) =
         tempfile("cregit-pipestatus-XXXXXX", TMPDIR => 1, UNLINK => 1);
     close $statusFh;
@@ -125,7 +120,6 @@ sub Tokenize
         Shell_Quote($filename), Shell_Quote($srcml2token),
         Shell_Quote($statusFile));
 
-    # bash, not sh: PIPESTATUS is a bashism.
     open(parser, "-|", "bash", "-c", $pipeline)
         or die "Unable to execute srcml pipeline on file [$filename]: $!";
 
@@ -172,7 +166,6 @@ sub Tokenize
     Verify_Parse($filename, $tokensRead, $statusFile, $closed, $closeStatus);
 }
 
-# Single-quote a string for the shell.
 sub Shell_Quote
 {
     my ($s) = @_;
@@ -181,7 +174,6 @@ sub Shell_Quote
     return "'$s'";
 }
 
-# Fail closed: anything but two clean stages and a non-empty stream is a defect.
 sub Verify_Parse
 {
     my ($filename, $tokensRead, $statusFile, $closed, $closeStatus) = @_;
@@ -208,19 +200,12 @@ sub Verify_Parse
         Parser_Crash($filename, "srcml2token exited $tokenStatus.");
     }
 
-    # If bash never wrote the statuses we cannot claim the parse was clean, so the
-    # close status is used as a (weaker) backstop rather than ignored.
     if (not defined $srcmlStatus or not defined $tokenStatus) {
         if (not $closed or $closeStatus != 0) {
             Parser_Crash_Unknown($filename, $closeStatus);
         }
     }
 
-    # The emptiness invariant, and the reason a crash can be caught even without
-    # PIPESTATUS: a successful srcML tokenization is NEVER empty. Even a zero-byte
-    # source file yields the 80-byte begin_unit/end_unit wrapper, for an empty and
-    # a whitespace-only file alike. So zero tokens here always means the parse
-    # failed, where a general-purpose filter could read it as empty input.
     if ($tokensRead == 0) {
         Parser_Crash($filename,
             "the token stream was empty. A successful srcML parse always emits at "
@@ -229,8 +214,6 @@ sub Verify_Parse
     }
 }
 
-# Reads the two shell statuses bash left behind. Returns (undef, undef) when the
-# file is missing or unparseable, so the caller can fall back rather than assume 0.
 sub Read_Pipe_Status
 {
     my ($statusFile) = @_;

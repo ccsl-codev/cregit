@@ -844,7 +844,6 @@ final class Walker(
     inFlightBlobs.put(label, System.nanoTime())
     try {
       blobCommandExecutions.increment()
-      // Either callback means nothing about this blob may be persisted.
       val unusable = new AtomicBoolean(false)
       val outcome = BlobExec.run(
         bytes        = bytes,
@@ -861,7 +860,6 @@ final class Walker(
       val res = outcome match {
         case BlobExec.Outcome.Skip if unusable.get() =>
           // The tree must still reference something, so keep the original bytes
-          // available — but report it as Unusable so nothing gets persisted.
           ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
           BlobResult.Unusable(task.origId)
         case BlobExec.Outcome.Skip =>
@@ -998,7 +996,6 @@ final class Walker(
           inFlightBlobs.put(label, System.nanoTime())
           try {
             blobCommandExecutions.increment()
-            // Either callback means nothing about this blob may be persisted.
       val unusable = new AtomicBoolean(false)
             val outcome = BlobExec.run(
               bytes        = bytes,
