@@ -300,13 +300,14 @@ produces no blame and no dataset row rather than rows of unparsed text:
 
 | Mechanism | Recorded as | Effect here |
 |---|---|---|
-| the **blob denylist**, `blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list is a data file so a paper can cite it; nothing at run time can extend or override it |
+| the **blob denylist**, `blobExec/src/main/scala/cregit/blobexec/BlobDenylistEntries.scala` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list ships in the jar; nothing at run time can extend or override it |
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
 | a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
 
 One example, so the shape is clear: [`2ee2673a`](https://github.com/tencent/tencentkona-21/blob/2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65/test/langtools/tools/javac/annotations/typeAnnotations/newlocations/TestNewCastArray.java)
 — srcML 1.1.0's Java parser does not terminate on type-annotated array types
-(upstream [`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361), open).
+(upstream [`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361), closed by the
+revision `nix/srcml.nix` pins).
 The list is keyed by content, not path: this file moved in a repository
 reorganisation, so its four revisions at two paths are four entries. Failure is
 non-termination, not slowness — 0 bytes out, one core at 100%, at every budget

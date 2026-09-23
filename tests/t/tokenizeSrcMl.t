@@ -20,7 +20,7 @@ plan skip_all => "ctags not on PATH"
 plan skip_all => "srcml2token not built (cd tokenize/srcMLtoken && make)"
     unless -x $srcml2token;
 
-plan tests => 21;
+plan tests => 24;
 
 my $workdir = tempdir(CLEANUP => 1);
 
@@ -108,6 +108,27 @@ sub run_tokenizer {
              "stderr names the signal, so srcml's death is attributed to srcml "
              . "and not to srcml2token, which exits 0 on the truncated XML");
     }
+}
+
+{
+    my $dies = "$workdir/srcml-that-dies";
+    open(my $fh, '>', $dies) or die $!;
+    print $fh "#!/bin/sh\nkill -SEGV \$\$\n";
+    close $fh;
+    chmod 0755, $dies or die $!;
+
+    my $victim = "$workdir/ordinary.c";
+    open($fh, '>', $victim) or die $!;
+    print $fh "int main() { return 0; }\n";
+    close $fh;
+
+    my ($status, $out, $err) =
+        run_tokenizer("--srcml='$dies'", "--position", "'$victim'");
+
+    is($status >> 8, $PARSER_CRASH_EXIT,
+       "a srcml killed by a signal exits $PARSER_CRASH_EXIT, whatever srcml we ship");
+    is($out, "", "and emits no tokenization");
+    like($err, qr/killed by signal 11/, "and names the signal on stderr");
 }
 
 {
