@@ -26,6 +26,9 @@ jobs:
             experimental-features = nix-command flakes
             accept-flake-config = true
 
+      - name: Cache the store paths no public cache has
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+
       - name: Set up Cachix (devenv)
         uses: cachix/cachix-action@v17
         with:
