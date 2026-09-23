@@ -51,8 +51,7 @@ HTML views land in the sibling directory `../cregit-files/html`. See
 ## Preliminaries
 
 - Code is written in Scala, C++, Rust and Perl.
-- Platform: Linux x86_64 or macOS arm64 — the pinned `srcml` 1.1.0 parser is a
-  prebuilt binary available only for those platforms.
+- Platform: Linux x86_64 or macOS arm64 — `devenv` builds the pinned `srcml` parser from source for those platforms (`nix/srcml.nix`). The 1.1.0 release binary segfaults under `--position`, which the pipeline always passes, and the fix is upstream but unreleased, so we pin a revision rather than a release. `srcml --version` still prints `1.1.0`.
 
 ## Prerequisites
 
@@ -177,7 +176,8 @@ would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 
 Four blobs in one corpus project are on a **blob denylist**
 (`blobExec/src/main/scala/cregit/blobexec/BlobDenylistEntries.scala`): srcML 1.1.0 does
-not terminate on them (upstream srcML/srcML#2361, open). They are never handed to
+not terminate on them (upstream srcML/srcML#2361, which the revision we now pin closes,
+so the entries should be inert). They are never handed to
 the tokenizer, are dropped from the rewritten trees rather than kept as raw
 source, are counted as `blobsDenylisted` and named with a reason and a citation —
 and, unlike a tokenizer timeout, they do **not** change the exit status. Adding an
