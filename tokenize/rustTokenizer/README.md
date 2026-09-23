@@ -26,8 +26,7 @@ is **honored**: it adds the position prefix described below.
 
 ## Output format
 
-Without `--position` — this is what the pipeline uses
-(`run_pipeline_process.sh` builds `BFG_TOKENIZE_CMD` without the flag):
+Without `--position`, which is what the pipeline uses:
 
 ```
 begin_unit|revision:...;language:Rust;cregit-version:...
@@ -51,34 +50,6 @@ One token per line. `kind` is one of `keyword`, `identifier`, `lifetime`, `liter
 `comment`, `op`, or `unknown`. The `value` is emitted verbatim, with embedded newlines in
 literals and block comments folded to spaces so each token stays on one line. Whitespace
 produces no line. Columns count code points, not bytes.
-
-### The separator is `|`, and the position prefix is opt-in
-
-Both are load-bearing, and both were wrong until fixed: this tokenizer used a TAB and
-emitted the prefix unconditionally, which corrupted 36,534,136 published dataset rows
-across 44 projects.
-
-The format is defined by `tokenizeSrcMl.pl`, the only other tokenizer the pipeline routes
-to, and its committed golden output is the reference:
-
-| file | shape |
-| --- | --- |
-| `tests/t/expected/main.c.nopos.token` | `begin_unit\|…`, `comment\|/* … */` |
-| `tests/t/expected/main.c.token` | `-:-\|begin_unit\|…`, `1:1\|comment\|/* … */` |
-
-Both downstream consumers split on `|`:
-
-- `generate_dataset/generate_dataset.py` — `re.match(r"^(.+?)\|(.+)$", token_content)`
-- `prettyPrint/prettyPrint-author.pl` — `split('\|', $value)`
-
-The first capture group is **non-greedy**, so any extra leading field silently becomes
-`token_type` and shifts `token_value`, `source_text` and `is_structural` by one. Nothing
-errors; the data is just wrong.
-
-Do **not** take `tokenize/srcMLtoken/tests/expected/*.token` as the reference. It is
-TAB-separated, but it is `srcml2token`'s *intermediate* output, which `tokenizeSrcMl.pl`
-consumes with `/^([0-9]+|-):([0-9]+|-)\s+(.+)$/` and re-emits with `|`. It reaches no
-consumer. `tests/framing.rs` pins this contract across tokenizers.
 
 ## How to build
 

@@ -37,9 +37,6 @@ object Main {
     * succeeded, but the output is incomplete and must not be validated. */
   private[blobexec] val TimedOutExitStatus = 4
 
-  /** Any tokenizer reported no usable tokenization: it exited
-    * [[BlobExec.ParserCrashExitCode]], or exited 0 with no output for a non-empty blob.
-    * Distinct from [[TimedOutExitStatus]] because more time does not help a crash. */
   private[blobexec] val ParserCrashedExitStatus = 6
 
   /** Upper bound on either timeout flag. A week is already far past any real
@@ -51,21 +48,11 @@ object Main {
     * within [[MaxTimeoutSeconds]], else None. Zero is rejected rather than read
     * as "no limit". */
 
-  /** Fraction of tokenized blobs allowed to crash before the run is unpublishable.
-    * A rate, not a count, so it holds for a 5,000-blob project and a 500,000-blob one.
-    * A few pathological inputs land far below it; an srcML that has stopped parsing C
-    * lands far above. */
   private[blobexec] val ToleratedCrashRate = 0.01
 
-  /** Crashes allowed for this walk. Always at least one below the rate, so a small
-    * project is not gated by rounding, and never zero-tolerance on an empty walk. */
   private[blobexec] def toleratedCrashes(blobsTokenized: Long): Long =
     math.max(1L, (blobsTokenized * ToleratedCrashRate).toLong)
 
-  /** The process exit status for a finished walk. An abort or a killed tokenizer gates
-    * publication outright. A crash gates only past [[ToleratedCrashRate]]: the blob is
-    * excluded either way, so one pathological input must not cost a whole project.
-    * blobsOversized and blobsDenylisted never gate. */
   private[blobexec] def exitStatus(stats: WalkStats): Int = {
     val tokenized = stats.blobsRunThroughCommand.toLong + stats.blobsCacheHit.toLong
     if (stats.aborted) 2

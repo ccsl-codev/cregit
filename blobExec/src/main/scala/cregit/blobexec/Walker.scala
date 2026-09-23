@@ -29,9 +29,6 @@ final case class WalkStats(
     /** Distinct mask-matched blobs excluded because they are on the shipped blob
       * denylist. Reported, not gating. */
     blobsDenylisted: Long,
-    /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]: srcML died
-      * on a signal, or produced no tokens. Gates publication like
-      * [[blobsTimedOut]], counted apart because the remedies differ. */
     blobsParserCrashed: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
