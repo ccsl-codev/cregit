@@ -63,7 +63,8 @@ if ($verbose) {
 }
 
 # -C100: credit a line moved in from another file to its author, not the mover.
-open(IN, "git -C '$repo' blame -C100 --line-porcelain '$file'|" ) or "unable to execute git ";
+# --porcelain: same shas, but the header once per commit instead of once per line.
+open(IN, "git -C '$repo' blame -C100 --porcelain '$file'|" ) or "unable to execute git ";
 while (my $l = Read_Record()) {
     print $fh $l;
     print $fh "\n";
@@ -76,21 +77,36 @@ if ($verbose) {
 }
 
 
+# Suppressed headers still owe field 2 a filename.
+my %filenameOfCommit;
+
 sub Read_Record {
     my $f ;
     my $cid;
+    my $sawFilename;
     while (<IN>) {
 	chomp;
         if ($_ =~ /^([0-9a-f]{40}) [0-9]/ ) {
             $cid = $1;
             $f = "$1;";
+            $sawFilename = 0;
         } elsif ($_ =~ /^(filename) (.+)$/) {
+            $filenameOfCommit{$cid} = $2 if defined $cid;
+            $sawFilename = 1;
 	    if ($2 ne $file) {
 		$f .=  $2 . ";";
 	    } else {
 		$f .= ";";
 	    }
 	} elsif (/^	(.*)/) { #actual line
+            if (not $sawFilename) {
+                my $known = defined $cid ? $filenameOfCommit{$cid} : undef;
+                if (defined $known and $known ne $file) {
+                    $f .= $known . ";";
+                } else {
+                    $f .= ";";
+                }
+            }
 	    $f = $f . $_;
 	    return $f;
 	} else {

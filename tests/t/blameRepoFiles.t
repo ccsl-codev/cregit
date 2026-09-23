@@ -111,4 +111,53 @@ STUB
          "invalid jobs reports a useful error");
 }
 
+# Dispatch order is reported on STDERR as "N: name"; assert on that, not timing.
+{
+    my $sized = "$workdir/sized";
+    mkdir $sized or die $!;
+    git($sized, "init -q -b main");
+    # Alphabetical order here is the exact opposite of size order.
+    write_file("$sized/a_small.c",  "int a;\n");
+    write_file("$sized/b_big.c",    "int b;\n" x 400);
+    write_file("$sized/c_medium.c", "int c;\n" x 20);
+    git($sized, "add .");
+    git($sized, "commit -q -m first");
+
+    my $sizedOut = "$workdir/sized-out";
+    mkdir $sizedOut or die $!;
+    system("perl '$script' '$sized' '$sizedOut' '\\.c\$' 2>'$workdir/order'") == 0
+        or die "sized run failed";
+
+    open(my $fh, '<', "$workdir/order") or die $!;
+    my @dispatched;
+    while (<$fh>) { push @dispatched, $1 if /^\d+: (.+)$/; }
+    close $fh;
+
+    is_deeply(\@dispatched, ['b_big.c', 'c_medium.c', 'a_small.c'],
+              "files are dispatched largest first, not alphabetically");
+}
+
+# Ties keep ls-files order, so uniform input is dispatched as it was before.
+{
+    my $tied = "$workdir/tied";
+    mkdir $tied or die $!;
+    git($tied, "init -q -b main");
+    write_file("$tied/$_.c", "int x;\n") for qw(a b c);
+    git($tied, "add .");
+    git($tied, "commit -q -m first");
+
+    my $tiedOut = "$workdir/tied-out";
+    mkdir $tiedOut or die $!;
+    system("perl '$script' '$tied' '$tiedOut' '\\.c\$' 2>'$workdir/tied-order'") == 0
+        or die "tied run failed";
+
+    open(my $fh, '<', "$workdir/tied-order") or die $!;
+    my @dispatched;
+    while (<$fh>) { push @dispatched, $1 if /^\d+: (.+)$/; }
+    close $fh;
+
+    is_deeply(\@dispatched, ['a.c', 'b.c', 'c.c'],
+              "equally sized files keep git ls-files order");
+}
+
 done_testing();

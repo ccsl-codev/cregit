@@ -101,6 +101,22 @@ foreach (@trackedFiles) {
     push @filesToBlame, $name;
 }
 
+# Largest first: a run ends no earlier than its longest single file, and ls-files
+# order is alphabetical. Ties keep that order.
+{
+    my %sizeOf;
+    foreach my $name (@filesToBlame) {
+        $sizeOf{$name} = -s "$repoDir/$name" || 0;
+    }
+    my $i = 0;
+    my %order = map { $_ => $i++ } @filesToBlame;
+    @filesToBlame = sort {
+        $sizeOf{$b} <=> $sizeOf{$a}
+            or
+        $order{$a} <=> $order{$b}
+    } @filesToBlame;
+}
+
 # Before the first fork, so two workers cannot race to create the same directory.
 make_output_dirs($outputDir, $blameExtension, \@filesToBlame);
 
