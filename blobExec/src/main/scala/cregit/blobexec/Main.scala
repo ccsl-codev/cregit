@@ -71,10 +71,16 @@ object Main {
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--tokenizer-worker <path>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
+      |  --tokenizer-worker <path>
+      |                    keep one protocol-speaking tokenizer process alive per
+      |                    available processor and route blob requests through it.
+      |                    The worker receives BFG_MEMO_DIR and BFG_TOKENIZE_CMD
+      |                    from this process; without this flag <command> is run
+      |                    once per blob as before.
       |  --blob-timeout=<seconds>
       |                    budget for one <command> invocation (default ${BlobExec.DefaultTimeoutSeconds}).
       |                    A child that exceeds it is killed with everything
@@ -135,7 +141,24 @@ object Main {
       |""".stripMargin
 
   def main(args: Array[String]): Unit = {
-    val (flags, positional) = args.partition(_.startsWith("-"))
+    val remainingArgs = Vector.newBuilder[String]
+    var tokenizerWorkerPath: Option[java.nio.file.Path] = None
+    var argIndex = 0
+    while (argIndex < args.length) {
+      if (args(argIndex) == "--tokenizer-worker") {
+        if (tokenizerWorkerPath.isDefined || argIndex + 1 >= args.length) {
+          System.err.println("Error: --tokenizer-worker requires exactly one path")
+          System.err.println(Usage)
+          sys.exit(1)
+        }
+        tokenizerWorkerPath = Some(Paths.get(args(argIndex + 1)))
+        argIndex += 2
+      } else {
+        remainingArgs += args(argIndex)
+        argIndex += 1
+      }
+    }
+    val (flags, positional) = remainingArgs.result().partition(_.startsWith("-"))
 
     var abortOnError = false
     var pipeline     = false
@@ -238,6 +261,12 @@ object Main {
       System.err.println(s"Error: command [$command] does not exist")
       sys.exit(1)
     }
+    tokenizerWorkerPath.foreach { path =>
+      if (!Files.isRegularFile(path) || !Files.isExecutable(path)) {
+        System.err.println(s"Error: tokenizer worker [$path] is not an executable file")
+        sys.exit(1)
+      }
+    }
     if (mask.isEmpty) {
       System.err.println("Error: fileMaskRegex must be non-empty")
       sys.exit(1)
@@ -258,7 +287,8 @@ object Main {
         s"abortOnError=$abortOnError pipeline=$pipeline pipelineTrees=$pipelineTrees " +
         s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s " +
         s"stallTimeout=${stallTimeoutSeconds}s incremental=$incremental " +
-        s"denylistEntries=${denylist.size}"
+        s"denylistEntries=${denylist.size} " +
+        s"tokenizerWorker=${tokenizerWorkerPath.map(_.toString).getOrElse("off")}"
     )
 
     val src: FileRepository = openSrc(srcPath)
@@ -272,14 +302,28 @@ object Main {
 
     // The cumulative figure is forensic only: gating on it would make one past
     // timeout permanent.
+    var workerPool: Option[TokenizerWorkerPool] = None
+    var workerShutdownHook: Option[Thread] = None
     val (stats, timedOutEver) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
+      workerPool = tokenizerWorkerPath.map { path =>
+        val workerEnv = Seq("BFG_MEMO_DIR", "BFG_TOKENIZE_CMD").flatMap { key =>
+          sys.env.get(key).map(key -> _)
+        }.toMap
+        new TokenizerWorkerPool(Seq(path.toString), workerEnv, parallelism, blobTimeoutSeconds)
+      }
+      workerShutdownHook = workerPool.map { pool =>
+        val hook = new Thread(() => pool.close(), "tokenizer-worker-pool-shutdown")
+        Runtime.getRuntime.addShutdownHook(hook)
+        hook
+      }
       val walker = new Walker(
         src, dst, mapping, mask.r, command, abortOnError, parallelism,
         pipeline, pipelineTrees, shard,
         destinationMayContainObjects = incremental,
         blobTimeoutSeconds = blobTimeoutSeconds,
         stallTimeoutSeconds = stallTimeoutSeconds,
+        workerPool = workerPool,
         denylist = denylist
       )
       val s = walker.run()
@@ -288,6 +332,11 @@ object Main {
       if (s.blobsTimedOut > 0) mapping.setMeta(BlobsTimedOutMetaKey, total.toString)
       (s, total)
     } finally {
+      workerPool.foreach(_.close())
+      workerShutdownHook.foreach { hook =>
+        try Runtime.getRuntime.removeShutdownHook(hook)
+        catch { case _: IllegalStateException => () }
+      }
       mapping.close()
       dst.close()
       src.close()

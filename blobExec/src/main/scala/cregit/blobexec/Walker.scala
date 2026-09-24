@@ -57,6 +57,7 @@ final class Walker(
     destinationMayContainObjects: Boolean = true,
     blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
     stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
+    workerPool: Option[TokenizerWorkerPool] = None,
     denylist: BlobDenylist = BlobDenylist.shipped
 ) {
   import Walker._
@@ -842,6 +843,8 @@ final class Walker(
     try {
       blobCommandExecutions.increment()
       val unusable = new AtomicBoolean(false)
+      val invocationResult =
+        workerPool.map(_.invoke(bytes, task.origId.name, task.filename, task.fullPath))
       val outcome = BlobExec.run(
         bytes        = bytes,
         origSha      = task.origId.name,
@@ -852,7 +855,8 @@ final class Walker(
         inserter     = workerInserter,
         timeoutSeconds = blobTimeoutSeconds,
         onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
+        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
+        invocationResult = invocationResult
       )
       val res = outcome match {
         case BlobExec.Outcome.Skip if unusable.get() =>

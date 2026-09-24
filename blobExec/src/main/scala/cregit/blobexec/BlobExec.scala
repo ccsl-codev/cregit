@@ -46,11 +46,12 @@ object BlobExec {
       inserter: ObjectInserter,
       timeoutSeconds: Int = DefaultTimeoutSeconds,
       onTimeout: () => Unit = () => (),
-      onParserCrash: () => Unit = () => ()
+      onParserCrash: () => Unit = () => (),
+      invocationResult: Option[ChildRunner.Outcome] = None
   ): Outcome = {
     val env = Seq("BFG_BLOB" -> origSha, "BFG_FILENAME" -> filename, "BFG_PATH" -> fullPath)
 
-    new ChildRunner(timeoutSeconds).run(command, bytes, env) match {
+    invocationResult.getOrElse(new ChildRunner(timeoutSeconds).run(command, bytes, env)) match {
       case ChildRunner.Outcome.Killed(why) =>
         System.err.println(
           s"Warning: command [$command] on blob $origSha at path [$fullPath] gave no usable " +

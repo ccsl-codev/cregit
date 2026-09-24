@@ -82,6 +82,10 @@ Output:
                                   with millions of loose objects.
                     A failed pack never aborts the run: the Parquet dataset is
                     the product, and packing only makes later steps faster.
+  --tokenizer-worker
+                    keep one tokenizeByBlobId/tokenWorker.pl process alive per
+                    blobExec worker slot instead of spawning the full wrapper
+                    chain for every blob (default: off).
   --memory-limit SIZE
                     cap the DuckDB heap in the dataset generator (step 10).
                     Omit to accept that script's own default of 8GB. Takes an
@@ -198,6 +202,7 @@ WORK="../cregit-files"
 MEMO_DIR=""
 SKIP_HTML=0
 GC_MODE="plain"
+TOKENIZER_WORKER=0
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
 # Empty means "do not pass the flag", as above: step 10 then emits the
@@ -367,6 +372,7 @@ while [ $# -gt 0 ]; do
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
+        --tokenizer-worker) TOKENIZER_WORKER=1; shift ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --project-meta)   need_val "$@"; PROJECT_META="$2"; shift 2 ;;
@@ -743,7 +749,12 @@ else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
+  TOKENIZER_WORKER_FLAGS=()
+  if [ "$TOKENIZER_WORKER" = 1 ]; then
+      TOKENIZER_WORKER_FLAGS=("--tokenizer-worker" "${CREGIT}/tokenizeByBlobId/tokenWorker.pl")
+  fi
   java -jar "$BFG" $MODE_FLAG \
+    ${TOKENIZER_WORKER_FLAGS[@]+"${TOKENIZER_WORKER_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
     ${STALL_TIMEOUT:+--stall-timeout=$STALL_TIMEOUT} \
     "$REPO_PATH_ORIGINAL_BARE" \
