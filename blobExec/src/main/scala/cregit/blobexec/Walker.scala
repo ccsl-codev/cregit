@@ -72,6 +72,7 @@ final class Walker(
     destinationMayContainObjects: Boolean = true,
     blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
     stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
+    workerPool: Option[TokenizerWorkerPool] = None,
     // The shipped list by default, so a caller cannot forget it and hand a known
     // non-terminating blob to srcml. A parameter only so a test can supply its
     // own fixture; nothing at run time chooses a different list.
@@ -887,6 +888,11 @@ final class Walker(
       // Set by either callback below: both mean "this blob's tokenization is
       // unusable, so nothing about it may be persisted".
       val unusable = new AtomicBoolean(false)
+      val invocationResult = workerPool match {
+        case Some(pool) => pool.invoke(bytes, task.origId.name, task.filename, task.fullPath)
+        case None => BlobExec.invoke(
+          bytes, task.origId.name, task.filename, task.fullPath, command, blobTimeoutSeconds)
+      }
       val outcome = BlobExec.run(
         bytes        = bytes,
         origSha      = task.origId.name,
@@ -897,7 +903,8 @@ final class Walker(
         inserter     = workerInserter,
         timeoutSeconds = blobTimeoutSeconds,
         onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
+        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
+        invocationResult = Some(invocationResult)
       )
       val res = outcome match {
         case BlobExec.Outcome.Skip if unusable.get() =>

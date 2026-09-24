@@ -115,9 +115,12 @@ object BlobExec {
       inserter: ObjectInserter,
       timeoutSeconds: Int = DefaultTimeoutSeconds,
       onTimeout: () => Unit = () => (),
-      onParserCrash: () => Unit = () => ()
+      onParserCrash: () => Unit = () => (),
+      invocationResult: Option[(Int, Array[Byte], String)] = None
   ): Outcome = {
-    val (exitCode, stdout, stderr) = invoke(bytes, origSha, filename, fullPath, command, timeoutSeconds)
+    val (exitCode, stdout, stderr) = invocationResult.getOrElse(
+      invoke(bytes, origSha, filename, fullPath, command, timeoutSeconds)
+    )
 
     if (exitCode == TimeoutExitCode) {
       // A timed-out child skips exactly one blob. Deliberately *not* routed

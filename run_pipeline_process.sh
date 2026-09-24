@@ -180,6 +180,10 @@ Output:
                                   "failed to run repack" after hours of work.
                     A failed pack never aborts the run: the Parquet dataset is
                     the product, and packing only makes later steps faster.
+  --tokenizer-worker
+                    keep one tokenizeByBlobId/tokenWorker.pl process alive per
+                    blobExec worker slot instead of spawning the full wrapper
+                    chain for every blob (default: off).
   --memory-limit SIZE
                     forward --memory-limit to step 10 (the DuckDB generator).
                     Omit to accept that script's own default of 8GB. Takes an
@@ -317,6 +321,7 @@ MEMO_DIR=""
 SKIP_HTML=0
 REBLAME=0
 GC_MODE="plain"
+TOKENIZER_WORKER=0
 # Empty means "do not pass the flag", so generate_dataset.py keeps its own
 # default. Step 10 settles at about 1.4x the limit, so a corpus run with N
 # concurrent projects must budget 1.4 x N x limit of RAM.
@@ -559,6 +564,7 @@ while [ $# -gt 0 ]; do
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
+        --tokenizer-worker) TOKENIZER_WORKER=1; shift ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --project-meta)   need_val "$@"; PROJECT_META="$2"; shift 2 ;;
@@ -1259,7 +1265,12 @@ else
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
   fi
+  TOKENIZER_WORKER_FLAGS=()
+  if [ "$TOKENIZER_WORKER" = 1 ]; then
+      TOKENIZER_WORKER_FLAGS=("--tokenizer-worker" "${CREGIT}/tokenizeByBlobId/tokenWorker.pl")
+  fi
   java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG \
+    ${TOKENIZER_WORKER_FLAGS[@]+"${TOKENIZER_WORKER_FLAGS[@]}"} \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
     ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
