@@ -92,6 +92,9 @@ jobs:
       - name: Perl tests (prove)
         run: devenv shell -- bash -c 'prove tokenize/t tokenizeByBlobId/t blameRepo/t prettyPrint/t'
 
+      - name: Tokenizer worker protocol tests
+        run: devenv shell -- bash tests/test_token_worker.sh
+
       # Without this step the coverage rule never reaches the dataset code.
       # devenv.nix already supplies pytest (see the comment beside
       # python3.withPackages), so only the CI step was missing.
