@@ -40,7 +40,7 @@ sub fixture {
     my $dir = tempdir(CLEANUP => 1);
     my $tok = "$dir/tokenize";
     make_path($tok);
-    for my $f (qw(tokenize.pl CregitLanguages.pm tokenizerIdentity.pl tokenizeSrcMl.pl)) {
+    for my $f (qw(tokenize.pl CregitLanguages.pm tokenizerIdentity.pl tokenizeSrcMl.pl CregitSrcMl.pm)) {
         copy("$realTokenizeDir/$f", "$tok/$f") or die "copy $f: $!";
     }
     chmod 0755, "$tok/tokenizerIdentity.pl", "$tok/tokenize.pl", "$tok/tokenizeSrcMl.pl";
@@ -148,6 +148,18 @@ for my $component (qw(srcml2token srcml ctags)) {
     my %b = as_map($before);
     my %a = as_map($after);
     isnt($a{c}, $b{c}, "editing tokenizeSrcMl.pl moves the .c identity");
+    is($a{rs}, $b{rs}, "and leaves .rs alone");
+}
+
+# CregitSrcMl.pm is the same parser run in-process by the tokenizer worker.
+{
+    my $d = fixture();
+    my ($before) = identity($d);
+    write_file("$d/tokenize/CregitSrcMl.pm", "# v2\n");
+    my ($after) = identity($d);
+    my %b = as_map($before);
+    my %a = as_map($after);
+    isnt($a{c}, $b{c}, "editing CregitSrcMl.pm moves the .c identity");
     is($a{rs}, $b{rs}, "and leaves .rs alone");
 }
 

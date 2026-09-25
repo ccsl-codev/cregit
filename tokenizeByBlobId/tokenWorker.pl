@@ -12,12 +12,15 @@ use FindBin qw($RealBin);
 use IO::Select;
 use POSIX qw(_exit);
 use Time::HiRes ();
+use File::Basename qw(basename dirname);
 use lib "$RealBin/../tokenize";
 use CregitLanguages;
+use CregitSrcMl;
 
 binmode STDIN;
 binmode STDOUT;
 $| = 1;
+$SIG{PIPE} = 'IGNORE';
 
 my $memoDir = $ENV{BFG_MEMO_DIR};
 die "You must define BFG_MEMO_DIR\n" if not defined($memoDir) or $memoDir eq "";
@@ -31,6 +34,8 @@ my @tokenizeCommand = grep { length($_) } split /\s+/, $tokenizeCmd;
 my %mapLang = %CregitLanguages::EXT_LANG;
 my $buildDir = "$RealBin/build";
 make_path($buildDir) if not -d $buildDir;
+
+my $inProcess = in_process_tokenizer(@tokenizeCommand);
 
 my $trace;
 if (my $tracePath = $ENV{BFG_WORKER_TRACE}) {
@@ -73,7 +78,38 @@ while (defined(my $header = <STDIN>)) {
     print STDOUT $stdout, $stderr;
 }
 
+$inProcess->shutdown() if $inProcess;
 exit 0;
+
+# In-process srcML only for the stock dispatcher/parser with options the worker honors.
+sub in_process_tokenizer {
+    my ($program, @options) = @_;
+    return undef if ($ENV{BFG_WORKER_INPROC} // "1") eq "0";
+    return undef unless defined $program;
+    my $name = basename($program);
+    return undef unless $name eq "tokenize.pl" or $name eq $CregitLanguages::SRCML_PARSER_REL;
+
+    my %config = (
+        srcml       => "srcml",
+        srcml2token => dirname($program) . "/srcMLtoken/srcml2token",
+        ctags       => "ctags-universal",
+        position    => 0,
+    );
+    for my $option (@options) {
+        if    ($option =~ /\A--srcml=(.+)\z/)       { $config{srcml} = $1 }
+        elsif ($option =~ /\A--srcml2token=(.+)\z/) { $config{srcml2token} = $1 }
+        elsif ($option =~ /\A--ctags=(.+)\z/)       { $config{ctags} = $1 }
+        elsif ($option eq "--position")             { $config{position} = 1 }
+        else { return undef }
+    }
+    return CregitSrcMl->new(%config);
+}
+
+sub srcml_language {
+    my ($language) = @_;
+    my $parser = $CregitLanguages::LANG_PARSER_REL{$language};
+    return (defined $parser and $parser eq $CregitLanguages::SRCML_PARSER_REL);
+}
 
 sub read_exact {
     my ($length, $label) = @_;
@@ -129,10 +165,18 @@ sub process_request {
     print {$input} $contents;
     close($input) or die "unable to close temp input [$inputFile]: $!\n";
 
-    my @command = (@tokenizeCommand, "--language=$mapLang{$fileExt}", $inputName);
-    my ($exitCode, $output, $error) = run_command(
-        "$tempDir", $timeoutSecs, @command
-    );
+    my $language = $mapLang{$fileExt};
+    my ($exitCode, $output, $error);
+    if ($inProcess and srcml_language($language)) {
+        ($exitCode, $output, $error) = $inProcess->tokenize(
+            $language, $inputName, "$tempDir", $timeoutSecs
+        );
+    } else {
+        my @command = (@tokenizeCommand, "--language=$language", $inputName);
+        ($exitCode, $output, $error) = run_command(
+            "$tempDir", $timeoutSecs, @command
+        );
+    }
     return ($exitCode, "", $error) if $exitCode != 0;
 
     make_path($dir) if not -d $dir;

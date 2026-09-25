@@ -148,6 +148,7 @@ for my $ext (@extensions) {
                 if $path eq "";
             push @components, $path;
         }
+        push @components, "$basedir/CregitSrcMl.pm";
     }
 
     # Digest of the component digests, not of the concatenated bytes: the list is

@@ -20,4 +20,8 @@ python3 "$ROOT/tests/token_worker_driver.py" \
     --tokenize-command "$TOKENIZE_COMMAND" \
     --fixture "$ROOT/tests/fixtures/tiny.c" \
     --fixture "$ROOT/tests/fixtures/quote'name.c" \
+    --fixture "$ROOT/tests/fixtures/tiny.cpp" \
+    --fixture "$ROOT/tests/fixtures/Tiny.java" \
+    --fixture "$ROOT/tests/fixtures/empty.c" \
+    --in-process \
     --temp-root "$TEMP_ROOT"

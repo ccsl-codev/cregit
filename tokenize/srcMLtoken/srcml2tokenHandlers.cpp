@@ -36,14 +36,25 @@
 
 std::vector<int> lineMarkers {0};
 std::vector<int> lineNumbers {1};
+std::ostream* srcml2tokenDiag = &std::cerr;
+
+void srcml2tokenResetState() {
+    lineMarkers.assign(1, 0);
+    lineNumbers.assign(1, 1);
+}
+
+static std::string transcoded(const XMLCh* s) {
+    char* local = XMLString::transcode(s);
+    std::string result = local == NULL ? "" : local;
+    XMLString::release(&local);
+    return result;
+}
 
 
 std::string get_attribute_value(const Attributes& attrs, std::string name) {
     XMLCh* revName= XMLString::transcode(name.c_str());
-    char* st = XMLString::transcode(attrs.getValue(revName));
-    std::string result = "";
-    if (st != NULL)
-        result = st;
+    std::string result = transcoded(attrs.getValue(revName));
+    XMLString::release(&revName);
     return result;
 }
 
@@ -152,7 +163,7 @@ void srcml2tokenHandlers::startElement(const XMLCh* const //uri
                                      , const XMLCh* const qname
                                        , const Attributes& attrs)
 {
-    std::string tagLocal = XMLString::transcode(localname);
+    std::string tagLocal = transcoded(localname);
 //    char *tagName = XMLString::transcode(qname);
 //    std::string savePos = position(attrs);
     std::string savePos = newGetPosition();
@@ -205,7 +216,7 @@ void srcml2tokenHandlers::endElement (const XMLCh *const /*uri*/,
                                     const XMLCh *const localname,
                                     const XMLCh *const /*qname*/)
 {
-    char *tagName = XMLString::transcode(localname);
+    std::string tagName = transcoded(localname);
 
     // No escapes are legal here
     if (currentContent.length() > 0 ) {
@@ -230,7 +241,7 @@ void srcml2tokenHandlers::endElement (const XMLCh *const /*uri*/,
 void srcml2tokenHandlers::characters(  const   XMLCh* const    chars 
 								    , const XMLSize_t length)
 {
-    std::string original = XMLString::transcode(chars);
+    std::string original = transcoded(chars);
     std::string st = mytrim(original);
     std::string node = mystack.top();
 
@@ -265,7 +276,7 @@ void srcml2tokenHandlers::startDocument()
 // ---------------------------------------------------------------------------
 void srcml2tokenHandlers::error(const SAXParseException& e)
 {
-    XERCES_STD_QUALIFIER cerr << "\nError at file " << StrX(e.getSystemId())
+    *srcml2tokenDiag << "\nError at file " << StrX(e.getSystemId())
 		 << ", line " << e.getLineNumber()
 		 << ", char " << e.getColumnNumber()
          << "\n  Message: " << StrX(e.getMessage()) << XERCES_STD_QUALIFIER endl;
@@ -273,7 +284,7 @@ void srcml2tokenHandlers::error(const SAXParseException& e)
 
 void srcml2tokenHandlers::fatalError(const SAXParseException& e)
 {
-    XERCES_STD_QUALIFIER cerr << "\nFatal Error at file " << StrX(e.getSystemId())
+    *srcml2tokenDiag << "\nFatal Error at file " << StrX(e.getSystemId())
 		 << ", line " << e.getLineNumber()
 		 << ", char " << e.getColumnNumber()
                  << "\n  Message: " << StrX(e.getMessage()) << XERCES_STD_QUALIFIER endl;
@@ -281,7 +292,7 @@ void srcml2tokenHandlers::fatalError(const SAXParseException& e)
 
 void srcml2tokenHandlers::warning(const SAXParseException& e)
 {
-    XERCES_STD_QUALIFIER cerr << "\nWarning at file " << StrX(e.getSystemId())
+    *srcml2tokenDiag << "\nWarning at file " << StrX(e.getSystemId())
 		 << ", line " << e.getLineNumber()
 		 << ", char " << e.getColumnNumber()
          << "\n  Message: " << StrX(e.getMessage()) << XERCES_STD_QUALIFIER endl;
