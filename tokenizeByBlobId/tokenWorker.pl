@@ -162,7 +162,7 @@ sub run_command {
             print STDERR "unable to enter tokenizer directory [$workingDir]: $!\n";
             _exit(255);
         };
-        exec {$command[0]} @command;
+        { no warnings 'exec'; exec {$command[0]} @command; }
         print STDERR "unable to execute tokenizer [$command[0]]: $!\n";
         _exit(255);
     }
