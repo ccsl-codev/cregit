@@ -67,6 +67,8 @@ in
 
   env.LEGACY_JAVA_HOME = "${legacyJdk}";
 
+  cachix.pull = [ "ccslcodevcregit" ];
+
   # `devenv test` gates every tracked shell script. The threshold is `error`
   # because the two scripts already carry 31 lower findings; raise it to
   # `warning` once those are fixed.
