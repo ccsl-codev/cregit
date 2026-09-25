@@ -20,12 +20,16 @@
 // ---------------------------------------------------------------------------
 //  Includes
 // ---------------------------------------------------------------------------
+#include <ostream>
 #include <stack>
 #include <string>
 #include <xercesc/sax2/Attributes.hpp>
 #include <xercesc/sax2/DefaultHandler.hpp>
 
 XERCES_CPP_NAMESPACE_USE
+
+extern std::ostream* srcml2tokenDiag;
+void srcml2tokenResetState();
 
 class srcml2tokenHandlers : public DefaultHandler
 {

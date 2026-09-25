@@ -22,6 +22,8 @@
 #include <xercesc/parsers/SAXParser.hpp>
 #include "srcml2token.hpp"
 #include <xercesc/util/OutOfMemoryException.hpp>
+#include <sstream>
+#include <string>
 
 // ---------------------------------------------------------------------------
 //  Local helper methods
@@ -29,11 +31,71 @@
 void usage()
 {
     XERCES_STD_QUALIFIER cout << "\nUsage:\n"
-            "    srcml2token  <XML file>\n\n"
+            "    srcml2token  <XML file>\n"
+            "    srcml2token  --server\n\n"
             "This program converts the output of srcML into a simplified tokenized version\n"
+            "--server reads `PARSE <path>` lines on stdin and answers each with the tokens,\n"
+            "then `\\x01ERR <diagnostic>` lines and a final `\\x01END <status>` line.\n"
          << XERCES_STD_QUALIFIER endl;
 }
 
+static int parseOne(SAX2XMLReader* parser, const char* path)
+{
+    srcml2tokenResetState();
+    srcml2tokenHandlers handler;
+    parser->setContentHandler(&handler);
+    parser->setErrorHandler(&handler);
+    try
+    {
+        if (path == NULL) {
+            StdInInputSource src;
+            parser->parse(src);
+        } else {
+            parser->parse(path);
+        }
+    }
+    catch (const OutOfMemoryException&)
+    {
+        *srcml2tokenDiag << "OutOfMemoryException" << XERCES_STD_QUALIFIER endl;
+        return 4;
+    }
+    catch (const XMLException& e)
+    {
+        *srcml2tokenDiag << "\nError during parsing: \n"
+             << StrX(e.getMessage())
+             << "\n" << XERCES_STD_QUALIFIER endl;
+        return 4;
+    }
+    catch (...)
+    {
+        *srcml2tokenDiag << "Unexpected exception during parsing" << XERCES_STD_QUALIFIER endl;
+        return 4;
+    }
+    return 0;
+}
+
+static int serverLoop(SAX2XMLReader* parser)
+{
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.compare(0, 6, "PARSE ") != 0) {
+            std::cout << "\x01" "ERR malformed request [" << line << "]\n" "\x01" "END 2\n" << std::flush;
+            continue;
+        }
+        std::ostringstream diag;
+        srcml2tokenDiag = &diag;
+        int status = parseOne(parser, line.c_str() + 6);
+        srcml2tokenDiag = &std::cerr;
+
+        std::istringstream lines(diag.str());
+        std::string d;
+        while (std::getline(lines, d)) {
+            std::cout << "\x01" "ERR " << d << "\n";
+        }
+        std::cout << "\x01" "END " << status << "\n" << std::flush;
+    }
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 //  Program entry point
@@ -56,42 +118,11 @@ int main(int argC, char* argV[])
 
     SAX2XMLReader* parser = XMLReaderFactory::createXMLReader();
 
-    srcml2tokenHandlers handler;
-    parser->setContentHandler(&handler);
-    parser->setErrorHandler(&handler);
-
-    int errorCount = 0;
-    // create a faux scope so that 'src' destructor is called before
-    // XMLPlatformUtils::Terminate
-    {
-        //
-        //  Kick off the parse and catch any exceptions. Create a standard
-        //  input input source and tell the parser to parse from that.
-        //
-        try
-        {
-            if (argC < 2) {
-                StdInInputSource src;
-                parser->parse(src);
-            } else {
-                parser->parse(argV[1]);
-            }
-        }
-        catch (const OutOfMemoryException&)
-        {
-            XERCES_STD_QUALIFIER cerr << "OutOfMemoryException" << XERCES_STD_QUALIFIER endl;
-            errorCount = 2;
-            return 4;
-        }
-        catch (const XMLException& e)
-        {
-            XERCES_STD_QUALIFIER cerr << "\nError during parsing: \n"
-                 << StrX(e.getMessage())
-                 << "\n" << XERCES_STD_QUALIFIER endl;
-            errorCount = 1;
-            return 4;
-        }
-
+    int status;
+    if (argC >= 2 && strcmp(argV[1], "--server") == 0) {
+        status = serverLoop(parser);
+    } else {
+        status = parseOne(parser, argC < 2 ? NULL : argV[1]);
     }
 
     //
@@ -101,10 +132,5 @@ int main(int argC, char* argV[])
 
     XMLPlatformUtils::Terminate();
 
-    if (errorCount > 0)
-        return 4;
-    else
-        return 0;
+    return status;
 }
-
-

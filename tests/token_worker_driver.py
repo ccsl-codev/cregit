@@ -105,6 +105,47 @@ def assert_no_timeout_process(marker):
         )
 
 
+def in_process_checks(args, marker, expected_first):
+    real_srcml = subprocess.run(["which", "srcml"], stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+    fake_srcml = args.temp_root / "fake-srcml.sh"
+    fake_srcml.write_text(
+        "#!/usr/bin/env bash\n"
+        'src="${@: -3:1}"\n'
+        f'grep -q SLEEP_MARKER "$src" && exec -a {marker} sleep 100\n'
+        'grep -q ABORT_MARKER "$src" && kill -ABRT $$\n'
+        f'exec {real_srcml} "$@"\n',
+        encoding="utf-8",
+    )
+    fake_srcml.chmod(0o755)
+    memo = args.temp_root / "inproc-memo"
+    memo.mkdir()
+    command = f"{args.tokenize_command} --srcml={fake_srcml}".replace(
+        f"--srcml={real_srcml} ", "")
+    worker = Worker(args.worker, memo, command)
+
+    started = time.monotonic()
+    timed_out = worker.request("timeout.c", "fixtures/timeout.c", b"int SLEEP_MARKER;\n", 1)
+    elapsed = time.monotonic() - started
+    if timed_out[0] != 124 or elapsed > 3.0:
+        raise AssertionError(f"in-process timeout response was {timed_out!r} after {elapsed:.2f}s")
+    assert_no_timeout_process(marker)
+    print(f"PASS in-process timeout exits 124 in {elapsed:.2f}s with no child left")
+
+    crash = worker.request("crash.c", "fixtures/crash.c", b"int ABORT_MARKER;\n", 20)
+    if crash[0] != 33 or b"killed by signal 6" not in crash[2]:
+        raise AssertionError(f"srcml death was not reported as a parser crash: {crash!r}")
+    print("PASS in-process srcml crash exits 33 without output")
+
+    if any(memo.rglob("*")):
+        raise AssertionError("failed in-process requests were memoized")
+    recovered = worker.request(args.fixture[0].name, f"fixtures/{args.fixture[0].name}",
+                               args.fixture[0].read_bytes(), 20)
+    if recovered != (0, expected_first, b""):
+        raise AssertionError(f"in-process worker did not recover: {recovered!r}")
+    worker.close()
+    print("PASS in-process worker recovers after timeout and crash")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", required=True, type=pathlib.Path)
@@ -112,6 +153,7 @@ def main():
     parser.add_argument("--tokenize-command", required=True)
     parser.add_argument("--fixture", action="append", required=True, type=pathlib.Path)
     parser.add_argument("--temp-root", required=True, type=pathlib.Path)
+    parser.add_argument("--in-process", action="store_true")
     args = parser.parse_args()
 
     worker_memo = args.temp_root / "worker-memo"
@@ -188,6 +230,9 @@ def main():
     assert_no_timeout_process(marker)
     timeout_worker.close()
     print(f"PASS timeout exits 124 in {elapsed:.2f}s with no child left")
+
+    if args.in_process:
+        in_process_checks(args, marker, expected_outputs[0])
 
     print("ALL TOKEN WORKER TESTS PASSED")
 
