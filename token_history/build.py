@@ -26,10 +26,12 @@ TYPES = dict(token_id="BIGINT", born_in_merge="INTEGER", copy_of="BIGINT",
 
 def read_tsv(con, name, pattern, columns):
     cols = ", ".join(f"'{c}': '{TYPES.get(c, 'VARCHAR')}'" for c in columns)
+    keep_text = ", force_not_null=['token']" if "token" in columns else ""
     con.execute(f"""
         CREATE TABLE {name} AS SELECT DISTINCT * FROM read_csv(
             '{pattern}', delim='{SEP}', header=false, quote='', escape='',
-            nullstr='', columns={{{cols}}})""")
+            nullstr='', auto_detect=false{keep_text},
+            columns={{{cols}}})""")
 
 
 def commit_runs(con):

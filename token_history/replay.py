@@ -208,6 +208,8 @@ class PathReplay:
         by_blob = {d.old_blob: d.hunks for d in c.diffs}
         out = []
         for blob in blobs:
+            if blob == NULL_BLOB:
+                continue
             ids = self.ids_of(blob, c)
             if blob in by_blob:
                 hunks = by_blob[blob]

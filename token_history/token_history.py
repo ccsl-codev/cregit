@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -121,6 +122,13 @@ def clean(value):
 
 
 def work(path):
+    try:
+        return replay_path(path)
+    except Exception:
+        return dict(path=path, error=traceback.format_exc())
+
+
+def replay_path(path):
     t0 = time.time()
     mainline = WORKER["changes"].get(path, [])
     rp = WORKER["src"].replay(path, mainline, WORKER["run_min_alnum"])
@@ -148,15 +156,19 @@ class Progress:
         self.start = self.last = time.time()
         self.done, self.tokens, self.rows = 0, 0, 0
         self.flags = dict(missing_parents=0, unaligned_merges=0,
-                          unmapped_mainline=0)
+                          unmapped_mainline=0, errors=0)
         self.slowest = []
 
     def add(self, r):
         self.done += 1
+        if "error" in r:
+            self.flags["errors"] += 1
+            r = dict(r, tokens=0, rows=0, seconds=0, missing_parents=0,
+                     unaligned_merges=0, unmapped_mainline=0)
         self.tokens += r["tokens"]
         self.rows += r["rows"]
         for k in self.flags:
-            self.flags[k] += r[k]
+            self.flags[k] += r.get(k, 0)
         self.slowest = sorted(self.slowest + [(r["seconds"], r["path"])])[-5:]
         if time.time() - self.last >= self.ping or self.done == self.total:
             self.write()
@@ -222,8 +234,12 @@ def main():
             (args.repo, merges, changes, args.out,
              args.run_min_alnum)) as pool:
         for r in pool.imap_unordered(work, paths):
-            done_out.write(r["path"] + "\n")
-            done_out.flush()
+            if "error" in r:
+                with open(os.path.join(args.out, "errors.txt"), "a") as err:
+                    err.write(f"== {r['path']}\n{r['error']}\n")
+            else:
+                done_out.write(r["path"] + "\n")
+                done_out.flush()
             progress.add(r)
     progress.write("done")
 

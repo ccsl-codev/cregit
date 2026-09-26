@@ -243,3 +243,26 @@ def test_a_line_kept_from_two_parents_becomes_a_copy(tmp_path):
     born, _ = tip_born(rp, r, "d.c")
     assert born == blame(r, "d.c")
     assert any(t.copy_of is not None and t.born == first for t in rp.tokens)
+
+
+def test_merge_that_brings_a_new_file_to_main(tmp_path):
+    r = tmp_path / "newfile"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    write(r, "other.c", ["o"])
+    commit(r, "base", "2022-01-01T00:00:00")
+    git(r, "checkout", "-q", "-b", "topic")
+    write(r, "n.c", ["a", "b", "c"])
+    commit(r, "topic adds n.c", "2022-01-02T00:00:00")
+    git(r, "checkout", "-q", "main")
+    write(r, "other.c", ["o", "p"])
+    commit(r, "main changes other.c", "2022-01-03T00:00:00")
+    git(r, "merge", "-q", "--no-ff", "--no-commit", "topic")
+    write(r, "n.c", ["a", "b", "c", "fixed in merge"])
+    commit(r, "merge topic with a fix", "2022-01-04T00:00:00")
+    write(r, "n.c", ["a", "b", "c", "fixed in merge", "later"])
+    commit(r, "later", "2022-01-05T00:00:00")
+    rp = PathReplay(parse_log(path_log(str(r), "n.c")),
+                    **real_parent_sources(str(r), "n.c")).run()
+    born, _ = tip_born(rp, r, "n.c")
+    assert born == blame(r, "n.c")

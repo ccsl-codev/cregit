@@ -14,7 +14,8 @@ print(f"tokens     {p['tokens']:,} in {p['rows']:,} rows")
 print(f"rate       {p['paths_per_min']} paths/min, elapsed {p['elapsed_s'] / 3600:.1f} h")
 print(f"eta        {'?' if eta is None else f'{eta / 3600:.1f} h'}")
 print(f"flags      missing parents {p['missing_parents']}, unaligned merges "
-      f"{p['unaligned_merges']}, unmapped mainline {p['unmapped_mainline']}")
+      f"{p['unaligned_merges']}, unmapped mainline {p['unmapped_mainline']}, "
+      f"errors {p.get('errors', 0)}")
 for s, path in p["slowest"]:
     print(f"slow       {s:7.1f} s  {path}")
 PY
