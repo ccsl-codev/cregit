@@ -113,6 +113,11 @@ class Token:
     born: str
     born_in_merge: bool
     died: str = None
+    copy_of: int = None
+
+
+def alnum(texts):
+    return sum(ch.isalnum() for text in texts for ch in text)
 
 
 def unique(items):
@@ -128,20 +133,39 @@ class PathReplay:
     """
 
     def __init__(self, commits, real_parents=None, blob_at=None,
-                 diff_blobs=None):
+                 diff_blobs=None, run_min_alnum=None):
         self.commits = commits
         self.tokens = []
         self.state = {}
         self.blob_nodes = {}
         self.order = {c.sha: i for i, c in enumerate(commits)}
         self.real_parents = real_parents
-        self.blob_at = blob_at
+        self.blob_at = blob_at and self.cached(blob_at)
         self.diff_blobs = diff_blobs
+        self.run_min_alnum = run_min_alnum
+        self.runs = []
         self.missing_parents = 0
         self.unaligned_merges = 0
 
+    @staticmethod
+    def cached(fn):
+        cache = {}
+
+        def lookup(sha):
+            if sha not in cache:
+                cache[sha] = fn(sha)
+            return cache[sha]
+        return lookup
+
     def born(self, text, commit, in_merge):
         self.tokens.append(Token(text, commit.sha, in_merge))
+        return len(self.tokens) - 1
+
+    def copy(self, t):
+        """A second line with the same identity: a new token, same birth."""
+        orig = self.tokens[t]
+        self.tokens.append(Token(orig.text, orig.born, orig.born_in_merge,
+                                 copy_of=t))
         return len(self.tokens) - 1
 
     def parent_ids(self, sha):
@@ -203,41 +227,107 @@ class PathReplay:
         return out
 
     def step(self, c):
-        if c.blob is None:
-            c.blob = self.blob_of(c.parents[0]) if c.parents else NULL_BLOB
         sources = self.sources(c)
         in_merge = len(sources) > 1 or len(c.parents) > 1
         base_ids, base = sources[0]
-        ids = []
+        ids, used = [], set()
         for i, line in enumerate(base):
             if not isinstance(line, tuple):
-                ids.append(base_ids[line])
-                continue
-            kept = next((s_ids[m[i]] for s_ids, m in sources[1:]
-                         if i < len(m) and not isinstance(m[i], tuple)), None)
-            ids.append(kept if kept is not None
-                       else self.born(line[1], c, in_merge))
+                kept = base_ids[line]
+            else:
+                kept = next((s_ids[m[i]] for s_ids, m in sources[1:]
+                             if i < len(m) and not isinstance(m[i], tuple)),
+                            None)
+            if kept is None:
+                kept = self.born(line[1], c, in_merge)
+            elif kept in used:
+                kept = self.copy(kept)
+            used.add(kept)
+            ids.append(kept)
         if not in_merge:
             alive = set(ids)
             for t in base_ids:
                 if t not in alive and self.tokens[t].died is None:
                     self.tokens[t].died = c.sha
+            self.add_runs(c, "died", [(j, t) for j, t in enumerate(base_ids)
+                                      if t not in alive])
+        self.add_runs(c, "born", [(i, t) for i, t in enumerate(ids)
+                                  if self.tokens[t].born == c.sha])
         self.state[c.sha] = ids
-        self.blob_nodes.setdefault(c.blob, []).append(c.sha)
 
-    def run(self):
+    def resolve_blobs(self):
+        for c in self.commits:
+            if c.blob is None:
+                c.blob = self.blob_of(c.parents[0]) if c.parents else NULL_BLOB
+
+    def latest_node(self, blob, before_ct):
+        nodes = [s for s in self.blob_nodes.get(blob, ())
+                 if self.commits[self.order[s]].ct <= before_ct]
+        nodes = nodes or self.blob_nodes.get(blob, ())
+        return max(nodes, key=self.order.get) if nodes else None
+
+    def add_runs(self, c, kind, positioned):
+        """Record runs of adjacent tokens that are long enough to move.
+
+        positioned: [(position in the file, token id)], in file order.
+        """
+        if self.run_min_alnum is None:
+            return
+        if kind == "died":
+            whole = c.blob == NULL_BLOB
+        else:
+            whole = all(self.blob_of(p) == NULL_BLOB for p in c.parents)
+        run, last = [], None
+        for pos, t in positioned + [(None, None)]:
+            if run and (pos is None or pos != last + 1):
+                if alnum(self.tokens[i].text for i in run) >= self.run_min_alnum:
+                    self.runs.append((c.sha, kind, whole, run))
+                run = []
+            if t is not None:
+                run.append(t)
+            last = pos
+
+    def run(self, mainline=None):
+        """Replay every commit. With mainline changes, free unneeded states."""
+        self.resolve_blobs()
+        for c in self.commits:
+            self.blob_nodes.setdefault(c.blob, []).append(c.sha)
+        if mainline is None:
+            for c in self.commits:
+                self.step(c)
+            return self
+        keep = {self.latest_node(b, ct) for _, ct, b in mainline}
+        for c in self.commits:
+            real = self.parents_of(c)
+            if len(real) > 1 and real != c.parents:
+                keep |= {self.latest_node(self.blob_at(p), c.ct)
+                         for p in real}
+        pending = {}
+        for c in self.commits:
+            for p in c.parents:
+                pending[p] = pending.get(p, 0) + 1
         for c in self.commits:
             self.step(c)
+            for p in c.parents:
+                pending[p] -= 1
+                if not pending[p] and p not in keep:
+                    self.state.pop(p, None)
         return self
 
     def state_of_blob(self, blob, before_ct):
         """The latest node with this blob, committed at or before a time."""
         if blob == NULL_BLOB:
             return []
-        nodes = [s for s in self.blob_nodes.get(blob, ())
-                 if self.commits[self.order[s]].ct <= before_ct]
-        nodes = nodes or self.blob_nodes.get(blob, ())
-        return self.state[max(nodes, key=self.order.get)] if nodes else None
+        node = self.latest_node(blob, before_ct)
+        return None if node is None else self.state.get(node)
+
+    def tip_positions(self, changes):
+        """{token: position} in the path's file at the last mainline change."""
+        if not changes:
+            return {}
+        sha, ct, blob = changes[-1]
+        ids = self.state_of_blob(blob, ct) or []
+        return {t: i for i, t in enumerate(ids)}
 
     def mainline_intervals(self, changes):
         """Intervals on the mainline: {token: [(in_sha, in_ct, out_sha, out_ct)]}.

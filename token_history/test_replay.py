@@ -178,3 +178,68 @@ def test_merge_equal_to_second_parent_takes_it_whole(repo):
                     **real_parent_sources(str(repo), "a.c")).run()
     born, _ = tip_born(rp, repo, "a.c")
     assert born == blame(repo, "a.c")
+
+
+def first_parent_changes(repo, path):
+    fp = git(repo, "log", "--first-parent", "--reverse", "-m", "--raw",
+             "--no-abbrev", "--format=\x01%H %ct", "--", path)
+    changes, sha, ct = [], None, 0
+    for line in fp.splitlines():
+        if line.startswith("\x01"):
+            sha, ct = line[1:].split()
+        elif line.startswith(":"):
+            changes.append((sha, int(ct), line.split()[3]))
+    return changes
+
+
+def test_freeing_states_changes_nothing(repo):
+    test_merge_follows_real_parent_order(repo)
+    changes = first_parent_changes(repo, "a.c")
+    src = real_parent_sources(str(repo), "a.c")
+    full = PathReplay(parse_log(path_log(str(repo), "a.c")), **src).run()
+    lean = PathReplay(parse_log(path_log(str(repo), "a.c")), **src).run(changes)
+    assert len(lean.state) < len(full.state)
+    assert lean.tokens == full.tokens
+    assert lean.mainline_intervals(changes) == full.mainline_intervals(changes)
+
+
+def test_runs_mark_a_whole_file_move(repo):
+    body = ["int", "alpha_long_identifier", ";", "int", "beta_long_identifier",
+            ";", "return", "gamma_long_identifier", ";"]
+    write(repo, "m.c", body)
+    commit(repo, "add m.c", "2020-07-01T00:00:00")
+    git(repo, "mv", "m.c", "n.c")
+    moved = commit(repo, "move m.c to n.c", "2020-07-02T00:00:00")
+    runs = {}
+    for path in ("m.c", "n.c"):
+        rp = PathReplay(parse_log(path_log(str(repo), path)),
+                        run_min_alnum=20).run()
+        runs[path] = [(sha, kind, whole, [rp.tokens[t].text for t in ids])
+                      for sha, kind, whole, ids in rp.runs if sha == moved]
+    assert runs["m.c"] == [(moved, "died", True, body)]
+    assert runs["n.c"] == [(moved, "born", True, body)]
+
+
+def test_a_line_kept_from_two_parents_becomes_a_copy(tmp_path):
+    r = tmp_path / "dup"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    write(r, "d.c", ["A"])
+    first = commit(r, "base", "2021-01-01T00:00:00")
+    git(r, "checkout", "-q", "-b", "keep")
+    write(r, "d.c", ["Q", "A"])
+    commit(r, "keep adds Q before A", "2021-01-02T00:00:00")
+    git(r, "checkout", "-q", "main")
+    write(r, "d.c", ["A", "P"])
+    commit(r, "main adds P after A", "2021-01-03T00:00:00")
+    subprocess.run(["git", "-C", str(r), "merge", "-q", "--no-ff",
+                    "--no-commit", "keep"], capture_output=True)
+    write(r, "d.c", ["A", "P", "Q", "A"])
+    commit(r, "merge keeps both", "2021-01-04T00:00:00")
+    rp = PathReplay(parse_log(path_log(str(r), "d.c")),
+                    **real_parent_sources(str(r), "d.c")).run()
+    for ids in rp.state.values():
+        assert len(ids) == len(set(ids))
+    born, _ = tip_born(rp, r, "d.c")
+    assert born == blame(r, "d.c")
+    assert any(t.copy_of is not None and t.born == first for t in rp.tokens)
