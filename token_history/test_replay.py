@@ -1,0 +1,180 @@
+import os
+import re
+import subprocess
+
+import pytest
+
+from replay import (NULL_BLOB, PathReplay, align, Hunk, parse_log, path_log,
+                    real_parent_sources)
+
+
+def git(repo, *args, date=None):
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x")
+    if date:
+        env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = f"{date} +0000"
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True, env=env).stdout
+
+
+def write(repo, path, lines):
+    (repo / path).write_text("".join(f"{x}\n" for x in lines))
+
+
+def commit(repo, msg, date):
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", msg, date=date)
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def blame(repo, path):
+    out = git(repo, "blame", "--line-porcelain", path)
+    return [line[:40] for line in out.splitlines()
+            if re.match(r"^[0-9a-f]{40} \d+ \d+", line)]
+
+
+@pytest.fixture
+def repo(tmp_path):
+    r = tmp_path / "r"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    write(r, "a.c", ["int", "a", ";", "int", "b", ";"])
+    commit(r, "c1", "2020-01-01T00:00:00")
+    write(r, "a.c", ["int", "a", ";", "long", "b", ";", "x"])
+    commit(r, "c2", "2020-02-01T00:00:00")
+    git(r, "checkout", "-q", "-b", "side")
+    write(r, "a.c", ["int", "a", ";", "long", "b", ";", "x", "side1"])
+    commit(r, "s1", "2020-03-01T00:00:00")
+    git(r, "checkout", "-q", "main")
+    write(r, "a.c", ["main0", "int", "a", ";", "long", "b", ";", "x"])
+    commit(r, "m1", "2020-04-01T00:00:00")
+    git(r, "merge", "-q", "--no-commit", "side")
+    write(r, "a.c", ["main0", "int", "a", ";", "long", "b", ";", "x",
+                     "side1", "fix"])
+    commit(r, "merge", "2020-05-01T00:00:00")
+    write(r, "a.c", ["main0", "a", ";", "long", "b", ";", "x", "side1", "fix"])
+    commit(r, "c3", "2020-06-01T00:00:00")
+    return r
+
+
+def replay(repo, path):
+    return PathReplay(parse_log(path_log(str(repo), path))).run()
+
+
+def tip_born(rp, repo, path):
+    tip = git(repo, "rev-parse", f"HEAD:{path}").strip()
+    ids = rp.state_of_blob(tip, 2**62)
+    return [rp.tokens[t].born for t in ids], [rp.tokens[t].text for t in ids]
+
+
+def test_align_insert_delete():
+    assert align(3, [Hunk(2, 1, ["y"])]) == [0, ("+", "y"), 2]
+    assert align(2, [Hunk(1, 0, ["z"])]) == [0, ("+", "z"), 1]
+    assert align(2, [Hunk(0, 0, ["z"])]) == [("+", "z"), 0, 1]
+
+
+def test_tip_matches_git_blame(repo):
+    rp = replay(repo, "a.c")
+    born, texts = tip_born(rp, repo, "a.c")
+    assert texts == (repo / "a.c").read_text().split()
+    assert born == blame(repo, "a.c")
+    assert rp.missing_parents == 0 and rp.unaligned_merges == 0
+
+
+def test_merge_resolution_line_is_born_in_merge(repo):
+    rp = replay(repo, "a.c")
+    merge = git(repo, "rev-parse", "HEAD~1").strip()
+    fix = next(t for t in rp.tokens if t.text == "fix")
+    assert fix.born == merge and fix.born_in_merge
+
+
+def test_deleted_token_keeps_its_death(repo):
+    rp = replay(repo, "a.c")
+    c3 = git(repo, "rev-parse", "HEAD").strip()
+    first_int = next(t for t in rp.tokens if t.text == "int")
+    assert first_int.died == c3
+
+
+def test_deleted_file_and_recreated(repo):
+    git(repo, "rm", "-q", "a.c")
+    commit(repo, "del", "2020-07-01T00:00:00")
+    write(repo, "a.c", ["int", "new"])
+    recreate = commit(repo, "re", "2020-08-01T00:00:00")
+    rp = replay(repo, "a.c")
+    born, _ = tip_born(rp, repo, "a.c")
+    assert born == [recreate, recreate] == blame(repo, "a.c")
+    assert all(t.died for t in rp.tokens if t.born != recreate)
+
+
+def test_mainline_intervals(repo):
+    rp = replay(repo, "a.c")
+    fp = git(repo, "log", "--first-parent", "--reverse", "-m", "--raw",
+             "--no-abbrev", "--format=\x01%H %ct", "--", "a.c")
+    changes, sha = [], None
+    for line in fp.splitlines():
+        if line.startswith("\x01"):
+            sha, ct = line[1:].split()
+        elif line.startswith(":"):
+            changes.append((sha, int(ct), line.split()[3]))
+    iv = rp.mainline_intervals(changes)
+    side1 = next(i for i, t in enumerate(rp.tokens) if t.text == "side1")
+    merge = git(repo, "rev-parse", "HEAD~1").strip()
+    assert iv[side1][0][0] == merge and iv[side1][0][2] is None
+    first_int = next(i for i, t in enumerate(rp.tokens) if t.text == "int")
+    assert iv[first_int][0][2] == git(repo, "rev-parse", "HEAD").strip()
+    assert NULL_BLOB not in {c[2] for c in changes}
+
+
+def test_merge_of_equal_parents_keeps_the_blob(repo):
+    git(repo, "checkout", "-q", "-b", "twin")
+    write(repo, "b.c", ["other"])
+    commit(repo, "twin only touches b.c", "2020-07-01T00:00:00")
+    git(repo, "checkout", "-q", "main")
+    write(repo, "c.c", ["main only touches c.c"])
+    commit(repo, "main only touches c.c", "2020-07-02T00:00:00")
+    git(repo, "merge", "-q", "--no-edit", "twin", date="2020-07-03T00:00:00")
+    write(repo, "a.c", ["main0", "a", ";", "long", "b", ";", "x", "side1",
+                        "fix", "after"])
+    commit(repo, "after merge", "2020-07-04T00:00:00")
+    rp = replay(repo, "a.c")
+    born, _ = tip_born(rp, repo, "a.c")
+    assert born == blame(repo, "a.c")
+    assert rp.unaligned_merges == 0
+
+
+def test_merge_follows_real_parent_order(repo):
+    base = ["main0", "a", ";", "long", "b", ";", "x", "side1", "fix"]
+    git(repo, "checkout", "-q", "-b", "redo")
+    write(repo, "a.c", [t for t in base if t != "long"])
+    commit(repo, "drop long", "2020-07-01T00:00:00")
+    write(repo, "a.c", base + ["tail"])
+    commit(repo, "re-add long", "2020-07-02T00:00:00")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "-q", "--no-ff", "--no-commit", "redo")
+    write(repo, "a.c", base + ["tail", "merged"])
+    commit(repo, "merge redo", "2020-07-03T00:00:00")
+    rp = PathReplay(parse_log(path_log(str(repo), "a.c")),
+                    **real_parent_sources(str(repo), "a.c")).run()
+    born, _ = tip_born(rp, repo, "a.c")
+    assert born == blame(repo, "a.c")
+
+
+def test_merge_equal_to_second_parent_takes_it_whole(repo):
+    base = ["main0", "a", ";", "long", "b", ";", "x", "side1", "fix"]
+    git(repo, "checkout", "-q", "-b", "same")
+    write(repo, "a.c", base + ["s"])
+    commit(repo, "side adds s", "2020-07-01T00:00:00")
+    git(repo, "checkout", "-q", "main")
+    write(repo, "a.c", [t for t in base if t != "long"])
+    commit(repo, "main drops long", "2020-07-02T00:00:00")
+    write(repo, "a.c", base)
+    commit(repo, "main re-adds long", "2020-07-03T00:00:00")
+    write(repo, "c.c", ["other"])
+    commit(repo, "main touches c.c", "2020-07-04T00:00:00")
+    git(repo, "merge", "-q", "--no-ff", "--no-commit", "same")
+    write(repo, "a.c", base + ["s"])
+    commit(repo, "merge same", "2020-07-05T00:00:00")
+    rp = PathReplay(parse_log(path_log(str(repo), "a.c")),
+                    **real_parent_sources(str(repo), "a.c")).run()
+    born, _ = tip_born(rp, repo, "a.c")
+    assert born == blame(repo, "a.c")
