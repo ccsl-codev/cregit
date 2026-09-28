@@ -105,7 +105,11 @@ flock -n 9 || { log "another shard build holds the lock -- exiting"; exit 0; }
 
 log "=== sharded build: N=$N threads/shard=$THREADS src=$SRC out=$OUT warm=${WARM_DB:-none} ==="
 
-TIMEOUT_FLAGS=()
+# Always strict. Each shard has its own fresh blob map, and the merge unions them,
+# so a blob that one shard dropped would get a retry_blob row that the merge does
+# not carry over. Until that is handled, a tokenizer failure in a sharded build
+# stops the build (exit 4 or 6), as it did before the default changed.
+TIMEOUT_FLAGS=(--strict-tokenize)
 [ -n "$BLOB_TIMEOUT" ]  && TIMEOUT_FLAGS+=("--blob-timeout=$BLOB_TIMEOUT")
 [ -n "$STALL_TIMEOUT" ] && TIMEOUT_FLAGS+=("--stall-timeout=$STALL_TIMEOUT")
 

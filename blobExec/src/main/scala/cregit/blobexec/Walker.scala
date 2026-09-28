@@ -20,9 +20,10 @@ final case class WalkStats(
     blobsCacheHit: Int,
     refsProjected: Int,
     aborted: Boolean,
-    /** Blobs whose command was killed for exceeding its budget. Each one is a
-      * file left holding raw source instead of tokens, so a non-zero count must
-      * reach the caller rather than living only in stderr. */
+    /** Blobs whose command was killed for exceeding its budget. Under
+      * `strictTokenize` the walk stops at the containing commit. Otherwise the
+      * blob is dropped and recorded (see [[blobsSkipped]]). Either way a non-zero
+      * count must reach the caller rather than living only in stderr. */
     blobsTimedOut: Long,
     /** Distinct mask-matched blobs excluded from the rewrite because JGit will
       * not materialise an object that large. Unlike [[blobsTimedOut]] this is
@@ -36,9 +37,11 @@ final case class WalkStats(
       * not block publication. */
     blobsDenylisted: Long,
     /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]: srcML died
-      * on a signal, or the token stream came back empty. Like [[blobsTimedOut]]
-      * and unlike [[blobsOversized]]/[[blobsDenylisted]] this DOES block
-      * publication, because an unexplained parser death is exactly the defect that
+      * on a signal, or the token stream came back empty. Under `strictTokenize`,
+      * like [[blobsTimedOut]] and unlike [[blobsOversized]]/[[blobsDenylisted]],
+      * this blocks publication (exit 6). Without it the blob is dropped and
+      * recorded, and the exit status does not change. Strict mode exists
+      * because an unexplained parser death is exactly the defect that
       * used to be written out as a silent 0-byte tokenization. It is a separate
       * counter rather than more timeouts because the two need different fixes: a
       * timeout wants --blob-timeout, a crash wants the blob denylisting or srcML
@@ -52,7 +55,19 @@ final case class WalkStats(
     originalBlobCacheHits: Long,
     originalBlobDestinationLookups: Long,
     originalBlobBytesCopied: Long,
-    originalBlobBytesAvoided: Long
+    originalBlobBytesAvoided: Long,
+    /** Distinct (sha, path) pairs whose tokenizer failed (a timeout, a parser
+      * crash or empty output) and which this run dropped from the rewritten trees,
+      * as it drops a denylisted blob. Zero under `strictTokenize`, where such a
+      * blob stops the walk instead. Each one is a row in the skip file. */
+    blobsSkipped: Long = 0L,
+    /** Blobs that timed out in an earlier run and that tokenized on the retry at
+      * the start of this run. Each one changes the trees above it. */
+    blobsRecovered: Long = 0L,
+    /** True if this run emptied commit_map, tree_map and ref_map because a retry
+      * recovered a blob. Every rewritten commit then has a new sha, so all of the
+      * outputs made from the tokenized repository are out of date. */
+    refolded: Boolean = false
 )
 
 /** Rebuild `src` history into `dst`, persisting mappings to `mapping`.
@@ -75,7 +90,16 @@ final class Walker(
     // The shipped list by default, so a caller cannot forget it and hand a known
     // non-terminating blob to srcml. A parameter only so a test can supply its
     // own fixture; nothing at run time chooses a different list.
-    denylist: BlobDenylist = BlobDenylist.shipped
+    denylist: BlobDenylist = BlobDenylist.shipped,
+    // false (the default): a blob whose tokenizer times out, crashes or gives
+    // empty output is dropped from the rewritten trees, as a denylisted blob is,
+    // and the walk continues. true: the old behaviour, where such a blob stops
+    // the walk at its commit and nothing is recorded for that commit.
+    strictTokenize: Boolean = false,
+    // Where each dropped blob is recorded. Disabled (memory only) by default.
+    skipLog: SkipLog = SkipLog.disabled,
+    // Only for the `tokenizer` column of the skip record.
+    tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty
 ) {
   import Walker._
 
@@ -89,6 +113,9 @@ final class Walker(
   private val blobsOversized                 = new LongAdder
   private val blobsDenylisted                = new LongAdder
   private val blobsParserCrashed             = new LongAdder
+  private val blobsSkipped                   = new LongAdder
+  private val blobsRecovered                 = new LongAdder
+  @volatile private var refolded             = false
   private val originalBlobCopyRequests       = new LongAdder
   private val originalBlobCopies             = new LongAdder
   private val originalBlobAlreadyPresent     = new LongAdder
@@ -216,6 +243,9 @@ final class Walker(
     revWalk.sort(RevSort.REVERSE, true)
 
     try {
+      // Before the frontier is read: a recovered blob empties commit_map, and the
+      // frontier must then be empty too.
+      retryTimedOutBlobs()
       markUninteresting(revWalk)
       markStartRefs(revWalk)
 
@@ -245,7 +275,10 @@ final class Walker(
         originalBlobCacheHits       = originalBlobCacheHits.sum(),
         originalBlobDestinationLookups = originalBlobDestinationLookups.sum(),
         originalBlobBytesCopied     = originalBlobBytesCopied.sum(),
-        originalBlobBytesAvoided    = originalBlobBytesAvoided.sum()
+        originalBlobBytesAvoided    = originalBlobBytesAvoided.sum(),
+        blobsSkipped                = blobsSkipped.sum(),
+        blobsRecovered              = blobsRecovered.sum(),
+        refolded                    = refolded
       )
     } finally revWalk.close()
   }
@@ -284,7 +317,10 @@ final class Walker(
       originalBlobCacheHits       = originalBlobCacheHits.sum(),
       originalBlobDestinationLookups = originalBlobDestinationLookups.sum(),
       originalBlobBytesCopied     = originalBlobBytesCopied.sum(),
-      originalBlobBytesAvoided    = originalBlobBytesAvoided.sum()
+      originalBlobBytesAvoided    = originalBlobBytesAvoided.sum(),
+      blobsSkipped                = blobsSkipped.sum(),
+      blobsRecovered              = blobsRecovered.sum(),
+      refolded                    = refolded
     )
   }
 
@@ -887,6 +923,7 @@ final class Walker(
       // Set by either callback below: both mean "this blob's tokenization is
       // unusable, so nothing about it may be persisted".
       val unusable = new AtomicBoolean(false)
+      val failure  = new AtomicReference[BlobExec.Failure](null)
       val outcome = BlobExec.run(
         bytes        = bytes,
         origSha      = task.origId.name,
@@ -897,9 +934,16 @@ final class Walker(
         inserter     = workerInserter,
         timeoutSeconds = blobTimeoutSeconds,
         onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
+        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
+        onFailure      = f => failure.set(f)
       )
       val res = outcome match {
+        case BlobExec.Outcome.Skip if unusable.get() && !strictTokenize =>
+          // Dropped, exactly as a denylisted blob is: no id, so no tree entry, no
+          // blob_map row and no dataset row. The original bytes are NOT put into
+          // dst, because nothing refers to them.
+          dropFailedBlob(task, failure.get())
+          BlobResult.Oversized(task.origId)
         case BlobExec.Outcome.Skip if unusable.get() =>
           // The tree must still reference something, so keep the original bytes
           // available — but report it as TimedOut so nothing gets persisted. A
@@ -909,8 +953,10 @@ final class Walker(
           BlobResult.TimedOut(task.origId)
         case BlobExec.Outcome.Skip =>
           ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
+          noteTokenized(task)
           BlobResult.Resolved(task.origId)
         case BlobExec.Outcome.Replace(newId) =>
+          noteTokenized(task)
           BlobResult.Resolved(newId)
         case BlobExec.Outcome.Abort(stderr, code) =>
           BlobResult.Aborted(stderr, code)
@@ -1037,15 +1083,16 @@ final class Walker(
     // blob_map row and no dataset row. See readBlob and resolveEntry.
     val futures = unique.map { task =>
       Future {
-        readBlob(task).map { bytes =>
+        readBlob(task).flatMap { bytes =>
           val workerInserter = dst.newObjectInserter()
           val label = s"${task.origId.name} (${task.fullPath})"
           inFlightBlobs.put(label, System.nanoTime())
           try {
             blobCommandExecutions.increment()
             // Set by either callback below: both mean "this blob's tokenization is
-      // unusable, so nothing about it may be persisted".
-      val unusable = new AtomicBoolean(false)
+            // unusable, so nothing about it may be persisted".
+            val unusable = new AtomicBoolean(false)
+            val failure  = new AtomicReference[BlobExec.Failure](null)
             val outcome = BlobExec.run(
               bytes        = bytes,
               origSha      = task.origId.name,
@@ -1056,20 +1103,27 @@ final class Walker(
               inserter     = workerInserter,
               timeoutSeconds = blobTimeoutSeconds,
               onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-              onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
+              onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
+              onFailure      = f => failure.set(f)
             )
+            val dropped = unusable.get() && !strictTokenize
             // For Skip outcomes (identical output, a non-zero exit with
             // abortOnError=false, or a timeout) we keep the original blob id, so
             // the dst tree will reference it — meaning the bytes must exist in
             // dst. For Replace outcomes the worker has already inserted the new
             // blob. For Abort we do nothing (caller short-circuits).
+            // A dropped blob (see executeBlobTask) gets no bytes in dst and no id.
             outcome match {
-              case BlobExec.Outcome.Skip => ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
+              case _ if dropped => dropFailedBlob(task, failure.get())
+              case BlobExec.Outcome.Skip =>
+                ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
+                if (!unusable.get()) noteTokenized(task)
+              case BlobExec.Outcome.Replace(_) => noteTokenized(task)
               case _                     => ()
             }
             workerInserter.flush()
             progress(s"blob $label")
-            (task, outcome, unusable.get())
+            if (dropped) None else Some((task, outcome, unusable.get()))
           } finally {
             inFlightBlobs.remove(label)
             workerInserter.close()
@@ -1133,6 +1187,10 @@ final class Walker(
     // into a microsecond and a logged exclusion.
     val denied = denylist.entryFor(task.origId.name)
     if (denied.isDefined) { noteDenylisted(task, denied.get); return None }
+    // A blob that this run already dropped after a tokenizer failure is not given
+    // to the tokenizer again: a second timeout costs a second budget, and a crash
+    // is deterministic. It is dropped from every tree that holds it.
+    if (skippedKeys.containsKey((task.origId.name, task.fullPath))) return None
 
     val r = src.newObjectReader()
     try {
@@ -1162,6 +1220,176 @@ final class Walker(
     * `oversizedKeys` so the two exclusions can never be confused in the counts. */
   private val denylistedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
+  /** `(origSha, fullPath)` of every blob this run dropped after a tokenizer
+    * failure, with the failure. Read by [[readBlob]] (do not run the tokenizer
+    * again) and by [[resolveEntry]] (omit the path). Empty under
+    * `strictTokenize`. */
+  private val skippedKeys = new ConcurrentHashMap[(String, String), BlobExec.Failure]()
+
+  /** Timed-out blobs that an earlier run dropped and that the retry at the start
+    * of this run could not recover. If the walk tokenizes one of them (a re-fold
+    * reaches it again), its retry_blob row goes. */
+  private val pendingRetry = ConcurrentHashMap.newKeySet[(String, String)]()
+
+  /** Drop one blob whose tokenizer failed, and record it. Called on a tokenizer
+    * worker. Counted, logged and recorded once per `(sha, path)`.
+    *
+    * A timeout also gets a retry_blob row, written under `dbLock` BEFORE the
+    * worker returns. The consumer writes the commit_map row of the containing
+    * commit only after it has this result, so the retry row is always durable
+    * first. Without it a resume never visits the commit again, and the drop of a
+    * blob that was only slow would be permanent. */
+  private def dropFailedBlob(task: BlobMissTask, f0: BlobExec.Failure): Unit = {
+    val f = Option(f0).getOrElse(BlobExec.Failure(BlobExec.Failure.ParserCrash, "unknown"))
+    val sha = task.origId.name
+    val key = (sha, task.fullPath)
+    if (skippedKeys.putIfAbsent(key, f) == null) {
+      blobsSkipped.increment()
+      if (f.reason == BlobExec.Failure.Timeout) {
+        dbLock.synchronized(mapping.putRetry(sha, task.fullPath))
+        pendingRetry.add(key)
+      }
+      skipLog.record(SkipLog.Row(sha, task.fullPath, f.reason, f.detail,
+        SkipLog.tokenizerFor(tokenizerIdentity, task.fullPath)))
+      val next =
+        if (f.reason == BlobExec.Failure.Timeout)
+          "A timeout depends on load, so the next run over this memo tries this blob again."
+        else
+          "A parser crash or empty output is deterministic for this tokenizer, so a re-run " +
+            "does not try it again " +
+            "unless the tokenizer identity changes (--retokenize)."
+      System.err.println(
+        s"blobExec: SKIPPED blob: sha=$sha path=${task.fullPath} reason=${f.reason} " +
+          s"detail=${f.detail}. The tokenizer output is not usable, so the blob is dropped from " +
+          "the rewritten tree, as a denylisted blob is: it gives no blame and no dataset row, " +
+          "and the file is not in the tokenized repository as raw source. The walk continues. " +
+          next +
+          skipLog.path.map(p => s" Recorded in $p.").getOrElse("")
+      )
+    }
+  }
+
+  /** A blob tokenized. If an earlier run recorded it as a failure, that record is
+    * now wrong: remove it from the skip file and from retry_blob. */
+  private def noteTokenized(task: BlobMissTask): Unit = {
+    val sha = task.origId.name
+    if (skipLog.contains(sha, task.fullPath, SkipLog.TokenizerFailures))
+      skipLog.forget(sha, task.fullPath, SkipLog.TokenizerFailures)
+    if (pendingRetry.remove((sha, task.fullPath)))
+      dbLock.synchronized(mapping.deleteRetry(sha, task.fullPath))
+  }
+
+  /** Try again, before the walk, each blob that timed out in an earlier run.
+    *
+    * These blobs are not in blob_map, and the trees and commits that hold them
+    * ARE in tree_map and commit_map, with the blob omitted. So the walk alone
+    * never gets to them again. For each retry_blob row:
+    *
+    *   - it tokenizes: its blob_map row is written, the row goes, and the skip
+    *     record goes. Then commit_map, tree_map and ref_map are emptied
+    *     ([[Mapping.clearFold]]), so the walk folds all of history again with the
+    *     blob in it. The blob rows stay, so the re-fold runs no tokenizer for the
+    *     blobs that are already done.
+    *   - it times out again: the row stays for the next run, and the blob stays
+    *     dropped. Nothing is folded again.
+    *   - it crashes: the row goes (a crash is deterministic), the skip record
+    *     changes from `timeout` to the crash reason, and the blob stays dropped.
+    *   - it is now denylisted, oversized or not in src: the row goes.
+    *
+    * Sequential, on this thread: there are few rows, and each one can take a
+    * whole budget. Under `strictTokenize` the same retry runs, and a failure
+    * counts as it does in the walk, so the exit status is 4 or 6. */
+  private def retryTimedOutBlobs(): Unit = {
+    val pending = mapping.retryBlobs
+    if (pending.isEmpty) return
+    System.err.println(
+      s"blobExec: retrying ${pending.size} blob(s) whose tokenizer timed out in an earlier run")
+    val inserter = dst.newObjectInserter()
+    var recovered = 0L
+    val timeoutOnly = Set(BlobExec.Failure.Timeout)
+    try {
+      pending.foreach { case (sha, blobPath) =>
+        progress(s"retry $sha ($blobPath)")
+        val key  = (sha, blobPath)
+        val task = BlobMissTask(ObjectId.fromString(sha), Mapping.basename(blobPath), blobPath)
+        val bytes =
+          try readBlob(task)
+          catch { case _: org.eclipse.jgit.errors.MissingObjectException => None }
+        bytes match {
+          case None =>
+            mapping.deleteRetry(sha, blobPath)
+            skipLog.forget(sha, blobPath, timeoutOnly)
+            System.err.println(s"blobExec: retry: $sha ($blobPath) is excluded or not in src; row removed")
+          case Some(b) =>
+            blobCommandExecutions.increment()
+            val unusable = new AtomicBoolean(false)
+            val failure  = new AtomicReference[BlobExec.Failure](null)
+            val outcome = BlobExec.run(
+              bytes = b, origSha = sha, filename = task.filename, fullPath = blobPath,
+              command = command, abortOnError = abortOnError, inserter = inserter,
+              timeoutSeconds = blobTimeoutSeconds,
+              onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
+              onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
+              onFailure      = f => failure.set(f)
+            )
+            outcome match {
+              case BlobExec.Outcome.Skip if unusable.get() =>
+                val f = Option(failure.get()).getOrElse(
+                  BlobExec.Failure(BlobExec.Failure.ParserCrash, "unknown"))
+                skippedKeys.put(key, f)
+                if (f.reason == BlobExec.Failure.Timeout) {
+                  pendingRetry.add(key)
+                  System.err.println(
+                    s"blobExec: retry: $sha ($blobPath) timed out again (${f.detail}). It stays " +
+                      "dropped, and the next run tries it again.")
+                } else {
+                  mapping.deleteRetry(sha, blobPath)
+                  skipLog.forget(sha, blobPath, timeoutOnly)
+                  skipLog.record(SkipLog.Row(sha, blobPath, f.reason, f.detail,
+                    SkipLog.tokenizerFor(tokenizerIdentity, blobPath)))
+                  System.err.println(
+                    s"blobExec: retry: $sha ($blobPath) did not time out, but ${f.reason} " +
+                      s"(${f.detail}). It stays dropped, and it is not tried again.")
+                }
+              case BlobExec.Outcome.Abort(_, code) =>
+                pendingRetry.add(key)
+                skippedKeys.put(key, BlobExec.Failure(BlobExec.Failure.Timeout, s"retry exit=$code"))
+                System.err.println(
+                  s"blobExec: retry: $sha ($blobPath) exited $code. It stays dropped, and the " +
+                    "next run tries it again.")
+              case other =>
+                val newId = other match {
+                  case BlobExec.Outcome.Replace(id) => id
+                  case _ =>
+                    ensureOriginalBlobAvailable(task.origId, insertHeldBytes(b), inserter)
+                    task.origId
+                }
+                inserter.flush()
+                mapping.inTx {
+                  mapping.putBlob(sha, blobPath, newId.name)
+                  mapping.deleteRetry(sha, blobPath)
+                }
+                skipLog.forget(sha, blobPath, timeoutOnly)
+                recovered += 1
+                System.err.println(s"blobExec: retry: $sha ($blobPath) tokenized; row removed")
+            }
+        }
+      }
+      inserter.flush()
+    } finally inserter.close()
+
+    if (recovered > 0) {
+      mapping.clearFold()
+      refolded = true
+      blobsRecovered.add(recovered)
+      System.err.println(
+        s"blobExec: $recovered blob(s) recovered on retry. commit_map, tree_map and ref_map are " +
+          "now empty, so this run folds all of history again with those blobs in it. The blob " +
+          "rows stay, so no other blob is tokenized again. Every rewritten commit gets a new " +
+          "sha: all outputs made from the tokenized repository are out of date.")
+    }
+  }
+
   /** Count and explain one denylisted blob, once per `(sha, path)`. The sha, the
     * path, the reason and the citation are all in the line, because this line is
     * the only per-blob record of what the dataset does not contain, and "we could
@@ -1175,6 +1403,9 @@ final class Walker(
     // is not four distinct files.
     if (denylistedKeys.add(key)) {
       blobsDenylisted.increment()
+      skipLog.record(SkipLog.Row(task.origId.name, task.fullPath, SkipLog.Denylisted,
+        s"reason=${entry.reason}; citation=${entry.citation}",
+        SkipLog.tokenizerFor(tokenizerIdentity, task.fullPath)))
       System.err.println(
         s"blobExec: EXCLUDED denylisted blob: sha=${task.origId.name} " +
           s"path=${task.fullPath} reason=${entry.reason} citation=${entry.citation}. " +
@@ -1194,6 +1425,9 @@ final class Walker(
     val key = (task.origId.name, task.fullPath)
     if (oversizedKeys.add(key)) {
       blobsOversized.increment()
+      skipLog.record(SkipLog.Row(task.origId.name, task.fullPath, SkipLog.Oversized,
+        s"size=${sizeBytes}B limit=${Walker.MaxBlobBytes}B",
+        SkipLog.tokenizerFor(tokenizerIdentity, task.fullPath)))
       System.err.println(
         s"blobExec: EXCLUDED oversized blob: sha=${task.origId.name} " +
           s"path=${task.fullPath} size=${sizeBytes}B limit=${Walker.MaxBlobBytes}B. " +
@@ -1290,7 +1524,8 @@ final class Walker(
         // Excluded as oversized or by the denylist (see readBlob): drop the entry,
         // so the file is absent from the rewritten tree rather than present as raw
         // source.
-        case None if oversizedKeys.contains(key) || denylistedKeys.contains(key) => None
+        case None if oversizedKeys.contains(key) || denylistedKeys.contains(key) ||
+                     skippedKeys.containsKey(key) => None
         // Anything else missing is a bug, and used to surface as a bare
         // NoSuchElementException. Keep it fatal and say which blob it was.
         case None =>

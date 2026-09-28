@@ -167,6 +167,7 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--mode` / `--shards` | tokenizer walk mode / shard count for `sharded`            | `pipeline` / `4`                 |
 | `--jobs`              | concurrent blame/HTML processes                            | `CREGIT_JOBS` or up to `4` CPUs  |
 | `--reblame`           | re-blame every file in step 7, replacing existing `.blame` output | off — a resume skips files already blamed |
+| `--strict-tokenize`   | stop step 2 on the first tokenizer failure (exit 4 or 6), as earlier versions did | off — a failed blob is skipped and recorded; also `CREGIT_STRICT_TOKENIZE=1` |
 
 **`git blame` runs with `-C100` copy detection** (`blameRepo/formatBlame.pl:73`), so a
 token moved between files keeps its original author. Upstream shipped that commented
@@ -210,9 +211,79 @@ distinct srcML 1.1.0 defects** that the file's header keeps apart:
 
 Denylisted blobs are never handed to the tokenizer, are dropped from the rewritten
 trees rather than kept as raw source, are counted as `blobsDenylisted` and named
-with a reason and a citation — and, unlike a tokenizer timeout or a parser crash,
-they do **not** change the exit status. Adding an entry means editing that file and
-rebuilding the jar.
+with a reason and a citation, and they do **not** change the exit status. Adding an
+entry means editing that file and rebuilding the jar.
+
+### When the tokenizer fails on a blob: skipped, recorded, and the run continues
+
+By default, a blob whose tokenizer fails does **not** stop the run. There are three
+failures:
+
+| reason         | what happened                                                    | retried by a later run? |
+| -------------- | ---------------------------------------------------------------- | ----------------------- |
+| `parser-crash` | the tokenizer exited 33: srcML died on a signal, or gave no tokens | no: deterministic for this tokenizer |
+| `empty-output` | the tokenizer exited 0 with no output for a non-empty input       | no: deterministic for this tokenizer |
+| `timeout`      | the tokenizer ran longer than `--blob-timeout` and was killed      | **yes**: a timeout depends on load |
+
+blobExec drops such a blob exactly as it drops a denylisted blob. The file is not in
+the tokenized repository, not as raw source and not as an empty tokenization, so it
+has no blame and no dataset row. A `SKIPPED blob` line in `pipeline.log` names the
+sha, the path, the reason and the detail. Step 2 then prints a warning, for example
+`WARNING: 3 blobs skipped, see <work>/tokenize-skipped.tsv (parser-crash=1, timeout=1, denylisted=1).`,
+and the run continues. The exit status of blobExec is 0.
+
+**`<work>/tokenize-skipped.tsv` lists every blob the dataset does not contain**: the
+skipped blobs, the denylisted blobs and the oversized blobs. It is tab-separated, with
+a header. This row comes from `SkipFailedBlobSpec`:
+
+```
+sha	path	reason	detail	tokenizer
+65b2df87f7df3aeedef04be96703e55ac19c2cfb	deep/b.c	denylisted	reason=srcML 1.1.0 does not terminate on it; citation=srcML/srcML#2361	c=0123456789abcdef
+```
+
+`reason` is one of `denylisted`, `oversized`, `parser-crash`, `empty-output` or
+`timeout`. `detail` is the denylist reason and citation, the size, the signal
+(`exit=33 signal=11`), the byte counts, or the budget (`timeout=600s`). `tokenizer`
+is `<ext>=<identity>` from `tokenize/tokenizerIdentity.pl`. The file is in the work
+directory, next to `<name>-dataset.parquet`, because that directory is the project's
+output folder: `ctp.py` reads the dataset from there, and `retain.py` removes only
+`memo/` and `html/`. A resumed step 2 appends to the file and does not write a second
+row for the same sha, path and reason. A row is removed when its blob tokenizes on a
+later run. A step-1 run deletes the work directory, and so the file, and writes it
+again. When a tree that holds a dropped blob occurs again under a different path, the
+walk reuses the rewritten tree, and the file names only the first path. The sha is
+always in the file.
+
+**A timeout is not permanent.** blobExec records a timed-out blob in the
+`retry_blob` table of the blob map, and the next step-2 run tries it first. If it now
+tokenizes, blobExec empties `commit_map`, `tree_map` and `ref_map` and folds all of
+history again, with the blob in it. The blob rows stay, so no other blob is tokenized
+again. Every rewritten commit then has a new sha, so the runner removes the outputs
+made from the old commits (as it does for `--retokenize`), and steps 3 to 10 make them
+again. If the blob times out again, it stays dropped and nothing is folded again.
+
+**A crash is recorded only through the blob map, never in the memo.**
+`tokenizeByBlobId/tokenBySha.pl` writes a memo entry only when the tokenizer succeeds,
+so a crash or a timeout is never cached there. A crash is "remembered" only because
+the trees and commits that omit the blob are in the blob map, and the blob map is
+keyed on the tokenizer identity: a changed tokenizer is refused (exit 3), and
+`--retokenize` empties `tree_map`, so the walk gets to the blob again and tries the new
+tokenizer on it.
+
+**To require a clean run, pass `--strict-tokenize`** (or `CREGIT_STRICT_TOKENIZE=1`).
+Then the first failure stops step 2, as in earlier versions: blobExec records nothing
+for the containing commit and exits 4 (timeout) or 6 (parser crash), and the runner
+writes `TOKENIZE-TIMEOUTS` or `TOKENIZE-PARSER-CRASHES` and stops. A step-2 resume
+retries exactly those blobs. `--mode sharded` is always strict, because the shard
+merge does not carry the retry records over.
+
+| blobExec exit status | before this change | now, default | now, `--strict-tokenize` |
+| -------------------- | ------------------ | ------------ | ------------------------ |
+| a blob timed out     | 4, step 2 stops    | 0, blob skipped and recorded, retried next run | 4, step 2 stops |
+| a parser crash or empty output | 6, step 2 stops | 0, blob skipped and recorded | 6, step 2 stops |
+| a denylisted or oversized blob | 0 | 0, and recorded | 0, and recorded |
+| an abort (`--abort-on-error`) | 2 | 2 | 2 |
+| a stall (watchdog) | 5 | 5 | 5 |
 
 Example run (cregit run on itself):
 ![Example cregit run](cregit.gif)

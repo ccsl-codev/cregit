@@ -63,6 +63,17 @@ object Main {
 
   /** The process exit status for a finished walk.
     *
+    * Without `--strict-tokenize` (the default) only an abort gates it. A blob
+    * whose tokenizer timed out, crashed or gave empty output is dropped from the
+    * rewritten trees, as a denylisted blob is, and it is recorded in the skip
+    * file (`--skipped-tsv`). The file, not the status, is the signal: the walk is
+    * complete, and the dataset has no raw source and no empty tokenization in it.
+    * Thus the status is 0, and the run continues.
+    *
+    * With `--strict-tokenize` the rules below apply. They are the rules of all
+    * the earlier versions, and a user who must have a clean run can still get
+    * them.
+    *
     * A function, and taking the whole [[WalkStats]], so that "which counters gate
     * publication" is a property something can be asserted about rather than a
     * conditional buried in `main`. Exactly two things gate it: an abort, and a
@@ -88,8 +99,9 @@ object Main {
     * A timeout is checked first only because it is the older and broader signal;
     * when both fire, either status correctly means "do not publish".
     */
-  private[blobexec] def exitStatus(stats: WalkStats): Int =
+  private[blobexec] def exitStatus(stats: WalkStats, strictTokenize: Boolean): Int =
     if (stats.aborted) 2
+    else if (!strictTokenize) 0
     else if (stats.blobsTimedOut > 0) TimedOutExitStatus
     else if (stats.blobsParserCrashed > 0) ParserCrashedExitStatus
     else 0
@@ -138,10 +150,50 @@ object Main {
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--strict-tokenize] [--skipped-tsv=<file>] [--refold-marker=<file>] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
+      |  --strict-tokenize stop at the first blob whose <command> times out,
+      |                    reports a parser crash (exit ${BlobExec.ParserCrashExitCode}), or gives empty
+      |                    output for a non-empty input. The walk records nothing
+      |                    for that commit and stops, and the exit status is
+      |                    ${TimedOutExitStatus} (timeout) or ${ParserCrashedExitStatus} (crash). This was the only behaviour
+      |                    before; use it if the run must be clean.
+      |
+      |                    Without this flag (the default) such a blob is DROPPED
+      |                    from the rewritten trees, exactly as a denylisted blob
+      |                    is: the file is not in the tokenized repository, not as
+      |                    raw source and not as an empty tokenization, so it gives
+      |                    no blame and no dataset row. The walk continues, one
+      |                    'SKIPPED blob' line names the sha, path, reason and
+      |                    detail, the blob is recorded in --skipped-tsv, and the
+      |                    exit status is 0.
+      |                      - a parser crash or empty output is deterministic for
+      |                        a given tokenizer, so a re-run does not try it again.
+      |                        A changed tokenizer identity is refused (status 3)
+      |                        or, with --retokenize, re-folds and tries it again.
+      |                      - a timeout depends on load, so it is NOT permanent.
+      |                        The blob is recorded in the retry_blob table of
+      |                        <db.sqlite>, and each later run tries it first. If it
+      |                        then tokenizes, the run empties commit_map, tree_map
+      |                        and ref_map and folds all of history again with the
+      |                        blob in it (see --refold-marker).
+      |  --skipped-tsv=<file>
+      |                    the record of every blob that the tokenized repository
+      |                    does not contain. Tab-separated, with the header
+      |                      sha	path	reason	detail	tokenizer
+      |                    reason is denylisted, oversized, parser-crash,
+      |                    empty-output or timeout. Append-safe: a resumed run
+      |                    reads the file and does not write a row for the same
+      |                    sha, path and reason again. A row is removed when its
+      |                    blob tokenizes on a later run.
+      |  --refold-marker=<file>
+      |                    create this file when a retry recovered a timed-out blob
+      |                    and the run folded all of history again. Every rewritten
+      |                    commit then has a new sha, so the caller must remove all
+      |                    outputs made from the tokenized repository. The caller
+      |                    removes the file.
       |  --mask-widened    resume against a blob map recorded under a DIFFERENT
       |                    <fileMaskRegex>, keeping the tokenizations already in
       |                    blob_map. Without it a mask change is refused (status
@@ -237,15 +289,13 @@ object Main {
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
-      |                    killed (whole process group) and that single blob is
-      |                    left untokenized; the run continues, and
-      |                    --abort-on-error does not turn a timeout into a
-      |                    whole-run abort. The count is reported on the done
-      |                    line and the process then exits ${TimedOutExitStatus},
-      |                    so the caller cannot publish a project whose tokens are
-      |                    incomplete. Nothing durable is recorded for the blob,
-      |                    the trees above it or its commit, so another run over
-      |                    the same memo retries just that blob (from the
+      |                    killed (whole process group), and --abort-on-error does
+      |                    not turn a timeout into a whole-run abort. The blob is
+      |                    then dropped and recorded (see --strict-tokenize), and
+      |                    the next run over the same memo tries it again. With
+      |                    --strict-tokenize the walk stops at that commit, records
+      |                    nothing for it, and exits ${TimedOutExitStatus}; another run
+      |                    over the same memo retries just that blob (from the
       |                    pipeline: resume at step 2, never step 1).
       |  --stall-timeout=<seconds>
       |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}); must be larger than
@@ -262,17 +312,20 @@ object Main {
       |  Blobs on the shipped denylist (${BlobDenylist.ResourcePath} inside this
       |  jar) are never handed to <command>: they are dropped from the rewritten
       |  trees, counted as blobsDenylisted, named with their reason and citation on
-      |  an EXCLUDED line, and they do NOT change the exit status. srcML 1.1.0 does
+      |  an EXCLUDED line and in --skipped-tsv, and they do NOT change the exit
+      |  status. srcML 1.1.0 does
       |  not terminate on the four listed blobs, the defect is diagnosed and cited
       |  upstream, and a diagnosed exclusion must not block publication the way an
       |  unexplained timeout does.
       |
-      |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
+      |  Exit status: 0 = complete (skipped blobs, if any, are in --skipped-tsv),
+      |               1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch (including a changed tokenizer with
-      |               no --retokenize), ${TimedOutExitStatus} = completed
-      |               but some blob timed out (output incomplete, re-run to
-      |               retry), ${Walker.StalledExitStatus} = killed by the stall watchdog,
-      |               ${ParserCrashedExitStatus} = a tokenizer reported a parser crash,
+      |               no --retokenize), ${TimedOutExitStatus} = only with --strict-tokenize: some
+      |               blob timed out (output incomplete, re-run to retry),
+      |               ${Walker.StalledExitStatus} = killed by the stall watchdog,
+      |               ${ParserCrashedExitStatus} = only with --strict-tokenize: a tokenizer
+      |               reported a parser crash,
       |               ${RetokenizeIneffectiveExitStatus} = --retokenize would have invalidated nothing.
       |  --pipeline        use the look-ahead pipelined walker (producer runs
       |                    ahead so the blob-command pool stays saturated);
@@ -318,8 +371,16 @@ object Main {
     var tokenizerIdentity = TokenizerIdentity.empty
     var retokenizeExtensions: Set[String] = Set.empty
     var memoDir: Option[java.nio.file.Path] = None
+    var strictTokenize = false
+    var skippedTsv: Option[java.nio.file.Path] = None
+    var refoldMarker: Option[java.nio.file.Path] = None
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
+      case "--strict-tokenize" => strictTokenize = true
+      case t if t.startsWith("--skipped-tsv=") && t.length > "--skipped-tsv=".length =>
+        skippedTsv = Some(Paths.get(t.stripPrefix("--skipped-tsv=")))
+      case t if t.startsWith("--refold-marker=") && t.length > "--refold-marker=".length =>
+        refoldMarker = Some(Paths.get(t.stripPrefix("--refold-marker=")))
       case "--pipeline"       => pipeline = true
       case "--pipeline-trees" => pipelineTrees = true
       case "--mask-widened"   => maskWidened = true
@@ -529,8 +590,19 @@ object Main {
         s"maskWidened=$maskWidened denylistEntries=${denylist.size} " +
         s"tokenizerIdentity=${if (tokenizerIdentity.isEmpty) "none" else tokenizerIdentity.render} " +
         s"retokenize=${if (retokenizeExtensions.isEmpty) "none" else retokenizeExtensions.toVector.sorted.mkString(",")} " +
-        s"memoDir=${memoDir.map(_.toString).getOrElse("none")}"
+        s"memoDir=${memoDir.map(_.toString).getOrElse("none")} " +
+        s"strictTokenize=$strictTokenize skippedTsv=${skippedTsv.map(_.toString).getOrElse("none")}"
     )
+
+    // Opened before the walk, so a file this run cannot append to stops the run
+    // now, not after hours of tokenizing.
+    val skipLog =
+      try skippedTsv.map(SkipLog.open).getOrElse(SkipLog.disabled)
+      catch {
+        case e: Exception =>
+          System.err.println(s"Error: --skipped-tsv: ${e.getMessage}")
+          sys.exit(1)
+      }
 
     val src: FileRepository = openSrc(srcPath)
     val dst: FileRepository = openOrInitDst(dstPath)
@@ -625,7 +697,10 @@ object Main {
         destinationMayContainObjects = incremental,
         blobTimeoutSeconds = blobTimeoutSeconds,
         stallTimeoutSeconds = stallTimeoutSeconds,
-        denylist = denylist
+        denylist = denylist,
+        strictTokenize = strictTokenize,
+        skipLog = skipLog,
+        tokenizerIdentity = tokenizerIdentity
       )
       val s = walker.run()
       val prior = mapping.getMeta(BlobsTimedOutMetaKey).flatMap(_.toLongOption).getOrElse(0L)
@@ -633,9 +708,17 @@ object Main {
       if (s.blobsTimedOut > 0) mapping.setMeta(BlobsTimedOutMetaKey, total.toString)
       (s, total)
     } finally {
+      skipLog.close()
       mapping.close()
       dst.close()
       src.close()
+    }
+
+    // Written after the walk, so that it exists only if the re-fold is complete.
+    if (stats.refolded) refoldMarker.foreach { p =>
+      Files.write(p, (s"${java.time.Instant.now()} blobExec re-folded all history: " +
+        s"${stats.blobsRecovered} timed-out blob(s) recovered on retry\n").getBytes("UTF-8"))
+      ()
     }
 
     println(
@@ -656,6 +739,11 @@ object Main {
         s"blobsOversized=${stats.blobsOversized} " +
         s"blobsDenylisted=${stats.blobsDenylisted} " +
         s"blobsParserCrashed=${stats.blobsParserCrashed} " +
+        s"blobsSkipped=${stats.blobsSkipped} " +
+        s"blobsRecovered=${stats.blobsRecovered} " +
+        s"refolded=${stats.refolded} " +
+        s"skippedTsvRows=${skipLog.all.size} " +
+        s"strictTokenize=$strictTokenize " +
         s"aborted=${stats.aborted}"
     )
 
@@ -690,7 +778,21 @@ object Main {
       )
     }
 
-    if (stats.blobsTimedOut > 0) {
+    if (!strictTokenize && (stats.blobsSkipped > 0 || stats.blobsTimedOut > 0 || stats.blobsParserCrashed > 0)) {
+      // Reported, not fatal. Each blob is named on a 'SKIPPED blob' line above.
+      System.err.println(
+        s"blobExec: WARNING: ${stats.blobsSkipped} blob(s) were skipped this run because their " +
+          s"tokenizer failed (timed out: ${stats.blobsTimedOut}, parser crash or empty output: " +
+          s"${stats.blobsParserCrashed}). They are dropped from the rewritten trees, as denylisted " +
+          "blobs are, so the dataset has no row for them and no raw source in their place. " +
+          skippedTsv.map(p => s"See $p (${skipLog.all.size} row(s) in all). ").getOrElse(
+            "No --skipped-tsv was given, so the 'SKIPPED blob' lines above are the only record. ") +
+          "A timed-out blob is tried again by the next run over this memo. To require a clean " +
+          "run instead, use --strict-tokenize."
+      )
+    }
+
+    if (strictTokenize && stats.blobsTimedOut > 0) {
       System.err.println(
         s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsTimedOut} blob(s) timed out this " +
           s"run ($timedOutEver ever for this memo, see meta['$BlobsTimedOutMetaKey'] in $dbPath). " +
@@ -709,7 +811,7 @@ object Main {
       )
     }
 
-    if (stats.blobsParserCrashed > 0) {
+    if (strictTokenize && stats.blobsParserCrashed > 0) {
       System.err.println(
         s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsParserCrashed} blob(s) had their " +
           "tokenizer report a parser crash this run. Each one is named on a 'reported a parser " +
@@ -732,7 +834,7 @@ object Main {
     // threads while they are blocked on a pipe, and on the pre-fix build the
     // JVM outlived the finished walk on exactly those threads — a silent stall
     // behind a done-line that read `aborted=false`.
-    sys.exit(exitStatus(stats))
+    sys.exit(exitStatus(stats, strictTokenize))
   }
 
   private def openSrc(path: java.nio.file.Path): FileRepository = {

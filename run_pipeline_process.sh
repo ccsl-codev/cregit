@@ -134,17 +134,38 @@ Target repository:
                     CREGIT_MEMO_KEEP_THRESHOLD) is refused; see --force-clean.
   --blob-timeout N  wall-clock budget in seconds for one blob's tokenizer
                     (blobExec default: 600). A child that exceeds it is killed,
-                    that blob is left untokenized, step 2 stops with exit 4 and
-                    a step-2 resume retries exactly those blobs. Also settable
-                    as CREGIT_BLOB_TIMEOUT in the environment, which is how to
-                    reach it through ctp.py.
+                    and the blob is skipped as described under
+                    --strict-tokenize. The next step-2 run tries it again.
+                    Also settable as CREGIT_BLOB_TIMEOUT in the environment,
+                    which is how to reach it through ctp.py.
+  --strict-tokenize stop step 2 on the first tokenizer failure, as all earlier
+                    versions did. Also CREGIT_STRICT_TOKENIZE=1.
+                    Without it (the default), a blob whose tokenizer times out,
+                    crashes (srcML dies on a signal, exit 33) or gives empty
+                    output is SKIPPED: it is dropped from the tokenized
+                    repository exactly as a denylisted blob is (never raw
+                    source, never an empty tokenization), so it has no blame
+                    and no dataset row. The run continues, and step 2 prints
+                    "N blobs skipped, see <work>/tokenize-skipped.tsv".
+                    That file lists every blob the dataset does not contain,
+                    denylisted and oversized blobs included, with the header
+                      sha  path  reason  detail  tokenizer   (tab-separated)
+                    It is next to <name>-dataset.parquet in the work directory.
+                    A timed-out blob is tried again on the next step-2 run. If
+                    it then tokenizes, blobExec folds all of history again, and
+                    the runner removes the outputs made from the old commits.
+                    With --strict-tokenize, a timeout stops step 2 with exit 4
+                    and a parser crash with exit 6, as described under
+                    --force-clean. --mode sharded is always strict.
   --stall-timeout N watchdog window in seconds (blobExec default: 1800). If no
                     blob, tree, commit or blob copy completes anywhere in this
                     window the run is killed with exit 5. Must be larger than
                     --blob-timeout; blobExec refuses an explicit value that is
                     not, and raises a defaulted one. Also CREGIT_STALL_TIMEOUT.
   --force-clean     allow the FROM_STEP=1 wipe even when $WORK holds a
-                    TOKENIZE-TIMEOUTS or TOKENIZE-STALLED marker, or a memo big
+                    TOKENIZE-TIMEOUTS, TOKENIZE-STALLED or
+                    TOKENIZE-PARSER-CRASHES marker (the first and the last only
+                    occur with --strict-tokenize or --mode sharded), or a memo big
                     enough to be worth keeping. Without this the runner refuses:
                     those markers mean the work is incomplete but resumable at
                     step 2, and deleting it means re-tokenizing everything to
@@ -349,11 +370,17 @@ RETOKENIZE=""
 # does hand its environment to this script.
 BLOB_TIMEOUT="${CREGIT_BLOB_TIMEOUT:-}"
 STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
+# 0 (the default): a blob whose tokenizer fails is skipped and recorded, and step 2
+# continues. 1: step 2 stops on it (exit 4 or 6 from blobExec). CREGIT_STRICT_TOKENIZE
+# is the way to set it through ctp.py.
+STRICT_TOKENIZE="${CREGIT_STRICT_TOKENIZE:-0}"
 
 # Markers meaning "the work in $WORK is incomplete but recoverable, and a
 # FROM_STEP=1 wipe would throw away days of tokenizing to redo it". Written by
 # step 2 when blobExec reports a timed-out blob (exit 4), a stall (exit 5), or a
-# parser crash (exit 6); see keep_markers_present and --force-clean.
+# parser crash (exit 6); see keep_markers_present and --force-clean. Exits 4 and 6
+# occur only with --strict-tokenize and in --mode sharded: by default blobExec
+# skips such a blob, records it in $SKIPPED_TSV and exits 0.
 KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED TOKENIZE-PARSER-CRASHES"
 
 # Prints the first marker found in $WORK and returns 0; returns 1 if none.
@@ -438,8 +465,10 @@ memo_rescue_advice() {
 EOF
 }
 
-# tokenize_gate <exit status> <what ran>: turn blobExec's two "incomplete but
+# tokenize_gate <exit status> <what ran>: turn blobExec's "incomplete but
 # resumable" statuses into a marker plus resume instructions, and stop the run.
+# 4 and 6 are only possible with --strict-tokenize or --mode sharded (always
+# strict). By default a failed blob is skipped, recorded, and blobExec exits 0.
 # Shared by the serial and sharded branches of step 2 so they cannot drift — the
 # sharded branch not having this is how a 435 GB build would have been wiped.
 #
@@ -469,7 +498,7 @@ tokenize_gate() {
              "retries those blobs. Resuming at step 1 deletes this directory instead;" \
              "while this marker exists the runner refuses to do that without" \
              "--force-clean." >> "${WORK}/TOKENIZE-TIMEOUTS"
-        die "$what left blobs untokenized (exit 4). Refusing to continue: the
+        die "$what left blobs untokenized (exit 4, strict mode). Refusing to continue: the
      dataset would carry raw source in place of tokens. Marker written to
      ${WORK}/TOKENIZE-TIMEOUTS.
      Recovery — resume at step 2. Do NOT re-run from step 1: that deletes
@@ -499,7 +528,7 @@ $resume_lines
              "this step's log. Nothing was recorded for the containing commit." \
              "This is deterministic: re-running alone will NOT clear it." \
              >> "${WORK}/TOKENIZE-PARSER-CRASHES"
-        die "$what hit a parser crash (exit 6). Refusing to continue: before this
+        die "$what hit a parser crash (exit 6, strict mode). Refusing to continue: before this
      was detected, such a blob became a silent 0-byte tokenization and the file
      vanished from the dataset with nothing counting it. Marker written to
      ${WORK}/TOKENIZE-PARSER-CRASHES.
@@ -512,7 +541,9 @@ $resume_lines
      blob denylist with a reason and citation so they are excluded explicitly
      and reported without blocking publication.
      If you do denylist them, resume at step 2 to keep the memo:
-$resume_lines"
+$resume_lines
+     Or resume without --strict-tokenize (not possible in --mode sharded): the
+     crashing blobs are then skipped and listed in $SKIPPED_TSV."
     elif [ "$rc" -eq 7 ]; then
         # No marker file, deliberately. The markers mean "work in $WORK is
         # incomplete but resumable and a step-1 wipe would destroy it". This is the
@@ -536,6 +567,23 @@ $resume_lines"
     fi
 }
 
+# report_skipped_blobs: the warning summary for the blobs that step 2 did not
+# tokenize. Not fatal: blobExec exits 0 when it skips a blob, and the file is the
+# signal. Counts all rows, from this run and from earlier runs of step 2.
+report_skipped_blobs() {
+    [ -s "$SKIPPED_TSV" ] || return 0
+    local n by_reason
+    n=$(awk -F'\t' 'NR > 1 && NF >= 3 { c++ } END { print c + 0 }' "$SKIPPED_TSV")
+    [ "$n" -gt 0 ] || return 0
+    by_reason=$(awk -F'\t' 'NR > 1 && NF >= 3 { c[$3]++ }
+        END { for (r in c) printf "%s%s=%d", (s++ ? ", " : ""), r, c[r] }' "$SKIPPED_TSV")
+    log "WARNING: $n blobs skipped, see $SKIPPED_TSV ($by_reason)."
+    log "  The dataset has no row for these blobs. They are not in the tokenized"
+    log "  repository, not as raw source and not as empty tokenizations. A timeout"
+    log "  is tried again by the next step-2 run. To require a clean run, use"
+    log "  --strict-tokenize (or CREGIT_STRICT_TOKENIZE=1)."
+}
+
 # need_val <flag> <value...>: refuse a value-taking flag with no value.
 need_val() {
     [ $# -ge 2 ] || { echo "missing value for $1" >&2; usage; exit 2; }
@@ -557,6 +605,7 @@ while [ $# -gt 0 ]; do
         --mask-widened) MASK_WIDENED=1; shift ;;
         --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
+        --strict-tokenize) STRICT_TOKENIZE=1; shift ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
@@ -758,6 +807,11 @@ for _tv in "BLOB_TIMEOUT:$BLOB_TIMEOUT:--blob-timeout" "STALL_TIMEOUT:$STALL_TIM
         0) echo "invalid $_flag: 0 (want a positive whole number of seconds)" >&2; exit 2 ;;
     esac
 done
+
+case "$STRICT_TOKENIZE" in
+    0|1) ;;
+    *) echo "invalid CREGIT_STRICT_TOKENIZE: '$STRICT_TOKENIZE' (want 0 or 1)" >&2; exit 2 ;;
+esac
 
 # The target repository is mandatory (only --build-only runs without one).
 if [ "$BUILD_ONLY" = 0 ]; then
@@ -1015,6 +1069,16 @@ DB_PATH_BLOBMAP="${WORK}/${REPO_NAME}-blobmap.db"
 DB_PATH_PERSONS="${WORK}/${REPO_NAME}-persons.db"
 XLS_PATH_PERSONS="${WORK}/${REPO_NAME}-persons.xls"
 DATASET_PATH="${WORK}/${REPO_NAME}-dataset.parquet"
+# Every blob that the dataset does not contain, one row each: skipped after a
+# tokenizer failure, denylisted, or oversized. Next to the dataset on purpose. The
+# work directory IS the project's output folder (ctp.py: <output_dir>/<name>/), and
+# nothing copies outputs out of it. retain.py prunes only memo/ and html/, and
+# drop_refold_derived_artifacts does not touch this file, so it stays with the
+# parquet. Only a FROM_STEP=1 wipe removes it, and that run writes it again.
+SKIPPED_TSV="${WORK}/tokenize-skipped.tsv"
+# Created by blobExec when a retry recovered a timed-out blob and it folded all of
+# history again. See the end of step 2.
+REFOLD_MARKER="${WORK}/TOKENIZE-REFOLDED"
 
 PYTHON=$(command -v python3 || true)  # only needed by step 10 (dataset)
 
@@ -1238,6 +1302,7 @@ if [ "$MODE" = "sharded" ]; then
     ${BLOB_TIMEOUT:+--blob-timeout "$BLOB_TIMEOUT"} \
     ${STALL_TIMEOUT:+--stall-timeout "$STALL_TIMEOUT"} || TOKENIZE_RC=$?
   tokenize_gate "$TOKENIZE_RC" "sharded tokenize (shard_build.sh)"
+  [ "$STRICT_TOKENIZE" = 1 ] || log "note: --mode sharded is always strict: a tokenizer failure stops it (exit 4 or 6), and it writes no $SKIPPED_TSV."
   # Said out loud rather than left to be discovered. The tokenizer identity is not
   # plumbed through shard_build.sh / shard_merge.py, so the merged blobmap.db a
   # sharded build produces carries no tokenizer_id.* rows. A later non-sharded
@@ -1259,7 +1324,11 @@ else
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
   fi
-  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG \
+  STRICT_FLAG=""
+  [ "$STRICT_TOKENIZE" = 1 ] && STRICT_FLAG="--strict-tokenize"
+  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG $STRICT_FLAG \
+    "--skipped-tsv=$SKIPPED_TSV" \
+    "--refold-marker=$REFOLD_MARKER" \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
     ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
@@ -1295,9 +1364,19 @@ if [ -n "$RETOKENIZE" ]; then
     drop_refold_derived_artifacts "--retokenize $RETOKENIZE"
 fi
 
+report_skipped_blobs
+
 pack_cregit_repo
 fi
 end_step
+
+# Outside the step-2 guard on purpose: if a run stopped after blobExec wrote the
+# marker and before this point, a later resume at step 3 or later must still drop
+# the outputs made from the commits of before the re-fold.
+if [ -e "$REFOLD_MARKER" ]; then
+    drop_refold_derived_artifacts "a timed-out blob recovered on retry"
+    rm -f "$REFOLD_MARKER"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 3 — git log DB (original repo)

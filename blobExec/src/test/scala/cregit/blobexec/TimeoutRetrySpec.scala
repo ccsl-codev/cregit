@@ -68,7 +68,9 @@ class TimeoutRetrySpec extends AnyFunSuite with Matchers with BeforeAndAfterAll 
         pipeline = mode == "pipeline",
         pipelineTrees = mode == "pipeline-trees",
         destinationMayContainObjects = dstExisted,
-        blobTimeoutSeconds = 1
+        blobTimeoutSeconds = 1,
+        // This spec pins the strict behaviour. SkipFailedBlobSpec pins the default.
+        strictTokenize = true
       ).run()
     finally {
       mapping.close()

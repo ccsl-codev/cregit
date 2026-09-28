@@ -114,31 +114,52 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     originalBlobDestinationLookups = 0, originalBlobBytesCopied = 0,
     originalBlobBytesAvoided = 0)
 
+  /** The exit status under --strict-tokenize: the rules of all earlier versions. */
+  private def strictStatus(s: WalkStats): Int = Main.exitStatus(s, strictTokenize = true)
+
+  /** The exit status without it (the default). */
+  private def defaultStatus(s: WalkStats): Int = Main.exitStatus(s, strictTokenize = false)
+
+  // Without --strict-tokenize, a failed blob is dropped and recorded, as a
+  // denylisted blob is, and the walk is complete. Only an abort fails the run.
+  test("default mode: a timeout, a parser crash or both do not change the exit status") {
+    defaultStatus(stats(blobsTimedOut = 1)) shouldEqual 0
+    defaultStatus(stats(blobsParserCrashed = 36)) shouldEqual 0
+    defaultStatus(stats(blobsTimedOut = 2, blobsParserCrashed = 3, blobsDenylisted = 4,
+      blobsOversized = 1)) shouldEqual 0
+  }
+
+  test("default mode: an abort still exits 2") {
+    defaultStatus(stats(aborted = true)) shouldEqual 2
+    defaultStatus(stats(aborted = true, blobsTimedOut = 1)) shouldEqual 2
+  }
+
   test("a clean walk exits 0") {
-    Main.exitStatus(stats()) shouldEqual 0
+    defaultStatus(stats()) shouldEqual 0
+    strictStatus(stats()) shouldEqual 0
   }
 
   test("denylisted blobs do not change the exit status, at any count") {
-    Main.exitStatus(stats(blobsDenylisted = 1)) shouldEqual 0
-    Main.exitStatus(stats(blobsDenylisted = 4)) shouldEqual 0
-    Main.exitStatus(stats(blobsDenylisted = 1000)) shouldEqual 0
+    strictStatus(stats(blobsDenylisted = 1)) shouldEqual 0
+    strictStatus(stats(blobsDenylisted = 4)) shouldEqual 0
+    strictStatus(stats(blobsDenylisted = 1000)) shouldEqual 0
   }
 
   test("oversized blobs do not change it either, unchanged from before") {
-    Main.exitStatus(stats(blobsOversized = 3)) shouldEqual 0
-    Main.exitStatus(stats(blobsOversized = 3, blobsDenylisted = 4)) shouldEqual 0
+    strictStatus(stats(blobsOversized = 3)) shouldEqual 0
+    strictStatus(stats(blobsOversized = 3, blobsDenylisted = 4)) shouldEqual 0
   }
 
   test("a timeout still blocks publication, even alongside a denylisted blob") {
-    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual Main.TimedOutExitStatus
-    Main.exitStatus(stats(blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual
+    strictStatus(stats(blobsTimedOut = 1)) shouldEqual Main.TimedOutExitStatus
+    strictStatus(stats(blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual
       Main.TimedOutExitStatus
   }
 
   test("an abort still wins over everything") {
-    Main.exitStatus(stats(aborted = true)) shouldEqual 2
-    Main.exitStatus(stats(aborted = true, blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual 2
-    Main.exitStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
+    strictStatus(stats(aborted = true)) shouldEqual 2
+    strictStatus(stats(aborted = true, blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual 2
+    strictStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
   }
 
   // A parser crash is a defect nobody has explained — srcML 1.1.0 dying on a
@@ -147,12 +168,12 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   // differ: --blob-timeout does nothing for a segfault.
 
   test("a parser crash blocks publication, with its own status") {
-    Main.exitStatus(stats(blobsParserCrashed = 1)) shouldEqual Main.ParserCrashedExitStatus
-    Main.exitStatus(stats(blobsParserCrashed = 36)) shouldEqual Main.ParserCrashedExitStatus
+    strictStatus(stats(blobsParserCrashed = 1)) shouldEqual Main.ParserCrashedExitStatus
+    strictStatus(stats(blobsParserCrashed = 36)) shouldEqual Main.ParserCrashedExitStatus
   }
 
   test("a parser crash still blocks alongside explained exclusions") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
+    strictStatus(stats(blobsParserCrashed = 1, blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
       Main.ParserCrashedExitStatus
   }
 

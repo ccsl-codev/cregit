@@ -894,7 +894,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       stats.blobsOversized shouldEqual 0L
       stats.blobsTimedOut shouldEqual 0L
       // The whole point. A timeout here would be exit 4 and no publication.
-      Main.exitStatus(stats) shouldEqual 0
+      Main.exitStatus(stats, strictTokenize = true) shouldEqual 0
 
       val seen = Files.readString(invoked).linesIterator.filter(_.nonEmpty).toSet
       seen should contain(blobIdOf(keep).name)   // the ordinary file was tokenized

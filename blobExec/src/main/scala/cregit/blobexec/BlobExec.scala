@@ -93,6 +93,42 @@ object BlobExec {
     found
   }
 
+  /** Why a blob's tokenization is unusable, in the words the skip record uses.
+    *
+    * `reason` is one of [[Failure.Timeout]], [[Failure.ParserCrash]] or
+    * [[Failure.EmptyOutput]]. `detail` is one short line with no tab and no line
+    * break: the budget in seconds, the signal, or the byte counts. The walker
+    * writes both to the skip file, so they must be stable and machine-readable. */
+  final case class Failure(reason: String, detail: String)
+
+  object Failure {
+    val Timeout: String     = "timeout"
+    val ParserCrash: String = "parser-crash"
+    val EmptyOutput: String = "empty-output"
+
+    private val SignalRe = """killed by signal ([0-9]+)""".r.unanchored
+
+    /** The detail of a parser crash. The tokenizer names the signal on stderr
+      * (tokenize/tokenizeSrcMl.pl, Parser_Crash). If it does not, the first
+      * `FAILED:` line is used. If there is no such line, only the exit code is
+      * given. */
+    private[blobexec] def crashDetail(exitCode: Int, stderr: String): String =
+      stderr match {
+        case SignalRe(sig) => s"exit=$exitCode signal=$sig"
+        case _ =>
+          stderr.linesIterator.find(_.contains("FAILED:")) match {
+            case Some(line) =>
+              val why = line.substring(line.indexOf("FAILED:") + "FAILED:".length).trim
+              s"exit=$exitCode ${clean(why).take(200)}"
+            case None => s"exit=$exitCode"
+          }
+      }
+
+    /** Remove the characters that would break one TSV field. */
+    private[blobexec] def clean(s: String): String =
+      s.map(c => if (c == '\t' || c == '\n' || c == '\r') ' ' else c).trim
+  }
+
   sealed trait Outcome
   object Outcome {
     case object Skip                          extends Outcome
@@ -115,7 +151,11 @@ object BlobExec {
       inserter: ObjectInserter,
       timeoutSeconds: Int = DefaultTimeoutSeconds,
       onTimeout: () => Unit = () => (),
-      onParserCrash: () => Unit = () => ()
+      onParserCrash: () => Unit = () => (),
+      // Called once, before the Skip is returned, for each of the three unusable
+      // cases. It gives the reason and a detail line for the skip record. The two
+      // callbacks above stay, because the counters use them.
+      onFailure: Failure => Unit = _ => ()
   ): Outcome = {
     val (exitCode, stdout, stderr) = invoke(bytes, origSha, filename, fullPath, command, timeoutSeconds)
 
@@ -128,9 +168,10 @@ object BlobExec {
       // where tokens belong must not be invisible to the run's statistics.
       System.err.println(
         s"Warning: command [$command] timed out after ${timeoutSeconds}s on blob $origSha " +
-          s"at path [$fullPath]: child killed, blob left untokenized"
+          s"at path [$fullPath]: child killed, and no tokenization is written for this blob"
       )
       onTimeout()
+      onFailure(Failure(Failure.Timeout, s"timeout=${timeoutSeconds}s"))
       Outcome.Skip
     } else if (exitCode == ParserCrashExitCode) {
       // srcML died on a signal (SIGSEGV on 32 of the 36 known corpus files,
@@ -144,8 +185,8 @@ object BlobExec {
       // segfault — and because the operator needs to know which one happened.
       System.err.println(
         s"Warning: command [$command] reported a parser crash (exit $exitCode) on blob $origSha " +
-          s"at path [$fullPath]: srcML died or produced no tokens, so this blob is left " +
-          "untokenized rather than written as an empty tokenization"
+          s"at path [$fullPath]: srcML died or produced no tokens, so no tokenization " +
+          "is written for this blob, and never an empty one"
       )
       if (stderr.nonEmpty) {
         System.err.println(s"--- stderr from $command on $origSha ($fullPath) ---")
@@ -154,6 +195,7 @@ object BlobExec {
         System.err.println("--- end stderr ---")
       }
       onParserCrash()
+      onFailure(Failure(Failure.ParserCrash, Failure.crashDetail(exitCode, stderr)))
       Outcome.Skip
     } else if (exitCode != 0) {
       logError(command, origSha, fullPath, exitCode, stderr)
@@ -173,9 +215,10 @@ object BlobExec {
       System.err.println(
         s"Warning: command [$command] exited 0 but produced no output for the ${bytes.length}-byte " +
           s"blob $origSha at path [$fullPath]. Refusing to write an empty tokenization: counting " +
-          "this as a parser crash and leaving the blob untokenized."
+          "this as a parser crash, and no tokenization is written for this blob."
       )
       onParserCrash()
+      onFailure(Failure(Failure.EmptyOutput, s"exit=0 input=${bytes.length}B output=0B"))
       Outcome.Skip
     } else if (JavaArrays.equals(bytes, stdout)) {
       Outcome.Skip

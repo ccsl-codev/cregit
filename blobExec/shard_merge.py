@@ -152,7 +152,8 @@ def refold(java, jar, src, final_git, final_db, command, mask, tok_cmd, memo,
     env["BFG_TOKENIZE_CMD"] = tok_cmd
     env["BFG_MEMO_DIR"] = memo
     os.makedirs(memo, exist_ok=True)
-    flags = []
+    # Strict, as the shards are: see TIMEOUT_FLAGS in shard_build.sh.
+    flags = ["--strict-tokenize"]
     if blob_timeout:
         flags.append(f"--blob-timeout={blob_timeout}")
     if stall_timeout:

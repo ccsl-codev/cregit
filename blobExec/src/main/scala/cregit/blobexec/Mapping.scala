@@ -99,6 +99,44 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     } finally st.close()
   }
 
+  // -- retry_blob: timed-out blobs that the next run must try again ------------
+
+  private val selRetry = conn.prepareStatement("SELECT orig_blob, path FROM retry_blob ORDER BY orig_blob, path")
+  private val insRetry = conn.prepareStatement("INSERT OR IGNORE INTO retry_blob(orig_blob, path) VALUES (?, ?)")
+  private val delRetry = conn.prepareStatement("DELETE FROM retry_blob WHERE orig_blob = ? AND path = ?")
+
+  /** Record that the tokenizer of this blob was killed on its budget, and that
+    * the blob was dropped from the rewritten trees. A timeout depends on the load
+    * of the machine, so the drop must not be permanent: the next run reads this
+    * table and tries the blob again. See `Walker.retryTimedOutBlobs`. */
+  def putRetry(origBlob: String, path: String): Unit = Mapping.execute(insRetry, origBlob, path)
+
+  def deleteRetry(origBlob: String, path: String): Unit = Mapping.execute(delRetry, origBlob, path)
+
+  def retryBlobs: Vector[(String, String)] = {
+    val rs = selRetry.executeQuery()
+    try {
+      val b = Vector.newBuilder[(String, String)]
+      while (rs.next()) b += ((rs.getString(1), rs.getString(2)))
+      b.result()
+    } finally rs.close()
+  }
+
+  /** Empty commit_map, ref_map and tree_map, and keep blob_map. The next walk
+    * then folds all of the history again from the blob rows. This is necessary
+    * when a blob that the trees omit now has a tokenization: every tree above it
+    * changes, and so does every commit. The same three tables go in
+    * [[applyRetokenize]], for the same reason. */
+  def clearFold(): Unit = inTx {
+    val st = conn.createStatement()
+    try {
+      st.executeUpdate("DELETE FROM commit_map")
+      st.executeUpdate("DELETE FROM ref_map")
+      st.executeUpdate("DELETE FROM tree_map")
+    } finally st.close()
+    ()
+  }
+
   def getMeta(key: String): Option[String] =
     Mapping.selectString(selMeta, key)
 
@@ -414,7 +452,7 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
 
   override def close(): Unit = {
     (List(selBlob, insBlob, selCommit, insCommit, selTree, insTree,
-          selRef, insRef, delRef, selMeta, insMeta) ++ warmSelBlob.toList ++ warmSelTree.toList)
+          selRef, insRef, delRef, selMeta, insMeta, selRetry, insRetry, delRetry) ++ warmSelBlob.toList ++ warmSelTree.toList)
       .foreach(s => try s.close() catch { case _: Throwable => () })
     conn.close()
     warm.foreach(w => try w.close() catch { case _: Throwable => () })
@@ -583,6 +621,16 @@ object Mapping {
     """CREATE TABLE IF NOT EXISTS meta (
       |  key   TEXT PRIMARY KEY,
       |  value TEXT NOT NULL
+      |)""".stripMargin,
+    // Timed-out blobs that were dropped and that the next run must try again.
+    // Crashes are not here: a crash is deterministic for a given tokenizer, and
+    // a changed tokenizer is refused or re-tokenized through the tokenizer
+    // identity, which empties tree_map and so reaches the blob again.
+    """CREATE TABLE IF NOT EXISTS retry_blob (
+      |  orig_blob    TEXT    NOT NULL,
+      |  path         TEXT    NOT NULL,
+      |  processed_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
+      |  PRIMARY KEY (orig_blob, path)
       |)""".stripMargin
   )
 

@@ -3,6 +3,11 @@
 # (4 = a blob timed out, 5 = the stall watchdog fired), for both the serial and
 # the sharded branch, plus the marker clearing and the timeout passthrough.
 #
+# Since the default changed, blobExec exits 4 or 6 only with --strict-tokenize
+# (and always in --mode sharded). By default it skips a failed blob, records it in
+# <work>/tokenize-skipped.tsv and exits 0; cases 10-14 pin that path. The strict
+# cases below pass --strict-tokenize so that they show a real combination.
+#
 # Why these matter:
 #   - the marker is what stops a later FROM_STEP=1 run from deleting the work, so
 #     a branch that does not write it silently loses days of tokenizing. Until
@@ -53,6 +58,20 @@ for a in "$@"; do
     esac
 done
 if [ "$STUB_RC" = 0 ] && [ "${#pos[@]}" -ge 2 ]; then mkdir -p "${pos[1]}"; fi
+# What blobExec writes by default: rows in --skipped-tsv, and (STUB_REFOLD=1) the
+# --refold-marker file when a retry recovered a blob.
+for a in "$@"; do
+    case "$a" in
+        --skipped-tsv=*)
+            if [ -n "${STUB_TSV_ROWS:-}" ]; then
+                f=${a#--skipped-tsv=}
+                [ -s "$f" ] || printf 'sha\tpath\treason\tdetail\ttokenizer\n' > "$f"
+                printf '%b' "$STUB_TSV_ROWS" >> "$f"
+            fi ;;
+        --refold-marker=*)
+            [ "${STUB_REFOLD:-0}" = 1 ] && : > "${a#--refold-marker=}" ;;
+    esac
+done
 exit "$STUB_RC"
 STUB
     chmod +x "$1/java"
@@ -82,9 +101,9 @@ make_stub_java "$BIN"
 trap 'rm -rf "$BIN"' EXIT
 
 # ---------------------------------------------------------------------------
-echo "case 1: serial branch, blobExec exits 4 — marker written, work kept"
+echo "case 1: serial branch, --strict-tokenize, blobExec exits 4 — marker written, work kept"
 W=$(fixture)
-OUT=$(STUB_RC=4 run_step2 "$W"); RC=$?
+OUT=$(STUB_RC=4 run_step2 "$W" --strict-tokenize); RC=$?
 [ "$RC" -ne 0 ]; check "step 2 refuses to continue (exit $RC)" $?
 [ -f "$W/TOKENIZE-TIMEOUTS" ]; check "TOKENIZE-TIMEOUTS written" $?
 [ -f "$W/proj-blobmap.db" ]; check "the work is still there" $?
@@ -133,13 +152,13 @@ for rc in 4 5; do
     rm -rf "$O" "$S"
 done
 
-echo "case 5bis: serial branch, blobExec exits 6 - parser-crash marker written"
+echo "case 5bis: serial branch, --strict-tokenize, blobExec exits 6 - parser-crash marker written"
 # The silent-empty defect: srcML dies on a signal, the wrapper used to report
 # success with zero bytes, and a 0-byte tokenization was published. Exit 6 is that
 # failure made visible, and it must keep the work rather than wipe it: the fix is a
 # denylist entry or a fixed srcML, not a re-run, so the memo has to survive.
 W=$(fixture)
-OUT=$(STUB_RC=6 run_step2 "$W"); RC=$?
+OUT=$(STUB_RC=6 run_step2 "$W" --strict-tokenize); RC=$?
 [ "$RC" -ne 0 ]; check "step 2 refuses to continue (exit $RC)" $?
 [ -f "$W/TOKENIZE-PARSER-CRASHES" ]; check "TOKENIZE-PARSER-CRASHES written" $?
 [ -f "$W/proj-blobmap.db" ]; check "the work is still there" $?
@@ -227,6 +246,69 @@ OUT=$(STUB_RC=0 run_step2 "$W" --blob-timeout 0); RC=$?
 grep -q "invalid --blob-timeout" <<<"$OUT"; check "says which flag was wrong" $?
 OUT=$(STUB_RC=0 run_step2 "$W" --stall-timeout abc); RC=$?
 [ "$RC" -ne 0 ]; check "--stall-timeout abc is rejected (exit $RC)" $?
+rm -rf "$W"
+
+# ---------------------------------------------------------------------------
+# The default: a failed blob is skipped, recorded, and step 2 continues.
+ROWS='1111111111111111111111111111111111111111\tsrc/crash.c\tparser-crash\texit=33 signal=11\tc=abcdef01\n'
+ROWS+='2222222222222222222222222222222222222222\tsrc/slow.c\ttimeout\ttimeout=600s\tc=abcdef01\n'
+ROWS+='3333333333333333333333333333333333333333\tsrc/deny.java\tdenylisted\treason=hang; citation=srcML/srcML#2361\tjava=abcdef02\n'
+
+echo "case 10: default serial branch - skipped blobs are recorded, and step 2 continues"
+W=$(fixture)
+export STUB_ARGV="$W/java-argv"
+OUT=$(STUB_RC=0 STUB_TSV_ROWS="$ROWS" run_step2 "$W")
+grep -q -- "--skipped-tsv=$W/tokenize-skipped.tsv" "$STUB_ARGV"; check "the skip file path reaches blobExec" $?
+grep -q -- "--refold-marker=$W/TOKENIZE-REFOLDED" "$STUB_ARGV"; check "so does the re-fold marker path" $?
+! grep -q -- "--strict-tokenize" "$STUB_ARGV"; check "strict mode is off by default" $?
+[ -d "$W/proj-cregit.git" ]; check "step 2 finished and produced its output" $?
+grep -q "WARNING: 3 blobs skipped, see $W/tokenize-skipped.tsv" <<<"$OUT"; check "the warning names the count and the file" $?
+grep -q "parser-crash=1" <<<"$OUT" && grep -q "timeout=1" <<<"$OUT" && grep -q "denylisted=1" <<<"$OUT"
+check "the warning gives the count for each reason" $?
+grep -q "step 3\|Step 3\|\[3/" <<<"$OUT"; check "the run went on to step 3" $?
+[ ! -e "$W/TOKENIZE-TIMEOUTS" ] && [ ! -e "$W/TOKENIZE-PARSER-CRASHES" ]; check "no failure marker is written" $?
+head -n 1 "$W/tokenize-skipped.tsv" | grep -qx "$(printf 'sha\tpath\treason\tdetail\ttokenizer')"; check "the file has the header" $?
+unset STUB_ARGV
+rm -rf "$W"
+
+echo "case 11: default serial branch, no skipped blobs - no warning"
+W=$(fixture)
+OUT=$(STUB_RC=0 run_step2 "$W")
+! grep -q "blobs skipped" <<<"$OUT"; check "no warning when nothing was skipped" $?
+rm -rf "$W"
+
+echo "case 12: --strict-tokenize and CREGIT_STRICT_TOKENIZE=1 reach blobExec"
+W=$(fixture)
+export STUB_ARGV="$W/java-argv"
+OUT=$(STUB_RC=0 run_step2 "$W" --strict-tokenize)
+grep -q -- "--strict-tokenize" "$STUB_ARGV"; check "the flag is passed through" $?
+rm -f "$STUB_ARGV"
+OUT=$(STUB_RC=0 CREGIT_STRICT_TOKENIZE=1 run_step2 "$W")
+grep -q -- "--strict-tokenize" "$STUB_ARGV"; check "CREGIT_STRICT_TOKENIZE=1 is honoured" $?
+OUT=$(STUB_RC=0 CREGIT_STRICT_TOKENIZE=yes run_step2 "$W"); RC=$?
+[ "$RC" -ne 0 ] && grep -q "invalid CREGIT_STRICT_TOKENIZE" <<<"$OUT"; check "a bad CREGIT_STRICT_TOKENIZE is refused" $?
+unset STUB_ARGV
+rm -rf "$W"
+
+echo "case 13: a re-fold after a recovered retry drops the outputs of the old commits"
+W=$(fixture)
+mkdir -p "$W/blame/old"; echo old > "$W/blame/old/x.blame"
+echo old > "$W/proj-dataset.parquet"
+printf 'sha\tpath\treason\tdetail\ttokenizer\n' > "$W/tokenize-skipped.tsv"
+OUT=$(STUB_RC=0 STUB_REFOLD=1 run_step2 "$W")
+[ ! -e "$W/blame/old/x.blame" ]; check "the old blame output is removed" $?
+[ ! -e "$W/proj-dataset.parquet" ]; check "the old dataset is removed" $?
+[ ! -e "$W/TOKENIZE-REFOLDED" ]; check "the marker is removed after the drop" $?
+[ -f "$W/tokenize-skipped.tsv" ]; check "the skip file is kept" $?
+[ -f "$W/proj-blobmap.db" ]; check "the blob map is kept" $?
+rm -rf "$W"
+
+echo "case 14: sharded mode is always strict"
+W=$(fixture)
+export STUB_ARGV="$W/java-argv"
+OUT=$(STUB_RC=4 run_step2 "$W" --mode sharded --shards 2)
+grep -q -- "--shard=0/2 --strict-tokenize" "$STUB_ARGV"; check "every shard gets --strict-tokenize" $?
+unset STUB_ARGV
 rm -rf "$W"
 
 # ---------------------------------------------------------------------------
