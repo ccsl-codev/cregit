@@ -97,17 +97,20 @@ def write_history(con, target, mode, chunks):
     con.execute("CREATE OR REPLACE TABLE origins (file_path VARCHAR, "
                 "token_id BIGINT, origin_path VARCHAR, origin_token_id BIGINT, "
                 "origin_born_sha VARCHAR)")
+    # A token has one born_sha on all its rows, so the DISTINCT runs on the
+    # join output (a few rows per link), not on the tokens of the chunk.
     for k in range(chunks):
         con.execute(f"""
             INSERT INTO origins
-            SELECT l.file_path, l.token_id, l.origin_path, l.origin_token_id,
-                   o.born_sha
+            SELECT DISTINCT l.file_path, l.token_id, l.origin_path,
+                   l.origin_token_id, o.born_sha
             FROM (SELECT * FROM links
                   WHERE {in_chunk('origin_path', k, chunks)}) l
-            JOIN (SELECT DISTINCT file_path, token_id, born_sha FROM tokens
+            JOIN (SELECT file_path, token_id, born_sha FROM tokens
                   WHERE {in_chunk('file_path', k, chunks)}) o
               ON o.file_path = l.origin_path
              AND o.token_id = l.origin_token_id""")
+        log(f"build: origins chunk {k + 1}/{chunks}")
     parts = os.path.join(os.path.dirname(target),
                          f".{os.path.basename(target)}.parts")
     shutil.rmtree(parts, ignore_errors=True)
@@ -129,6 +132,7 @@ def write_history(con, target, mode, chunks):
                   USING (file_path, token_id)
             ) TO '{os.path.join(parts, f"{k:03d}.parquet")}'
               (FORMAT parquet, COMPRESSION zstd)""")
+        log(f"build: write chunk {k + 1}/{chunks}")
     con.execute(f"COPY (SELECT * FROM read_parquet('{parts}/*.parquet')) "
                 f"TO '{target}' (FORMAT parquet, COMPRESSION zstd)")
     shutil.rmtree(parts)
