@@ -111,7 +111,7 @@ def in_process_checks(args, marker, expected_first):
     fake_srcml.write_text(
         "#!/usr/bin/env bash\n"
         'src="${@: -3:1}"\n'
-        f'grep -q SLEEP_MARKER "$src" && exec -a {marker} sleep 100\n'
+        f'grep -q SLEEP_MARKER "$src" && exec perl -e "sleep 100" {marker}\n'
         'grep -q ABORT_MARKER "$src" && kill -ABRT $$\n'
         f'exec {real_srcml} "$@"\n',
         encoding="utf-8",
@@ -213,7 +213,7 @@ def main():
     marker = f"cregit-token-worker-timeout-{os.getpid()}"
     timeout_script.write_text(
         "#!/usr/bin/env bash\n"
-        f"exec -a {marker} sleep 100\n",
+        f"exec perl -e 'sleep 100' {marker}\n",
         encoding="utf-8",
     )
     timeout_script.chmod(0o755)
