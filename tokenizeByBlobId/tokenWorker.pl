@@ -31,7 +31,6 @@ die "Tokenize command not defined. Use BFG_TOKENIZE_CMD\n"
     if not defined($tokenizeCmd) or $tokenizeCmd eq "";
 
 my @tokenizeCommand = grep { length($_) } split /\s+/, $tokenizeCmd;
-my %mapLang = %CregitLanguages::EXT_LANG;
 my $buildDir = "$RealBin/build";
 make_path($buildDir) if not -d $buildDir;
 
@@ -133,9 +132,12 @@ sub protocol_error {
 sub process_request {
     my ($origSha, $filename, $fullPath, $contents, $timeoutSecs) = @_;
 
-    my $fileExt;
-    $fileExt = lc($1) if $filename =~ /\.([^.]+)\z/;
-    if (not defined($fileExt) or not defined($mapLang{$fileExt})) {
+    my ($fileExt, $language);
+    if ($filename =~ /\.([^.]+)\z/) {
+        $fileExt = lc($1);
+        $language = CregitLanguages::language_for_ext($1);
+    }
+    if (not defined($language)) {
         my $shownExt = defined($fileExt) ? $fileExt : "";
         return (255, "", "unknown file extension [$shownExt]\n");
     }
@@ -165,7 +167,6 @@ sub process_request {
     print {$input} $contents;
     close($input) or die "unable to close temp input [$inputFile]: $!\n";
 
-    my $language = $mapLang{$fileExt};
     my ($exitCode, $output, $error);
     if ($inProcess and srcml_language($language)) {
         ($exitCode, $output, $error) = $inProcess->tokenize(
