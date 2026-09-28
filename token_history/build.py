@@ -4,11 +4,16 @@
 The move mode is chosen here, not in the replay, so a run can switch between
 off, renames and moves without replaying the history again.
 
-Usage: build.py --out DIR [--mode moves] [--min-alnum 100]
+Usage: build.py --out DIR [--mode moves] [--min-alnum 100] [--reuse]
+
+--reuse keeps the tokens and runs tables of DIR/build.duckdb and a finished
+links-<mode>.tsv, so a build that failed after the link pass restarts at the
+chain resolution.
 """
 import argparse
 import glob
 import os
+import shutil
 import sys
 import time
 
@@ -78,6 +83,58 @@ def resolve_origins(con):
             return rounds
 
 
+def in_chunk(column, k, chunks):
+    return f"hash({column}) % {chunks} = {k}"
+
+
+def write_history(con, target, mode, chunks):
+    """Tokens with their resolved origin, written in chunks of paths.
+
+    On a whole kernel, one join of every token with every link does not fit
+    in memory. Each chunk joins only the paths whose hash falls in it; the
+    parts are then copied into one parquet (no row order is kept).
+    """
+    con.execute("CREATE OR REPLACE TABLE origins (file_path VARCHAR, "
+                "token_id BIGINT, origin_path VARCHAR, origin_token_id BIGINT, "
+                "origin_born_sha VARCHAR)")
+    for k in range(chunks):
+        con.execute(f"""
+            INSERT INTO origins
+            SELECT l.file_path, l.token_id, l.origin_path, l.origin_token_id,
+                   o.born_sha
+            FROM (SELECT * FROM links
+                  WHERE {in_chunk('origin_path', k, chunks)}) l
+            JOIN (SELECT DISTINCT file_path, token_id, born_sha FROM tokens
+                  WHERE {in_chunk('file_path', k, chunks)}) o
+              ON o.file_path = l.origin_path
+             AND o.token_id = l.origin_token_id""")
+    parts = os.path.join(os.path.dirname(target),
+                         f".{os.path.basename(target)}.parts")
+    shutil.rmtree(parts, ignore_errors=True)
+    os.makedirs(parts)
+    for k in range(chunks):
+        con.execute(f"""
+            COPY (
+                SELECT t.*,
+                       coalesce(o.origin_path, t.file_path) AS origin_path,
+                       coalesce(o.origin_token_id, t.token_id)
+                         AS origin_token_id,
+                       coalesce(o.origin_born_sha, t.born_sha)
+                         AS origin_born_sha,
+                       '{mode}' AS move_mode
+                FROM (SELECT * FROM tokens
+                      WHERE {in_chunk('file_path', k, chunks)}) t
+                LEFT JOIN (SELECT * FROM origins
+                           WHERE {in_chunk('file_path', k, chunks)}) o
+                  USING (file_path, token_id)
+            ) TO '{os.path.join(parts, f"{k:03d}.parquet")}'
+              (FORMAT parquet, COMPRESSION zstd)""")
+    con.execute(f"COPY (SELECT * FROM read_parquet('{parts}/*.parquet')) "
+                f"TO '{target}' (FORMAT parquet, COMPRESSION zstd)")
+    shutil.rmtree(parts)
+    con.execute("DROP TABLE origins")
+
+
 def commit_runs(con):
     """Yield (sha, runs, texts) for commits that have both kinds of run."""
     cur = con.execute("""
@@ -117,6 +174,34 @@ def commit_runs(con):
         yield sha, runs, texts
 
 
+def load(con, out):
+    read_tsv(con, "tokens", os.path.join(out, "part-*.tsv"), COLUMNS,
+             key=["file_path", "token_id", "mainline_in_sha"])
+    if glob.glob(os.path.join(out, "runs-*.tsv")):
+        read_tsv(con, "runs", os.path.join(out, "runs-*.tsv"), RUN_COLUMNS)
+    else:
+        con.execute("CREATE TABLE runs (sha VARCHAR, kind VARCHAR, "
+                    "whole_file INTEGER, file_path VARCHAR, token_ids VARCHAR)")
+
+
+def write_links(con, links_file, mode, min_alnum):
+    """The link pass, to a .part file that is renamed only at the end."""
+    linked = commits = 0
+    with open(links_file + ".part", "w", encoding="utf-8") as f:
+        f.write(f"{SEP}{SEP}{SEP}\n")
+        if mode != "off":
+            for sha, runs, texts in commit_runs(con):
+                for (p, t), (op, ot) in link(runs, texts.__getitem__, mode,
+                                             min_alnum).items():
+                    f.write(f"{p}{SEP}{t}{SEP}{op}{SEP}{ot}\n")
+                    linked += 1
+                commits += 1
+                if commits % 20_000 == 0:
+                    log(f"build: {commits:,} commits, {linked:,} links")
+    os.replace(links_file + ".part", links_file)
+    log(f"build: mode {mode}, {linked:,} tokens linked in {commits:,} commits")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--out", required=True)
@@ -124,6 +209,10 @@ def main():
     ap.add_argument("--min-alnum", type=int, default=100)
     ap.add_argument("--memory", default="6GB")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--chunks", type=int, default=16,
+                    help="path chunks for the final write")
+    ap.add_argument("--reuse", action="store_true",
+                    help="keep the loaded tables and a finished links file")
     args = ap.parse_args()
     t0 = time.time()
     con = duckdb.connect(os.path.join(args.out, "build.duckdb"))
@@ -131,16 +220,13 @@ def main():
     con.execute(f"SET temp_directory='{os.path.join(args.out, 'tmp')}'")
     con.execute(f"SET threads={args.threads}")
     con.execute("SET preserve_insertion_order=false")
-    for name in ("tokens", "runs", "links"):
+    tables = {n for n, in con.execute("SELECT table_name FROM "
+                                      "duckdb_tables()").fetchall()}
+    reuse = args.reuse and {"tokens", "runs"} <= tables
+    for name in ("links",) if reuse else ("tokens", "runs", "links"):
         con.execute(f"DROP TABLE IF EXISTS {name}")
-    read_tsv(con, "tokens", os.path.join(args.out, "part-*.tsv"), COLUMNS,
-             key=["file_path", "token_id", "mainline_in_sha"])
-    if glob.glob(os.path.join(args.out, "runs-*.tsv")):
-        read_tsv(con, "runs", os.path.join(args.out, "runs-*.tsv"),
-                 RUN_COLUMNS)
-    else:
-        con.execute("CREATE TABLE runs (sha VARCHAR, kind VARCHAR, "
-                    "whole_file INTEGER, file_path VARCHAR, token_ids VARCHAR)")
+    if not reuse:
+        load(con, args.out)
     log(f"build: {con.execute('SELECT count(*) FROM tokens').fetchone()[0]:,}"
         f" token rows, {con.execute('SELECT count(*) FROM runs').fetchone()[0]:,}"
         " runs")
@@ -148,41 +234,17 @@ def main():
     # Links go to disk commit by commit: on a whole kernel they do not fit
     # in memory. A born token has one birth commit, so it has one link.
     links_file = os.path.join(args.out, f"links-{args.mode}.tsv")
-    linked = commits = 0
-    with open(links_file, "w", encoding="utf-8") as f:
-        f.write(f"{SEP}{SEP}{SEP}\n")
-        if args.mode != "off":
-            for sha, runs, texts in commit_runs(con):
-                for (p, t), (op, ot) in link(runs, texts.__getitem__,
-                                             args.mode,
-                                             args.min_alnum).items():
-                    f.write(f"{p}{SEP}{t}{SEP}{op}{SEP}{ot}\n")
-                    linked += 1
-                commits += 1
-                if commits % 20_000 == 0:
-                    log(f"build: {commits:,} commits, {linked:,} links")
-    log(f"build: mode {args.mode}, {linked:,} tokens linked in "
-        f"{commits:,} commits")
+    if args.reuse and os.path.exists(links_file):
+        log(f"build: reuse {links_file}")
+    else:
+        write_links(con, links_file, args.mode, args.min_alnum)
     read_tsv(con, "links", links_file,
              ["file_path", "token_id", "origin_path", "origin_token_id"])
     con.execute("DELETE FROM links WHERE file_path IS NULL")
     log(f"build: move chains resolved in {resolve_origins(con)} rounds")
 
     target = os.path.join(args.out, f"history-{args.mode}.parquet")
-    con.execute(f"""
-        COPY (
-            SELECT t.*,
-                   coalesce(l.origin_path, t.file_path) AS origin_path,
-                   coalesce(l.origin_token_id, t.token_id) AS origin_token_id,
-                   coalesce(o.born_sha, t.born_sha) AS origin_born_sha,
-                   '{args.mode}' AS move_mode
-            FROM tokens t
-            LEFT JOIN links l USING (file_path, token_id)
-            LEFT JOIN (SELECT DISTINCT file_path, token_id, born_sha
-                       FROM tokens) o
-              ON o.file_path = l.origin_path AND o.token_id = l.origin_token_id
-            ORDER BY t.file_path, t.token_id, t.mainline_in_ts
-        ) TO '{target}' (FORMAT parquet, COMPRESSION zstd)""")
+    write_history(con, target, args.mode, args.chunks)
     log(f"build: wrote {target} in {time.time() - t0:.0f} s")
 
 
