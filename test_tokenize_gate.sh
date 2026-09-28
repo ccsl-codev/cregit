@@ -312,6 +312,102 @@ unset STUB_ARGV
 rm -rf "$W"
 
 # ---------------------------------------------------------------------------
+# Earlier timeouts are retried by themselves only while no blame output exists.
+TIMEOUT_TSV=$(printf 'sha\tpath\treason\tdetail\ttokenizer\n2222222222222222222222222222222222222222\tsrc/slow.c\ttimeout\ttimeout=600s retry=1800s\tc=abcdef01\n')
+
+echo "case 15: no blame output - the retry pass runs"
+W=$(fixture)
+printf '%s\n' "$TIMEOUT_TSV" > "$W/tokenize-skipped.tsv"
+export STUB_ARGV="$W/java-argv"
+OUT=$(STUB_RC=0 run_step2 "$W")
+! grep -q -- "--no-retry-timed-out" "$STUB_ARGV"; check "blobExec is not told to hold the retries" $?
+! grep -q "stay dropped" <<<"$OUT"; check "no held-retry warning" $?
+unset STUB_ARGV
+rm -rf "$W"
+
+echo "case 16: blame output exists, no --retry-skipped - held, warned, blame untouched"
+W=$(fixture)
+printf '%s\n' "$TIMEOUT_TSV" > "$W/tokenize-skipped.tsv"
+mkdir -p "$W/blame/src"; echo kept > "$W/blame/src/a.c.blame"; echo kept > "$W/blame/src/b.c.blame"
+mkdir -p "$W/blame-c100-incoming/gcj"; echo kept > "$W/blame-c100-incoming/gcj/a.c.blame"
+export STUB_ARGV="$W/java-argv"
+OUT=$(STUB_RC=0 run_step2 "$W")
+grep -q -- "--no-retry-timed-out" "$STUB_ARGV"; check "blobExec is told to hold the retries" $?
+grep -q "WARNING: 1 timed-out blobs stay dropped (see $W/tokenize-skipped.tsv); --retry-skipped retries them and re-blames the project (3 .blame files would be deleted)" <<<"$OUT"
+check "the warning gives the count, the file, the flag and the blame estimate" $?
+[ -f "$W/blame/src/a.c.blame" ] && [ -f "$W/blame/src/b.c.blame" ] && [ -f "$W/blame-c100-incoming/gcj/a.c.blame" ]
+check "the blame output is untouched, the incoming re-blame too" $?
+unset STUB_ARGV
+rm -rf "$W"
+
+echo "case 17: blame output exists, --retry-skipped - retried, re-folded, blame dropped"
+for how in flag env; do
+    W=$(fixture)
+    printf '%s\n' "$TIMEOUT_TSV" > "$W/tokenize-skipped.tsv"
+    mkdir -p "$W/blame/src"; echo old > "$W/blame/src/a.c.blame"
+    mkdir -p "$W/blame-c100-incoming/gcj"; echo old > "$W/blame-c100-incoming/gcj/a.c.blame"
+    export STUB_ARGV="$W/java-argv"
+    if [ "$how" = flag ]; then
+        OUT=$(STUB_RC=0 STUB_REFOLD=1 run_step2 "$W" --retry-skipped)
+    else
+        OUT=$(STUB_RC=0 STUB_REFOLD=1 CREGIT_RETRY_SKIPPED=1 run_step2 "$W")
+    fi
+    ! grep -q -- "--no-retry-timed-out" "$STUB_ARGV"; check "($how) blobExec may retry" $?
+    [ ! -e "$W/blame/src/a.c.blame" ]; check "($how) the re-fold drops the old blame" $?
+    [ ! -e "$W/blame-c100-incoming" ]; check "($how) the re-fold drops blame-c100-incoming too" $?
+    ! grep -q "stay dropped" <<<"$OUT"; check "($how) no held-retry warning" $?
+    unset STUB_ARGV
+    rm -rf "$W"
+done
+
+echo "case 18: a .blame file in blame-c100-incoming counts as blame output"
+W=$(fixture)
+mkdir -p "$W/blame-c100-incoming/gcj/src"; echo x > "$W/blame-c100-incoming/gcj/src/a.c.blame"
+export STUB_ARGV="$W/java-argv"
+OUT=$(STUB_RC=0 run_step2 "$W")
+grep -q -- "--no-retry-timed-out" "$STUB_ARGV"; check "held because of the incoming blame" $?
+unset STUB_ARGV
+rm -rf "$W"
+
+echo "case 19: --max-retries, --timeout-retry-factor and CREGIT_LOAD_LIMIT reach blobExec"
+W=$(fixture)
+export STUB_ARGV="$W/java-argv"
+OUT=$(STUB_RC=0 CREGIT_LOAD_LIMIT=8 run_step2 "$W" --timeout-retry-factor 0)
+grep -q -- "--timeout-retry-factor=0" "$STUB_ARGV"; check "the factor is passed through (0 disables the retry)" $?
+grep -q -- "--load-limit=8" "$STUB_ARGV"; check "the load limit is passed through" $?
+rm -f "$STUB_ARGV"
+OUT=$(STUB_RC=0 CREGIT_TIMEOUT_RETRY_FACTOR=5 run_step2 "$W")
+grep -q -- "--timeout-retry-factor=5" "$STUB_ARGV"; check "CREGIT_TIMEOUT_RETRY_FACTOR is honoured" $?
+rm -f "$STUB_ARGV"
+OUT=$(STUB_RC=0 run_step2 "$W" --max-retries 0)
+grep -q -- "--max-retries=0" "$STUB_ARGV"; check "--max-retries is passed through" $?
+rm -f "$STUB_ARGV"
+OUT=$(STUB_RC=0 run_step2 "$W" --max-retries 3)
+grep -q -- "--max-retries=3" "$STUB_ARGV"; check "an explicit --max-retries 3 is passed through" $?
+rm -f "$STUB_ARGV"
+OUT=$(STUB_RC=0 CREGIT_MAX_RETRIES=3 run_step2 "$W")
+grep -q -- "--max-retries=3" "$STUB_ARGV"; check "CREGIT_MAX_RETRIES=3 is passed through" $?
+rm -f "$STUB_ARGV"
+OUT=$(STUB_RC=0 CREGIT_MAX_RETRIES=5 run_step2 "$W")
+grep -q -- "--max-retries=5" "$STUB_ARGV"; check "CREGIT_MAX_RETRIES is honoured" $?
+rm -f "$STUB_ARGV"
+OUT=$(STUB_RC=0 run_step2 "$W")
+! grep -q -- "--max-retries=\|--load-limit=" "$STUB_ARGV"; check "without them, blobExec keeps its own defaults" $?
+grep -q "blobExec default: 0" "$RUNNER"; check "the help text names the default of 0 retries" $?
+OUT=$(STUB_RC=0 run_step2 "$W" --max-retries three); RC=$?
+[ "$RC" -ne 0 ] && grep -q "invalid --max-retries" <<<"$OUT"; check "a bad --max-retries is refused" $?
+OUT=$(STUB_RC=0 CREGIT_MAX_RETRIES=500 run_step2 "$W"); RC=$?
+[ "$RC" -ne 0 ] && grep -q "invalid --max-retries" <<<"$OUT"; check "too many retries are refused" $?
+OUT=$(STUB_RC=0 CREGIT_LOAD_LIMIT=lots run_step2 "$W"); RC=$?
+[ "$RC" -ne 0 ] && grep -q "invalid CREGIT_LOAD_LIMIT" <<<"$OUT"; check "a bad CREGIT_LOAD_LIMIT is refused" $?
+OUT=$(STUB_RC=0 run_step2 "$W" --timeout-retry-factor x); RC=$?
+[ "$RC" -ne 0 ] && grep -q "invalid --timeout-retry-factor" <<<"$OUT"; check "a bad factor is refused" $?
+OUT=$(STUB_RC=0 CREGIT_RETRY_SKIPPED=maybe run_step2 "$W"); RC=$?
+[ "$RC" -ne 0 ] && grep -q "invalid CREGIT_RETRY_SKIPPED" <<<"$OUT"; check "a bad CREGIT_RETRY_SKIPPED is refused" $?
+unset STUB_ARGV
+rm -rf "$W"
+
+# ---------------------------------------------------------------------------
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

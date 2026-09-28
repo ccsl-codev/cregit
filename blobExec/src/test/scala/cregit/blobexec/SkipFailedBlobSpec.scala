@@ -47,6 +47,12 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
         |exit 33""".stripMargin
     case "empty"   => "cat > /dev/null\nexit 0"
     case "timeout" => "sleep 300 & sleep 300"
+    // "timeout-N": hangs on the first N calls, then tokenizes. The load that made
+    // it slow is gone by call N+1.
+    case k if k.startsWith("timeout-") =>
+      val n = k.stripPrefix("timeout-").toInt
+      s"""c=$$(cat "$$0.count" 2>/dev/null || echo 0); c=$$((c + 1)); echo $$c > "$$0.count"
+         |if [ $$c -gt $n ]; then tr a-z A-Z; else sleep 300 & sleep 300; fi""".stripMargin
   }
 
   private final case class Fixture(
@@ -111,7 +117,10 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
       fx: Fixture,
       mode: String,
       strict: Boolean = false,
-      denylist: BlobDenylist = BlobDenylist.empty
+      denylist: BlobDenylist = BlobDenylist.empty,
+      maxRetries: Int = 0,
+      retryFactor: Int = 2,
+      retryPass: Boolean = true
   ): WalkStats = {
     val dstExisted = Files.isDirectory(fx.dstPath)
     val dst = FileRepositoryBuilder.create(fx.dstPath.toFile).asInstanceOf[FileRepository]
@@ -130,7 +139,10 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
         denylist = denylist,
         strictTokenize = strict,
         skipLog = log,
-        tokenizerIdentity = TokenizerIdentity(Map("c" -> "0123456789abcdef"))
+        tokenizerIdentity = TokenizerIdentity(Map("c" -> "0123456789abcdef")),
+        maxRetries = maxRetries,
+        timeoutRetryFactor = retryFactor,
+        retryTimedOutPass = retryPass
       ).run()
     finally {
       log.close()
@@ -314,6 +326,205 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
     BlobExec.Failure.crashDetail(33, "cregit: tokenization of [x.c] FAILED: srcml exited 2.\n") shouldEqual
       "exit=33 srcml exited 2."
     BlobExec.Failure.crashDetail(33, "") shouldEqual "exit=33"
+  }
+
+  // -- retries in the same run ---------------------------------------------------
+  //
+  // --blob-timeout is 1s here and the factor is 2, so each retry has 2s.
+
+  for (mode <- Modes; (hangs, retry) <- Seq((1, 1), (3, 3))) {
+    test(s"[$mode] a timeout recovered on retry $retry of 3 is not dropped and not recorded") {
+      val fx = fixture(s"timeout-$hangs")
+      val stats = run(fx, mode, maxRetries = 3)
+      stats.blobsTimeoutRetriedInRun shouldEqual retry.toLong   // retry attempts
+      stats.blobsTimeoutRecoveredInRun shouldEqual 1L            // blobs recovered
+      stats.blobsTimedOut shouldEqual 0L
+      stats.blobsSkipped shouldEqual 0L
+      stats.commitsProcessed shouldEqual 2
+      fx.callsForB shouldEqual 1 + retry                         // it stopped at the success
+      dstContent(fx, fx.firstCommit, "deep/b.c") shouldEqual Some("BETA\n")
+      dstContent(fx, fx.secondCommit, "deep/b.c") shouldEqual Some("BETA\n")
+      withMapping(fx)(_.retryBlobs) shouldBe empty
+      Files.exists(fx.tsv) shouldBe false   // nothing to record
+      // A recovered blob does not make the strict exit status 4.
+      Main.exitStatus(stats, strictTokenize = true) shouldEqual 0
+    }
+  }
+
+  for (mode <- Modes)
+  test(s"[$mode] a timeout on all 4 attempts is dropped, and the record lists the attempts") {
+    val fx = fixture("timeout-4")
+    val stats = run(fx, mode, maxRetries = 3)
+    stats.blobsTimeoutRetriedInRun shouldEqual 3L
+    stats.blobsTimeoutRecoveredInRun shouldEqual 0L
+    stats.blobsTimedOut shouldEqual 1L
+    fx.callsForB shouldEqual 4
+    withMapping(fx)(_.retryBlobs) shouldEqual Vector((fx.bSha, "deep/b.c"))
+    dstContent(fx, fx.firstCommit, "deep/b.c") shouldEqual None
+    tsvLines(fx) shouldEqual Vector(
+      SkipLog.Header,
+      s"${fx.bSha}\tdeep/b.c\ttimeout\ttimeout=1s retries=3x2s\tc=0123456789abcdef")
+    Main.exitStatus(stats, strictTokenize = false) shouldEqual 0
+  }
+
+  test("strict mode: a timeout on all attempts stops the walk and exits 4") {
+    val fx = fixture("timeout-4")
+    val stats = run(fx, "serial", strict = true, maxRetries = 3)
+    fx.callsForB shouldEqual 4
+    stats.commitsProcessed shouldEqual 0
+    stats.blobsTimedOut shouldEqual 1L
+    Main.exitStatus(stats, strictTokenize = true) shouldEqual Main.TimedOutExitStatus
+  }
+
+  test("strict mode: a timeout recovered on a retry does not stop the walk") {
+    val fx = fixture("timeout-2")
+    val stats = run(fx, "serial", strict = true, maxRetries = 3)
+    stats.commitsProcessed shouldEqual 2
+    Main.exitStatus(stats, strictTokenize = true) shouldEqual 0
+  }
+
+  test("--max-retries=0 gives no retry") {
+    val fx = fixture("timeout-1")
+    val stats = run(fx, "serial", maxRetries = 0)
+    stats.blobsTimeoutRetriedInRun shouldEqual 0L
+    stats.blobsSkipped shouldEqual 1L
+    fx.callsForB shouldEqual 1
+    tsvLines(fx).last.split("\t")(3) shouldEqual "timeout=1s"
+  }
+
+  test("the default is no retry, and the stall window then stays at 3 x --blob-timeout") {
+    Main.DefaultMaxRetries shouldEqual 0
+    Main.Usage should include("default 0: a timeout skips and records the blob")
+    // With the default, a defaulted window stays at 1800s (30 min) for 600s blobs.
+    Main.resolveStallWindow(600, Main.DefaultMaxRetries, Main.DefaultTimeoutRetryFactor,
+      600, 1800, stallExplicit = false) shouldEqual Right(1800)
+    // With an explicit --max-retries=3 it grows to 8420s (about 2 h 20 min).
+    Main.resolveStallWindow(600, 3, Main.DefaultTimeoutRetryFactor,
+      600, 1800, stallExplicit = false) shouldEqual Right(8420)
+  }
+
+  test("with the default, a timeout skips and records the blob at once") {
+    val fx = fixture("timeout-1")
+    val stats = run(fx, "serial", maxRetries = Main.DefaultMaxRetries)
+    stats.blobsTimeoutRetriedInRun shouldEqual 0L
+    stats.blobsSkipped shouldEqual 1L
+    fx.callsForB shouldEqual 1
+    tsvLines(fx).last.split("\t")(3) shouldEqual "timeout=1s"
+  }
+
+  test("an explicit --max-retries=3 still retries") {
+    val fx = fixture("timeout-1")
+    val stats = run(fx, "serial", maxRetries = 3)
+    stats.blobsTimeoutRetriedInRun shouldEqual 1L
+    stats.blobsTimeoutRecoveredInRun shouldEqual 1L
+    stats.blobsSkipped shouldEqual 0L
+    fx.callsForB shouldEqual 2
+  }
+
+  test("a factor of 0 or 1 gives each retry the first budget") {
+    val fx = fixture("timeout-4")
+    run(fx, "serial", maxRetries = 2, retryFactor = 1)
+    fx.callsForB shouldEqual 3
+    tsvLines(fx).last.split("\t")(3) shouldEqual "timeout=1s retries=2x1s"
+  }
+
+  test("a parser crash gets no retry, whatever --max-retries says") {
+    val fx = fixture("crash")
+    val stats = run(fx, "serial", maxRetries = 3)
+    stats.blobsTimeoutRetriedInRun shouldEqual 0L
+    stats.blobsParserCrashed shouldEqual 1L
+    fx.callsForB shouldEqual 1
+  }
+
+  // -- the retry pass across runs ----------------------------------------------
+
+  test("with the retry pass off, a timed-out blob stays dropped and keeps its rows") {
+    val fx = fixture("timeout")
+    run(fx, "serial")
+    Files.delete(fx.marker)          // it would tokenize now
+    val before = tsvLines(fx)
+
+    val held = run(fx, "serial", retryPass = false)
+    held.blobsRecovered shouldEqual 0L
+    held.refolded shouldBe false
+    held.commitsProcessed shouldEqual 0
+    fx.callsForB shouldEqual 1       // not given to the tokenizer again
+    withMapping(fx)(_.retryBlobs) shouldEqual Vector((fx.bSha, "deep/b.c"))
+    tsvLines(fx) shouldEqual before
+    dstContent(fx, fx.secondCommit, "deep/b.c") shouldEqual None
+
+    // A later run with the pass on retries it, as before.
+    val retried = run(fx, "serial")
+    retried.blobsRecovered shouldEqual 1L
+    retried.refolded shouldBe true
+    dstContent(fx, fx.secondCommit, "deep/b.c") shouldEqual Some("BETA\n")
+    withMapping(fx)(_.retryBlobs) shouldBe empty
+  }
+
+  test("with the retry pass off, a new commit that holds the held blob drops it too") {
+    val fx = fixture("timeout")
+    run(fx, "serial")
+    Files.delete(fx.marker)
+    val git = Git.open(fx.src.getDirectory.getParentFile)
+    try {
+      val srcDir = fx.src.getDirectory.getParentFile.toPath
+      Files.writeString(srcDir.resolve("deep/d.c"), "delta\n")
+      git.add().addFilepattern("deep/d.c").call()
+      commit(git, "a new file next to b.c")
+    } finally git.close()
+    val held = run(fx, "serial", retryPass = false)
+    held.commitsProcessed shouldEqual 1
+    fx.callsForB shouldEqual 1
+    withMapping(fx)(_.retryBlobs) shouldEqual Vector((fx.bSha, "deep/b.c"))
+  }
+
+  // -- the load gate -------------------------------------------------------------
+
+  test("the load gate waits while the load is above the limit, and no longer than its cap") {
+    val f = Files.createTempFile(workRoot, "loadavg-", "")
+    Files.writeString(f, "99.00 50.00 20.00 3/900 12345\n")
+    var polls = 0
+    val gate = LoadGate(limit = 4.0, maxWaitSeconds = 2, pollSeconds = 1, loadavg = f)
+    val t0 = System.nanoTime()
+    gate.await(_ => polls += 1)
+    val secs = (System.nanoTime() - t0) / 1e9
+    secs should be >= 1.9
+    secs should be < 10.0
+    polls should be >= 2
+
+    Files.writeString(f, "0.50 0.40 0.30 1/900 12345\n")
+    gate.await(_ => fail("no wait at a low load")) shouldEqual 0L
+    LoadGate(4.0, 2, 1, workRoot.resolve("no-such-file")).await(_ => fail("no file, no wait")) shouldEqual 0L
+    LoadGate.disabled.await(_ => fail("disabled")) shouldEqual 0L
+  }
+
+  test("the longest time for one blob includes every retry and its load wait") {
+    // Defaults: 600s, then 3 x (600s wait + 1800s retry), plus 5s grace x 4 attempts.
+    Walker.longestBlobSeconds(600, 3, 3, 600) shouldEqual 7820L
+    Walker.longestBlobSeconds(600, 0, 3, 600) shouldEqual 605L
+    Walker.retryBudget(600, 3) shouldEqual 1800
+    Walker.retryBudget(600, 0) shouldEqual 600
+  }
+
+  test("the stall window with retries: a defaulted one is raised, an explicit one too small is refused") {
+    // Defaulted: raised to the longest time plus one --blob-timeout.
+    Main.resolveStallWindow(600, 3, 3, 600, 1800, stallExplicit = false) shouldEqual Right(8420)
+    // Explicit and large enough: kept.
+    Main.resolveStallWindow(600, 3, 3, 600, 9000, stallExplicit = true) shouldEqual Right(9000)
+    // Explicit and too small: refused, naming the settings that make it too small.
+    val bad = Main.resolveStallWindow(600, 3, 3, 600, 7000, stallExplicit = true)
+    bad.isLeft shouldBe true
+    Seq("--max-retries 3", "--timeout-retry-factor 3", "--load-wait-max", "7820s").foreach { part =>
+      bad.left.getOrElse("") should include(part)
+    }
+    // Without retries the old rule holds, unchanged.
+    Main.resolveStallWindow(600, 0, 3, 600, 1800, stallExplicit = false) shouldEqual Right(1800)
+    Main.resolveStallWindow(600, 0, 3, 600, 601, stallExplicit = true) shouldEqual Right(601)
+  }
+
+  test("the default load limit is twice the processor count") {
+    Main.defaultLoadLimit(16) shouldEqual 32.0
+    LoadGate.DefaultMaxWaitSeconds shouldEqual 600
   }
 
   // -- helpers ---------------------------------------------------------------

@@ -168,6 +168,9 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--jobs`              | concurrent blame/HTML processes                            | `CREGIT_JOBS` or up to `4` CPUs  |
 | `--reblame`           | re-blame every file in step 7, replacing existing `.blame` output | off — a resume skips files already blamed |
 | `--strict-tokenize`   | stop step 2 on the first tokenizer failure (exit 4 or 6), as earlier versions did | off — a failed blob is skipped and recorded; also `CREGIT_STRICT_TOKENIZE=1` |
+| `--max-retries`       | retries of a timed-out blob in the same run; 0 = no retry  | `0`; also `CREGIT_MAX_RETRIES` |
+| `--timeout-retry-factor` | budget of each retry, as a multiple of `--blob-timeout`; 0 or 1 = the same budget | `3`; also `CREGIT_TIMEOUT_RETRY_FACTOR` |
+| `--retry-skipped`     | try again the earlier timeouts even when blame output exists (a recovered blob means a full re-blame) | off; also `CREGIT_RETRY_SKIPPED=1` |
 
 **`git blame` runs with `-C100` copy detection** (`blameRepo/formatBlame.pl:73`), so a
 token moved between files keeps its original author. Upstream shipped that commented
@@ -254,13 +257,59 @@ again. When a tree that holds a dropped blob occurs again under a different path
 walk reuses the rewritten tree, and the file names only the first path. The sha is
 always in the file.
 
-**A timeout is not permanent.** blobExec records a timed-out blob in the
-`retry_blob` table of the blob map, and the next step-2 run tries it first. If it now
-tokenizes, blobExec empties `commit_map`, `tree_map` and `ref_map` and folds all of
-history again, with the blob in it. The blob rows stay, so no other blob is tokenized
-again. Every rewritten commit then has a new sha, so the runner removes the outputs
-made from the old commits (as it does for `--retokenize`), and steps 3 to 10 make them
-again. If the blob times out again, it stays dropped and nothing is folded again.
+**A timeout can get retries in the same run.** By default it does not:
+`--max-retries` is 0, so a timeout skips and records the blob at once. A timeout is
+often the load of the machine, not the blob. To retry, set `--max-retries 3` (or
+`CREGIT_MAX_RETRIES=3`). Then the stall watchdog window grows from 30 min to about
+2 h 20 min (see the worst case below). blobExec retries a timed-out blob up to
+`--max-retries` times. Before each retry it waits while the 1-minute load
+average (`/proc/loadavg`) is above the limit (`--load-limit`, default 2 x the number of
+processors; `CREGIT_LOAD_LIMIT` in the runner), for 10 minutes at most
+(`--load-wait-max`). Each retry has `--timeout-retry-factor` times the budget (default
+3, so 1800 s for the default 600 s). The first retry that tokenizes ends the sequence.
+The blob is dropped only if all 1 + N attempts time out. The record then lists the
+attempts: `timeout=600s retries=3x1800s`. A parser crash and empty output get no retry,
+because they are deterministic.
+
+Why these defaults. The machine this runs on sits at a 1-minute load of 21 to 27 on 16
+processors. A limit equal to the processor count would make every wait last until its
+cap, so the limit is twice the processor count. The 1-minute load average falls by a
+factor of e each minute after a burst ends, so a burst is gone from it within about
+five minutes; a wait longer than 10 minutes helps only under a load that does not end,
+and with `--max-retries 3` each wait can occur three times per blob.
+
+**Worst case for one blob, with `--max-retries 3` and the other defaults:** 600 s,
+then 3 x (600 s wait + 1800 s retry) = 7800 s, about 2 h 10 min, plus 5 s kill grace for each of the 4 attempts
+(7820 s). No progress is stamped during that sequence, so the stall window must be
+larger than it. A defaulted `--stall-timeout` is raised to that time plus one
+`--blob-timeout` (8420 s, about 2 h 20 min); an explicit value that is too small is
+refused, and the message names `--max-retries`, `--timeout-retry-factor` and
+`--load-wait-max`. The cost: a real stall is then seen after 2 h 20 min, not after
+30 min. This is why the default is 0 retries: the window stays at 3 x
+`--blob-timeout` (30 min).
+
+**A timeout that stays is not permanent either.** blobExec records it in the
+`retry_blob` table of the blob map, and a later step-2 run can try it first. If it
+then tokenizes, blobExec empties `commit_map`, `tree_map` and `ref_map` and folds all
+of history again, with the blob in it. The blob rows stay, so no other blob is
+tokenized again. But every rewritten commit then has a new sha, so the runner removes
+the outputs made from the old commits (as it does for `--retokenize`), `blame/`
+included, and step 7 blames the whole project again. For the largest project that is
+about 130 hours, for one file that timed out once. So the runner applies two rules:
+
+1. **While there is no blame output**, step 2 tries the earlier timeouts by itself.
+   "Blame output" means any `.blame` file in `<work>/blame` or in
+   `<work>/blame-c100-incoming` (a re-blame made on another machine).
+2. **When blame output exists**, step 2 passes `--no-retry-timed-out` to blobExec.
+   The blobs stay dropped, their `retry_blob` rows and skip-file rows stay, and the
+   blame is not touched. Step 2 prints, for example,
+   `WARNING: 1 timed-out blobs stay dropped (see <work>/tokenize-skipped.tsv); --retry-skipped retries them and re-blames the project (41213 .blame files would be deleted).`
+   Pass `--retry-skipped` (or `CREGIT_RETRY_SKIPPED=1`) to try them anyway, and accept
+   the re-blame. A re-fold deletes `<work>/blame` and `<work>/blame-c100-incoming`,
+   because both name the commits of before the re-fold; the count covers both.
+
+If a blob times out again on such a retry, it stays dropped and nothing is folded
+again.
 
 **A crash is recorded only through the blob map, never in the memo.**
 `tokenizeByBlobId/tokenBySha.pl` writes a memo entry only when the tokenizer succeeds,
@@ -279,7 +328,8 @@ merge does not carry the retry records over.
 
 | blobExec exit status | before this change | now, default | now, `--strict-tokenize` |
 | -------------------- | ------------------ | ------------ | ------------------------ |
-| a blob timed out     | 4, step 2 stops    | 0, blob skipped and recorded, retried next run | 4, step 2 stops |
+| a blob timed out (on all attempts) | 4, step 2 stops | 0, blob skipped and recorded; a later run retries it while no blame exists, or with `--retry-skipped` | 4, step 2 stops |
+| a blob timed out, then tokenized on a retry | 4, step 2 stops | 0, not skipped | 0, not skipped |
 | a parser crash or empty output | 6, step 2 stops | 0, blob skipped and recorded | 6, step 2 stops |
 | a denylisted or oversized blob | 0 | 0, and recorded | 0, and recorded |
 | an abort (`--abort-on-error`) | 2 | 2 | 2 |

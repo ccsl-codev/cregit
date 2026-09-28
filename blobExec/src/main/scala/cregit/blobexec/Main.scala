@@ -117,6 +117,58 @@ object Main {
     * for it, matching the ratio of the two defaults (600 and 1800). */
   private[blobexec] val StallTimeoutMultiple = 3
 
+  /** Default of `--timeout-retry-factor`: each retry of a timed-out blob has
+    * three times the budget of the first attempt. */
+  private[blobexec] val DefaultTimeoutRetryFactor = 3
+
+  /** Default of `--max-retries`: no retry. A timed-out blob is skipped and
+    * recorded at once, and the stall window stays at 3 x `--blob-timeout`
+    * (30 min). With `--max-retries=3` the window grows to about 2 h 20 min. */
+  private[blobexec] val DefaultMaxRetries = 0
+
+  /** Default of `--load-limit`: twice the processor count. The machine this runs
+    * on sits at a 1-minute load of 21 to 27 on 16 processors; with a limit equal
+    * to the processor count, every wait would last until its cap. */
+  private[blobexec] def defaultLoadLimit(processors: Int): Double = 2.0 * processors
+
+  /** The stall window for a run with retries.
+    *
+    * With `maxRetries = 0` this is [[resolveStallTimeout]] unchanged: the window
+    * must be larger than `--blob-timeout`, and a defaulted one is raised to
+    * [[StallTimeoutMultiple]] times it.
+    *
+    * With retries, no progress is stamped for one blob from its first attempt to
+    * its last, so the window must be larger than [[Walker.longestBlobSeconds]]:
+    * the first attempt, plus each retry with its longest load wait. An explicit
+    * window that is not larger is refused, and the message names both settings. A
+    * defaulted one is raised to that longest time plus one `--blob-timeout`. It is
+    * not raised to three times the longest time: that would be 6.5 hours with
+    * --max-retries=3, and a real stall would then go unseen for that long. */
+  private[blobexec] def resolveStallWindow(
+      blobTimeoutSeconds: Int,
+      maxRetries: Int,
+      timeoutRetryFactor: Int,
+      loadWaitMaxSeconds: Int,
+      stallTimeoutSeconds: Int,
+      stallExplicit: Boolean
+  ): Either[String, Int] =
+    if (maxRetries <= 0) resolveStallTimeout(blobTimeoutSeconds, stallTimeoutSeconds, stallExplicit)
+    else {
+      val longest = Walker.longestBlobSeconds(blobTimeoutSeconds, maxRetries, timeoutRetryFactor, loadWaitMaxSeconds)
+      val widened = math.min(longest + blobTimeoutSeconds.toLong, Int.MaxValue.toLong).toInt
+      if (stallTimeoutSeconds.toLong > longest) Right(stallTimeoutSeconds)
+      else if (stallExplicit)
+        Left(
+          s"--stall-timeout=$stallTimeoutSeconds must be greater than ${longest}s, the longest time one " +
+            s"blob can take: --blob-timeout ${blobTimeoutSeconds}s, then --max-retries $maxRetries " +
+            s"retries of ${Walker.retryBudget(blobTimeoutSeconds, timeoutRetryFactor)}s each " +
+            s"(--timeout-retry-factor $timeoutRetryFactor), each after a load wait of up to " +
+            s"${loadWaitMaxSeconds}s (--load-wait-max), with 5s kill grace per attempt. Try " +
+            s"--stall-timeout=$widened, or fewer retries (--max-retries), or a smaller factor or wait."
+        )
+      else Right(widened)
+    }
+
   /** Reconcile the two timeouts, which are not independent: during a commit that
     * is pure blob work, a blob finishing or being killed is the only thing that
     * stamps progress, so the watchdog window has to be strictly larger than the
@@ -149,8 +201,8 @@ object Main {
 
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
-  private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--strict-tokenize] [--skipped-tsv=<file>] [--refold-marker=<file>] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+  private[blobexec] val Usage =
+    raw"""Usage: blobExec [--abort-on-error] [--strict-tokenize] [--skipped-tsv=<file>] [--refold-marker=<file>] [--max-retries=<n>] [--timeout-retry-factor=<n>] [--load-limit=<load>] [--load-wait-max=<seconds>] [--no-retry-timed-out] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
@@ -175,10 +227,47 @@ object Main {
       |                        or, with --retokenize, re-folds and tries it again.
       |                      - a timeout depends on load, so it is NOT permanent.
       |                        The blob is recorded in the retry_blob table of
-      |                        <db.sqlite>, and each later run tries it first. If it
+      |                        <db.sqlite>, and each later run tries it first
+      |                        (unless --no-retry-timed-out). If it
       |                        then tokenizes, the run empties commit_map, tree_map
       |                        and ref_map and folds all of history again with the
       |                        blob in it (see --refold-marker).
+      |  --max-retries=<n>
+      |                    retry a timed-out blob up to n more times in the same run
+      |                    (default ${DefaultMaxRetries}: a timeout skips and records the blob at
+      |                    once). Before each retry, wait
+      |                    while the 1-minute load average (/proc/loadavg) is above
+      |                    --load-limit, for --load-wait-max seconds at most. The
+      |                    first retry that tokenizes ends the sequence. The blob is
+      |                    dropped and recorded only if all 1+n attempts time out;
+      |                    the detail then lists them (timeout=600s retries=3x1800s).
+      |                    A parser crash or empty output gets no retry: it is
+      |                    deterministic.
+      |  --timeout-retry-factor=<n>
+      |                    the budget of each retry, as n x --blob-timeout (default
+      |                    ${DefaultTimeoutRetryFactor}). 0 or 1: the same budget as the first attempt.
+      |  --load-limit=<load>
+      |                    the load average above which a retry waits (default: 2 x
+      |                    the number of processors). 0 disables the wait.
+      |  --load-wait-max=<seconds>
+      |                    the longest wait for the load before one retry (default
+      |                    ${LoadGate.DefaultMaxWaitSeconds}). After it, the retry starts at any load.
+      |
+      |                    Worst case for one blob with --max-retries=3 and the other
+      |                    defaults: 600s, then 3 x (600s wait + 1800s retry) = 7800s,
+      |                    about 2 h 10 min, plus 5s kill grace per attempt. The stall
+      |                    window must be larger than this, so with retries a
+      |                    defaulted --stall-timeout is raised to that time plus one
+      |                    --blob-timeout (8420s, about 2 h 20 min). With the default
+      |                    of 0 retries it stays at 3 x --blob-timeout (30 min).
+      |  --no-retry-timed-out
+      |                    do not try again, before the walk, the blobs that timed
+      |                    out in an earlier run (the retry_blob table). They stay
+      |                    dropped, and their rows stay, so a later run without
+      |                    this flag tries them. A recovered blob folds all of
+      |                    history again and so makes all blame output out of
+      |                    date; the pipeline passes this flag when blame output
+      |                    exists (see run_pipeline_process.sh --retry-skipped).
       |  --skipped-tsv=<file>
       |                    the record of every blob that the tokenized repository
       |                    does not contain. Tab-separated, with the header
@@ -290,19 +379,24 @@ object Main {
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
       |                    killed (whole process group), and --abort-on-error does
-      |                    not turn a timeout into a whole-run abort. The blob is
-      |                    then dropped and recorded (see --strict-tokenize), and
-      |                    the next run over the same memo tries it again. With
+      |                    not turn a timeout into a whole-run abort. The blob then
+      |                    gets up to --max-retries retries. If they all time out
+      |                    too, it is dropped and recorded (see
+      |                    --strict-tokenize), and a later run over the same memo
+      |                    tries it again unless --no-retry-timed-out. With
       |                    --strict-tokenize the walk stops at that commit, records
       |                    nothing for it, and exits ${TimedOutExitStatus}; another run
       |                    over the same memo retries just that blob (from the
       |                    pipeline: resume at step 2, never step 1).
       |  --stall-timeout=<seconds>
       |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}); must be larger than
-      |                    --blob-timeout, since a pure-blob commit's only
+      |                    the longest per-blob budget, since a pure-blob commit's only
       |                    progress is a blob finishing or being killed. If it is
       |                    not, an explicit value is refused and a defaulted one
-      |                    is raised to ${StallTimeoutMultiple}x --blob-timeout. If no blob, tree,
+      |                    is raised: to ${StallTimeoutMultiple}x --blob-timeout without retries, and
+      |                    to the longest time for one blob (all its attempts and
+      |                    load waits, see --max-retries) plus one --blob-timeout
+      |                    with retries. If no blob, tree,
       |                    commit or blob copy completes anywhere in this window,
       |                    the run is stuck in a way the per-blob kill did not
       |                    cover: it is reported with the work in flight and the
@@ -374,7 +468,45 @@ object Main {
     var strictTokenize = false
     var skippedTsv: Option[java.nio.file.Path] = None
     var refoldMarker: Option[java.nio.file.Path] = None
+    var timeoutRetryFactor = DefaultTimeoutRetryFactor
+    var maxRetries = DefaultMaxRetries
+    var loadLimit: Double = defaultLoadLimit(Runtime.getRuntime.availableProcessors)
+    var loadWaitMax = LoadGate.DefaultMaxWaitSeconds
+    var retryTimedOutPass = true
     flags.foreach {
+      case "--no-retry-timed-out" => retryTimedOutPass = false
+      case t if t.startsWith("--max-retries=") =>
+        val spec = t.stripPrefix("--max-retries=")
+        spec.toIntOption.filter(n => n >= 0 && n <= 100) match {
+          case Some(n) => maxRetries = n
+          case None =>
+            System.err.println(s"Error: --max-retries must be a whole number from 0 to 100 [$spec]")
+            sys.exit(1)
+        }
+      case t if t.startsWith("--timeout-retry-factor=") =>
+        val spec = t.stripPrefix("--timeout-retry-factor=")
+        spec.toIntOption.filter(_ >= 0) match {
+          case Some(n) => timeoutRetryFactor = n
+          case None =>
+            System.err.println(s"Error: --timeout-retry-factor must be a whole number >= 0 [$spec]")
+            sys.exit(1)
+        }
+      case t if t.startsWith("--load-limit=") =>
+        val spec = t.stripPrefix("--load-limit=")
+        spec.toDoubleOption.filter(v => v >= 0 && !v.isNaN) match {
+          case Some(v) => loadLimit = v
+          case None =>
+            System.err.println(s"Error: --load-limit must be a number >= 0 [$spec]")
+            sys.exit(1)
+        }
+      case t if t.startsWith("--load-wait-max=") =>
+        val spec = t.stripPrefix("--load-wait-max=")
+        spec.toIntOption.filter(_ >= 0) match {
+          case Some(n) => loadWaitMax = n
+          case None =>
+            System.err.println(s"Error: --load-wait-max must be a whole number of seconds >= 0 [$spec]")
+            sys.exit(1)
+        }
       case "--abort-on-error" => abortOnError = true
       case "--strict-tokenize" => strictTokenize = true
       case t if t.startsWith("--skipped-tsv=") && t.length > "--skipped-tsv=".length =>
@@ -452,12 +584,18 @@ object Main {
         sys.exit(1)
     }
 
-    resolveStallTimeout(blobTimeoutSeconds, stallTimeoutSeconds, stallExplicit) match {
+    // A timed-out blob and its retries can run much longer than --blob-timeout,
+    // with no progress stamped. So the stall window is checked against the whole
+    // sequence, not the first attempt.
+    resolveStallWindow(blobTimeoutSeconds, maxRetries, timeoutRetryFactor, loadWaitMax,
+        stallTimeoutSeconds, stallExplicit) match {
       case Right(secs) =>
         if (secs != stallTimeoutSeconds) {
           System.err.println(
             s"blobExec: raising the stall window from ${stallTimeoutSeconds}s to ${secs}s, because " +
-              s"--blob-timeout=${blobTimeoutSeconds}s needs a watchdog window larger than itself. " +
+              s"one blob can take up to ${if (maxRetries > 0) Walker.longestBlobSeconds(blobTimeoutSeconds, maxRetries, timeoutRetryFactor, loadWaitMax) else blobTimeoutSeconds.toLong}s " +
+              s"(--blob-timeout=${blobTimeoutSeconds}s, --max-retries=$maxRetries, " +
+              s"--timeout-retry-factor=$timeoutRetryFactor, --load-wait-max=${loadWaitMax}s). " +
               "Pass --stall-timeout explicitly to choose your own."
           )
           stallTimeoutSeconds = secs
@@ -591,7 +729,9 @@ object Main {
         s"tokenizerIdentity=${if (tokenizerIdentity.isEmpty) "none" else tokenizerIdentity.render} " +
         s"retokenize=${if (retokenizeExtensions.isEmpty) "none" else retokenizeExtensions.toVector.sorted.mkString(",")} " +
         s"memoDir=${memoDir.map(_.toString).getOrElse("none")} " +
-        s"strictTokenize=$strictTokenize skippedTsv=${skippedTsv.map(_.toString).getOrElse("none")}"
+        s"strictTokenize=$strictTokenize skippedTsv=${skippedTsv.map(_.toString).getOrElse("none")} " +
+        s"maxRetries=$maxRetries timeoutRetryFactor=$timeoutRetryFactor loadLimit=$loadLimit loadWaitMax=${loadWaitMax}s " +
+        s"retryTimedOutPass=$retryTimedOutPass"
     )
 
     // Opened before the walk, so a file this run cannot append to stops the run
@@ -689,6 +829,8 @@ object Main {
     // (stats, timeouts this memo has ever seen). The cumulative figure is kept
     // for forensics only — it must NOT gate the exit status, or a blob that
     // times out once could never be retried to a clean run.
+    // Rows of retry_blob after the walk: timed-out blobs that stay dropped.
+    var retryPending = 0
     val (stats, timedOutEver) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
       val walker = new Walker(
@@ -700,9 +842,14 @@ object Main {
         denylist = denylist,
         strictTokenize = strictTokenize,
         skipLog = skipLog,
-        tokenizerIdentity = tokenizerIdentity
+        tokenizerIdentity = tokenizerIdentity,
+        maxRetries = maxRetries,
+        timeoutRetryFactor = timeoutRetryFactor,
+        loadGate = LoadGate(loadLimit, loadWaitMax),
+        retryTimedOutPass = retryTimedOutPass
       )
       val s = walker.run()
+      retryPending = mapping.retryBlobs.size
       val prior = mapping.getMeta(BlobsTimedOutMetaKey).flatMap(_.toLongOption).getOrElse(0L)
       val total = prior + s.blobsTimedOut
       if (s.blobsTimedOut > 0) mapping.setMeta(BlobsTimedOutMetaKey, total.toString)
@@ -743,6 +890,9 @@ object Main {
         s"blobsRecovered=${stats.blobsRecovered} " +
         s"refolded=${stats.refolded} " +
         s"skippedTsvRows=${skipLog.all.size} " +
+        s"blobsTimeoutRetriedInRun=${stats.blobsTimeoutRetriedInRun} " +
+        s"blobsTimeoutRecoveredInRun=${stats.blobsTimeoutRecoveredInRun} " +
+        s"retryPending=$retryPending " +
         s"strictTokenize=$strictTokenize " +
         s"aborted=${stats.aborted}"
     )

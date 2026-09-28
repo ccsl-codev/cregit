@@ -67,7 +67,12 @@ final case class WalkStats(
     /** True if this run emptied commit_map, tree_map and ref_map because a retry
       * recovered a blob. Every rewritten commit then has a new sha, so all of the
       * outputs made from the tokenized repository are out of date. */
-    refolded: Boolean = false
+    refolded: Boolean = false,
+    /** Retry attempts at timed-out blobs in the same run (see `maxRetries`), and
+      * the number of blobs that a retry recovered. A recovered blob is not counted
+      * in [[blobsTimedOut]], and it is not dropped. */
+    blobsTimeoutRetriedInRun: Long = 0L,
+    blobsTimeoutRecoveredInRun: Long = 0L
 )
 
 /** Rebuild `src` history into `dst`, persisting mappings to `mapping`.
@@ -99,7 +104,20 @@ final class Walker(
     // Where each dropped blob is recorded. Disabled (memory only) by default.
     skipLog: SkipLog = SkipLog.disabled,
     // Only for the `tokenizer` column of the skip record.
-    tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty
+    tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
+    // A timed-out blob gets up to `maxRetries` more attempts in the same run, each
+    // after `loadGate` lets it start, and each with a budget of
+    // `blobTimeoutSeconds * max(1, timeoutRetryFactor)`. 0 by default here, so a
+    // library caller and the older specs keep one attempt; Main's defaults are
+    // 3 retries and factor 3.
+    maxRetries: Int = 0,
+    timeoutRetryFactor: Int = 3,
+    loadGate: LoadGate = LoadGate.disabled,
+    // true: before the walk, try again each blob that timed out in an earlier run
+    // (retry_blob). false: keep those blobs dropped, and keep their rows. The
+    // runner sets false when blame output exists, because a recovered blob folds
+    // all of history again and so deletes the blame.
+    retryTimedOutPass: Boolean = true
 ) {
   import Walker._
 
@@ -115,6 +133,8 @@ final class Walker(
   private val blobsParserCrashed             = new LongAdder
   private val blobsSkipped                   = new LongAdder
   private val blobsRecovered                 = new LongAdder
+  private val blobsTimeoutRetriedInRun       = new LongAdder
+  private val blobsTimeoutRecoveredInRun     = new LongAdder
   @volatile private var refolded             = false
   private val originalBlobCopyRequests       = new LongAdder
   private val originalBlobCopies             = new LongAdder
@@ -245,7 +265,7 @@ final class Walker(
     try {
       // Before the frontier is read: a recovered blob empties commit_map, and the
       // frontier must then be empty too.
-      retryTimedOutBlobs()
+      if (retryTimedOutPass) retryTimedOutBlobs() else holdTimedOutBlobs()
       markUninteresting(revWalk)
       markStartRefs(revWalk)
 
@@ -278,7 +298,9 @@ final class Walker(
         originalBlobBytesAvoided    = originalBlobBytesAvoided.sum(),
         blobsSkipped                = blobsSkipped.sum(),
         blobsRecovered              = blobsRecovered.sum(),
-        refolded                    = refolded
+        refolded                    = refolded,
+        blobsTimeoutRetriedInRun    = blobsTimeoutRetriedInRun.sum(),
+        blobsTimeoutRecoveredInRun  = blobsTimeoutRecoveredInRun.sum()
       )
     } finally revWalk.close()
   }
@@ -320,7 +342,9 @@ final class Walker(
       originalBlobBytesAvoided    = originalBlobBytesAvoided.sum(),
       blobsSkipped                = blobsSkipped.sum(),
       blobsRecovered              = blobsRecovered.sum(),
-      refolded                    = refolded
+      refolded                    = refolded,
+      blobsTimeoutRetriedInRun    = blobsTimeoutRetriedInRun.sum(),
+      blobsTimeoutRecoveredInRun  = blobsTimeoutRecoveredInRun.sum()
     )
   }
 
@@ -922,21 +946,9 @@ final class Walker(
       blobCommandExecutions.increment()
       // Set by either callback below: both mean "this blob's tokenization is
       // unusable, so nothing about it may be persisted".
-      val unusable = new AtomicBoolean(false)
-      val failure  = new AtomicReference[BlobExec.Failure](null)
-      val outcome = BlobExec.run(
-        bytes        = bytes,
-        origSha      = task.origId.name,
-        filename     = task.filename,
-        fullPath     = task.fullPath,
-        command      = command,
-        abortOnError = abortOnError,
-        inserter     = workerInserter,
-        timeoutSeconds = blobTimeoutSeconds,
-        onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
-        onFailure      = f => failure.set(f)
-      )
+      val (outcome, failed) = tokenize(bytes, task, workerInserter)
+      val unusable = new AtomicBoolean(failed.isDefined)
+      val failure  = new AtomicReference[BlobExec.Failure](failed.orNull)
       val res = outcome match {
         case BlobExec.Outcome.Skip if unusable.get() && !strictTokenize =>
           // Dropped, exactly as a denylisted blob is: no id, so no tree entry, no
@@ -1091,21 +1103,9 @@ final class Walker(
             blobCommandExecutions.increment()
             // Set by either callback below: both mean "this blob's tokenization is
             // unusable, so nothing about it may be persisted".
-            val unusable = new AtomicBoolean(false)
-            val failure  = new AtomicReference[BlobExec.Failure](null)
-            val outcome = BlobExec.run(
-              bytes        = bytes,
-              origSha      = task.origId.name,
-              filename     = task.filename,
-              fullPath     = task.fullPath,
-              command      = command,
-              abortOnError = abortOnError,
-              inserter     = workerInserter,
-              timeoutSeconds = blobTimeoutSeconds,
-              onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-              onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
-              onFailure      = f => failure.set(f)
-            )
+            val (outcome, failed) = tokenize(bytes, task, workerInserter)
+            val unusable = new AtomicBoolean(failed.isDefined)
+            val failure  = new AtomicReference[BlobExec.Failure](failed.orNull)
             val dropped = unusable.get() && !strictTokenize
             // For Skip outcomes (identical output, a non-zero exit with
             // abortOnError=false, or a timeout) we keep the original blob id, so
@@ -1279,6 +1279,92 @@ final class Walker(
       dbLock.synchronized(mapping.deleteRetry(sha, task.fullPath))
   }
 
+  /** The budget of each retry of a timed-out blob. */
+  private val retryTimeoutSeconds: Int =
+    Walker.retryBudget(blobTimeoutSeconds, timeoutRetryFactor)
+
+  /** Run the tokenizer on one blob, and retry a timed-out blob up to `maxRetries`
+    * times.
+    *
+    * Only a timeout gets retries. A parser crash and empty output are
+    * deterministic for a given tokenizer, so a retry gives the same result. Before
+    * each retry, [[LoadGate.await]] waits while the machine is loaded, and each
+    * retry has the budget `blobTimeoutSeconds * timeoutRetryFactor`. The first
+    * retry that tokenizes ends the sequence. The blob is a timeout only if all
+    * `1 + maxRetries` attempts time out; the detail then lists the attempts, as in
+    * `timeout=600s retries=3x1800s`.
+    *
+    * No progress is stamped between the attempts or during the waits. The stall
+    * watchdog therefore sees the whole sequence as one unit of work, and Main
+    * makes the stall window larger than the longest sequence
+    * ([[Walker.longestBlobSeconds]]).
+    *
+    * The counters are set from the final result only: a blob that tokenizes on a
+    * retry is not a timeout, and in strict mode it does not change the exit
+    * status. `blobsTimeoutRetriedInRun` counts retry attempts, and
+    * `blobsTimeoutRecoveredInRun` counts blobs that a retry recovered. Returns
+    * the outcome and the failure, if there is one. */
+  private def tokenize(
+      bytes: Array[Byte],
+      task: BlobMissTask,
+      inserter: ObjectInserter
+  ): (BlobExec.Outcome, Option[BlobExec.Failure]) = {
+    def attempt(secs: Int): (BlobExec.Outcome, Option[BlobExec.Failure]) = {
+      val failure = new AtomicReference[BlobExec.Failure](null)
+      val outcome = BlobExec.run(
+        bytes = bytes, origSha = task.origId.name, filename = task.filename,
+        fullPath = task.fullPath, command = command, abortOnError = abortOnError,
+        inserter = inserter, timeoutSeconds = secs, onFailure = f => failure.set(f))
+      (outcome, Option(failure.get()))
+    }
+    def timedOut(r: (BlobExec.Outcome, Option[BlobExec.Failure])): Boolean =
+      r._2.exists(_.reason == BlobExec.Failure.Timeout)
+
+    val label = s"${task.origId.name} (${task.fullPath})"
+    var result = attempt(blobTimeoutSeconds)
+    var retries = 0
+    while (timedOut(result) && retries < maxRetries) {
+      retries += 1
+      val waited = loadGate.await(_ => ())
+      System.err.println(
+        s"blobExec: blob $label timed out (attempt $retries of ${1 + maxRetries}). Waited ${waited}s " +
+          s"for the load${if (loadGate.enabled) f" (limit ${loadGate.limit}%.1f)" else ""}; retry " +
+          s"$retries of $maxRetries with ${retryTimeoutSeconds}s.")
+      blobCommandExecutions.increment()
+      blobsTimeoutRetriedInRun.increment()
+      result = attempt(retryTimeoutSeconds)
+      if (result._2.isEmpty) {
+        blobsTimeoutRecoveredInRun.increment()
+        System.err.println(s"blobExec: blob $label tokenized on retry $retries; it is not dropped.")
+      }
+    }
+    if (retries > 0 && timedOut(result))
+      result = (result._1, Some(BlobExec.Failure(BlobExec.Failure.Timeout,
+        s"timeout=${blobTimeoutSeconds}s retries=${retries}x${retryTimeoutSeconds}s")))
+    result._2.foreach { f =>
+      if (f.reason == BlobExec.Failure.Timeout) blobsTimedOut.increment()
+      else blobsParserCrashed.increment()
+    }
+    result
+  }
+
+  /** The retry pass is off (`retryTimedOutPass = false`): keep each blob that
+    * timed out in an earlier run dropped, and keep its retry_blob row. The walk
+    * does not give such a blob to the tokenizer either, so every tree that holds
+    * it stays the same, and the blame output made from those trees stays valid. */
+  private def holdTimedOutBlobs(): Unit = {
+    val pending = mapping.retryBlobs
+    if (pending.isEmpty) return
+    pending.foreach { key =>
+      skippedKeys.put(key, BlobExec.Failure(BlobExec.Failure.Timeout, "retry pass off"))
+      pendingRetry.add(key)
+    }
+    System.err.println(
+      s"blobExec: ${pending.size} blob(s) that timed out in an earlier run stay dropped: the retry " +
+        "pass is off (--no-retry-timed-out). Their retry_blob rows stay, so a later run without " +
+        "that flag tries them again.")
+  }
+
   /** Try again, before the walk, each blob that timed out in an earlier run.
     *
     * These blobs are not in blob_map, and the trees and commits that hold them
@@ -1322,16 +1408,9 @@ final class Walker(
             System.err.println(s"blobExec: retry: $sha ($blobPath) is excluded or not in src; row removed")
           case Some(b) =>
             blobCommandExecutions.increment()
-            val unusable = new AtomicBoolean(false)
-            val failure  = new AtomicReference[BlobExec.Failure](null)
-            val outcome = BlobExec.run(
-              bytes = b, origSha = sha, filename = task.filename, fullPath = blobPath,
-              command = command, abortOnError = abortOnError, inserter = inserter,
-              timeoutSeconds = blobTimeoutSeconds,
-              onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-              onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
-              onFailure      = f => failure.set(f)
-            )
+            val (outcome, failed) = tokenize(b, task, inserter)
+            val unusable = new AtomicBoolean(failed.isDefined)
+            val failure  = new AtomicReference[BlobExec.Failure](failed.orNull)
             outcome match {
               case BlobExec.Outcome.Skip if unusable.get() =>
                 val f = Option(failure.get()).getOrElse(
@@ -1813,6 +1892,29 @@ final class Walker(
 }
 
 object Walker {
+
+  /** The budget of one retry of a timed-out blob: `factor` times the first
+    * budget. A factor below 1 means the same budget as the first attempt. */
+  private[blobexec] def retryBudget(blobTimeoutSeconds: Int, factor: Int): Int =
+    math.min(blobTimeoutSeconds.toLong * math.max(1, factor), Int.MaxValue.toLong).toInt
+
+  /** GNU `timeout -k` grace per attempt; see BlobExec. */
+  private val KillGraceSecondsPerAttempt = 5L
+
+  /** The longest time one blob can take with no progress stamped: the first
+    * attempt, and `maxRetries` times (the longest load wait plus one retry), plus
+    * the kill grace of each attempt. The stall window must be larger. */
+  private[blobexec] def longestBlobSeconds(
+      blobTimeoutSeconds: Int,
+      maxRetries: Int,
+      timeoutRetryFactor: Int,
+      loadWaitMaxSeconds: Int
+  ): Long = {
+    val retries = math.max(0, maxRetries).toLong
+    blobTimeoutSeconds.toLong +
+      retries * (math.max(0, loadWaitMaxSeconds).toLong + retryBudget(blobTimeoutSeconds, timeoutRetryFactor)) +
+      (1L + retries) * KillGraceSecondsPerAttempt
+  }
 
   /** Size at which a mask-matched blob stops being tokenizable and is excluded.
     *

@@ -157,6 +157,31 @@ Target repository:
                     With --strict-tokenize, a timeout stops step 2 with exit 4
                     and a parser crash with exit 6, as described under
                     --force-clean. --mode sharded is always strict.
+  --max-retries N   retry a timed-out blob up to N more times in the same run
+                    (blobExec default: 0, so a timeout skips and records
+                    the blob at once). Before each retry,
+                    blobExec waits while the 1-minute load average is above
+                    CREGIT_LOAD_LIMIT (default: 2 x the number of processors),
+                    for 10 minutes at most. The first retry that tokenizes ends
+                    it; the blob is skipped only if every attempt times out.
+                    A crash gets no retry. Also CREGIT_MAX_RETRIES.
+  --timeout-retry-factor N
+                    the budget of each retry, as N x --blob-timeout (blobExec
+                    default: 3). Also CREGIT_TIMEOUT_RETRY_FACTOR.
+                    Worst case for one blob with --max-retries 3: 600 s, then
+                    3 x (600 s wait + 1800 s retry), about 2 h 10 min. blobExec
+                    then raises a defaulted --stall-timeout above that (8420 s,
+                    about 2 h 20 min). With the default of 0 retries the window
+                    stays at 30 min.
+  --retry-skipped   let step 2 try again the blobs that timed out in an earlier
+                    run even when blame output exists. Also CREGIT_RETRY_SKIPPED=1.
+                    A recovered blob changes every rewritten commit, so the
+                    runner then deletes <work>/blame and step 7 blames the
+                    whole project again (about 130 h for the largest project).
+                    Without this flag, step 2 tries them again only while
+                    <work>/blame and <work>/blame-c100-incoming hold no .blame
+                    file. Otherwise they stay dropped, their records stay, and
+                    step 2 prints a warning with the count.
   --stall-timeout N watchdog window in seconds (blobExec default: 1800). If no
                     blob, tree, commit or blob copy completes anywhere in this
                     window the run is killed with exit 5. Must be larger than
@@ -374,6 +399,14 @@ STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
 # continues. 1: step 2 stops on it (exit 4 or 6 from blobExec). CREGIT_STRICT_TOKENIZE
 # is the way to set it through ctp.py.
 STRICT_TOKENIZE="${CREGIT_STRICT_TOKENIZE:-0}"
+# 1: step 2 tries again the blobs that timed out in an earlier run, even when blame
+# output exists (a recovered blob means a full re-blame). 0: only while no blame
+# output exists. See blame_output_exists.
+RETRY_SKIPPED="${CREGIT_RETRY_SKIPPED:-0}"
+# Empty means blobExec's defaults: factor 3, load limit = processor count.
+TIMEOUT_RETRY_FACTOR="${CREGIT_TIMEOUT_RETRY_FACTOR:-}"
+MAX_RETRIES="${CREGIT_MAX_RETRIES:-}"
+LOAD_LIMIT="${CREGIT_LOAD_LIMIT:-}"
 
 # Markers meaning "the work in $WORK is incomplete but recoverable, and a
 # FROM_STEP=1 wipe would throw away days of tokenizing to redo it". Written by
@@ -584,6 +617,38 @@ report_skipped_blobs() {
     log "  --strict-tokenize (or CREGIT_STRICT_TOKENIZE=1)."
 }
 
+# blame_file_count <max>: the number of .blame files in the blame output, stopping
+# at <max> (0 = no limit). Step 7 writes <work>/blame/<path>.blame. A re-blame made
+# on another machine arrives in <work>/blame-c100-incoming (see the pipeline
+# repository's receive-gcj-result.sh), and it counts too.
+blame_file_count() {
+    local max="${1:-0}" dirs=() d
+    for d in "$WORK/blame" "$WORK/blame-c100-incoming"; do
+        [ -d "$d" ] && dirs+=("$d")
+    done
+    [ "${#dirs[@]}" -gt 0 ] || { echo 0; return 0; }
+    if [ "$max" -gt 0 ]; then
+        find "${dirs[@]}" -type f -name '*.blame' 2>/dev/null | head -n "$max" | wc -l
+    else
+        find "${dirs[@]}" -type f -name '*.blame' 2>/dev/null | wc -l
+    fi
+}
+
+blame_output_exists() { [ "$(blame_file_count 1)" -gt 0 ]; }
+
+# report_held_timeouts: the warning for timed-out blobs that step 2 did not try
+# again because blame output exists. The skip file has one timeout row for each
+# retry_blob row: blobExec writes and removes the two together.
+report_held_timeouts() {
+    [ -s "$SKIPPED_TSV" ] || return 0
+    local n m
+    n=$(awk -F'\t' 'NR > 1 && $3 == "timeout" { c++ } END { print c + 0 }' "$SKIPPED_TSV")
+    [ "$n" -gt 0 ] || return 0
+    # Both directories, because drop_refold_derived_artifacts deletes both.
+    m=$(blame_file_count 0)
+    log "WARNING: $n timed-out blobs stay dropped (see $SKIPPED_TSV); --retry-skipped retries them and re-blames the project ($m .blame files would be deleted)."
+}
+
 # need_val <flag> <value...>: refuse a value-taking flag with no value.
 need_val() {
     [ $# -ge 2 ] || { echo "missing value for $1" >&2; usage; exit 2; }
@@ -606,6 +671,9 @@ while [ $# -gt 0 ]; do
         --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
         --strict-tokenize) STRICT_TOKENIZE=1; shift ;;
+        --retry-skipped)   RETRY_SKIPPED=1; shift ;;
+        --timeout-retry-factor) need_val "$@"; TIMEOUT_RETRY_FACTOR="$2"; shift 2 ;;
+        --max-retries) need_val "$@"; MAX_RETRIES="$2"; shift 2 ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
@@ -812,6 +880,26 @@ case "$STRICT_TOKENIZE" in
     0|1) ;;
     *) echo "invalid CREGIT_STRICT_TOKENIZE: '$STRICT_TOKENIZE' (want 0 or 1)" >&2; exit 2 ;;
 esac
+case "$RETRY_SKIPPED" in
+    0|1) ;;
+    *) echo "invalid CREGIT_RETRY_SKIPPED: '$RETRY_SKIPPED' (want 0 or 1)" >&2; exit 2 ;;
+esac
+if [ -n "$MAX_RETRIES" ]; then
+    case "$MAX_RETRIES" in
+        *[!0-9]*) echo "invalid --max-retries: '$MAX_RETRIES' (want a whole number from 0 to 100)" >&2; exit 2 ;;
+    esac
+    [ "$MAX_RETRIES" -le 100 ] || { echo "invalid --max-retries: '$MAX_RETRIES' (want a whole number from 0 to 100)" >&2; exit 2; }
+fi
+if [ -n "$LOAD_LIMIT" ]; then
+    case "$LOAD_LIMIT" in
+        *[!0-9.]*|*.*.*|.|'') echo "invalid CREGIT_LOAD_LIMIT: '$LOAD_LIMIT' (want a number >= 0)" >&2; exit 2 ;;
+    esac
+fi
+if [ -n "$TIMEOUT_RETRY_FACTOR" ]; then
+    case "$TIMEOUT_RETRY_FACTOR" in
+        *[!0-9]*) echo "invalid --timeout-retry-factor: '$TIMEOUT_RETRY_FACTOR' (want a whole number >= 0)" >&2; exit 2 ;;
+    esac
+fi
 
 # The target repository is mandatory (only --build-only runs without one).
 if [ "$BUILD_ONLY" = 0 ]; then
@@ -1195,6 +1283,10 @@ echo ""
 # cregit bare repo (where blob_map's new_blob ids live), the blob map itself, and
 # the memo. Those four are the entire point of the flag.
 #
+# blame-c100-incoming is a re-blame made on another machine and not yet swapped in
+# (receive-gcj-result.sh in the pipeline repository). It names the commits of
+# before the re-fold just as blame/ does, so it goes too.
+#
 # Named paths only. No globs, and never $WORK itself — the wipe of $WORK is the
 # expensive mistake this whole script is defended against.
 drop_refold_derived_artifacts() {  # $1 = which flag is asking, for the log
@@ -1205,6 +1297,7 @@ drop_refold_derived_artifacts() {  # $1 = which flag is asking, for the log
     local _stale
     for _stale in \
         "$WORK/blame" \
+        "$WORK/blame-c100-incoming" \
         "$WORK/html" \
         "$REPO_PATH_ORIGINAL" \
         "$REPO_PATH_CREGIT" \
@@ -1326,7 +1419,22 @@ else
   fi
   STRICT_FLAG=""
   [ "$STRICT_TOKENIZE" = 1 ] && STRICT_FLAG="--strict-tokenize"
-  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG $STRICT_FLAG \
+  # The retry of earlier timeouts folds all of history again when a blob
+  # recovers, and that makes all blame output out of date. So it runs by itself
+  # only while there is no blame to lose; after that, only on --retry-skipped.
+  HOLD_RETRY_FLAG=""
+  if blame_output_exists; then
+      if [ "$RETRY_SKIPPED" = 1 ]; then
+          log "--retry-skipped: blame output exists, and earlier timeouts are tried again anyway;"
+          log "  a recovered blob deletes $WORK/blame and step 7 blames the project again."
+      else
+          HOLD_RETRY_FLAG="--no-retry-timed-out"
+      fi
+  fi
+  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG $STRICT_FLAG $HOLD_RETRY_FLAG \
+    ${MAX_RETRIES:+--max-retries=$MAX_RETRIES} \
+    ${TIMEOUT_RETRY_FACTOR:+--timeout-retry-factor=$TIMEOUT_RETRY_FACTOR} \
+    ${LOAD_LIMIT:+--load-limit=$LOAD_LIMIT} \
     "--skipped-tsv=$SKIPPED_TSV" \
     "--refold-marker=$REFOLD_MARKER" \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
@@ -1365,6 +1473,7 @@ if [ -n "$RETOKENIZE" ]; then
 fi
 
 report_skipped_blobs
+[ -n "${HOLD_RETRY_FLAG:-}" ] && report_held_timeouts
 
 pack_cregit_repo
 fi
