@@ -158,16 +158,21 @@ def commit_runs(con):
                    generate_subscripts(string_split(token_ids, ','), 1) AS pos
             FROM r)
         SELECT t.sha, t.run_no, t.kind, t.whole_file, t.file_path, t.tid,
-               tok.token
-        -- tokens has one row per mainline interval; a token with two
-        -- intervals must still be one place in its run
-        FROM t JOIN (SELECT DISTINCT file_path, token_id, token
-                     FROM tokens) tok
+               tok.token, t.pos
+        FROM t JOIN tokens tok
           ON tok.file_path = t.file_path AND tok.token_id = t.tid
         ORDER BY t.sha, t.run_no, t.pos""")
-    sha, runs, texts, cur_run = None, [], {}, None
+    # tokens has one row per mainline interval, so a token with two
+    # intervals comes twice at one place of its run. The rows of one place
+    # are next to each other (the sort), and a token id has one text, so
+    # keeping the first row of each place is a DISTINCT that costs no
+    # memory (a DISTINCT over the 408 M kernel token rows does not fit).
+    sha, runs, texts, cur_run, last = None, [], {}, None, None
     while batch := cur.fetchmany(100_000):
-        for s, run_no, kind, whole, path, tid, token in batch:
+        for s, run_no, kind, whole, path, tid, token, pos in batch:
+            if (s, run_no, pos) == last:
+                continue
+            last = (s, run_no, pos)
             if s != sha:
                 if sha is not None:
                     yield sha, runs, texts
