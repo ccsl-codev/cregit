@@ -1,0 +1,57 @@
+import argparse
+
+import pytest
+
+from replay import NULL_BLOB, GitError, diff_hunks, git_out
+from test_replay import commit, git, write
+from token_history import list_paths, mainline_changes, merge_parents
+
+
+@pytest.fixture
+def not_a_repo(tmp_path):
+    d = tmp_path / "empty"
+    d.mkdir()
+    return str(d)
+
+
+def test_git_failures_stop_the_run(not_a_repo):
+    # Before, each of these returned empty data and the run went on with
+    # no mainline intervals, no merges or no paths, and 0 errors.
+    with pytest.raises(GitError):
+        merge_parents(not_a_repo)
+    with pytest.raises(GitError):
+        mainline_changes(not_a_repo, [])
+    with pytest.raises(GitError):
+        list_paths(argparse.Namespace(paths=None, repo=not_a_repo,
+                                      pathspec=[]))
+
+
+def test_an_expected_non_zero_exit_is_accepted(not_a_repo):
+    assert git_out(not_a_repo, "rev-parse", "-q", "--verify", "x:y",
+                   check=False) == ""
+
+
+def test_the_null_blob_diffs_to_no_hunks(tmp_path):
+    r = tmp_path / "r"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    write(r, "a.c", ["x", "y"])
+    commit(r, "a", "2020-01-01T00:00:00")
+    blob = git(r, "rev-parse", "HEAD:a.c").strip()
+    assert diff_hunks(str(r), blob, NULL_BLOB) == []
+    assert diff_hunks(str(r), NULL_BLOB, blob) == []
+    with pytest.raises(GitError):
+        diff_hunks(str(r), blob, "1" * 40)
+
+
+def test_a_good_repo_still_works(tmp_path):
+    r = tmp_path / "r"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    write(r, "a.c", ["x"])
+    sha = commit(r, "a", "2020-01-01T00:00:00")
+    assert merge_parents(str(r)) == {}
+    assert list(mainline_changes(str(r), [])) == ["a.c"]
+    assert mainline_changes(str(r), [])["a.c"][0][0] == sha
+    assert list_paths(argparse.Namespace(paths=None, repo=str(r),
+                                         pathspec=[])) == ["a.c"]

@@ -22,8 +22,8 @@ import traceback
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from replay import (HEADER, NULL_BLOB, PathReplay, git_out,  # noqa: E402
-                    parse_hunks, parse_log, path_log)
+from replay import (HEADER, NULL_BLOB, GitError, PathReplay,  # noqa: E402
+                    diff_hunks, git_out, parse_log, path_log)
 
 MASK = re.compile(r"\.[ch]$")
 SEP = "\x1f"
@@ -48,7 +48,8 @@ def mainline_changes(repo, pathspec):
         ["git", "-C", repo, "log", "--first-parent", "--reverse", "-m",
          "--raw", "--no-abbrev", "--no-renames", f"--format={HEADER}%H %ct",
          "HEAD", "--", *pathspec],
-        stdout=subprocess.PIPE, text=True, errors="replace")
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        errors="replace")
     changes, sha, ct = {}, None, 0
     for line in proc.stdout:
         if line.startswith(HEADER):
@@ -58,7 +59,10 @@ def mainline_changes(repo, pathspec):
             meta, path = line.rstrip("\n").split("\t", 1)
             if MASK.search(path):
                 changes.setdefault(path, []).append((sha, ct, meta.split()[3]))
-    proc.wait()
+    # a failed git log would leave every path with no mainline interval,
+    # and the run would still end with 0 errors
+    if proc.wait():
+        raise GitError(f"git log --first-parent exited {proc.returncode}")
     return changes
 
 
@@ -82,8 +86,7 @@ class GitSource:
         return out if len(out) == 40 else NULL_BLOB
 
     def diff_blobs(self, a, b):
-        return parse_hunks(git_out(self.repo, "diff", "-U0", "--no-color",
-                                   a, b))
+        return diff_hunks(self.repo, a, b)
 
     def replay(self, path, mainline, run_min_alnum):
         self.path = path

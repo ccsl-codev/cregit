@@ -72,9 +72,27 @@ def parse_log(text):
     return commits
 
 
-def git_out(repo, *args):
-    return subprocess.run(["git", "-C", repo, *args], capture_output=True,
-                          text=True, errors="replace").stdout
+class GitError(RuntimeError):
+    """git exited with an error: the caller must not go on with no data."""
+
+
+def git_out(repo, *args, check=True):
+    """The output of one git command. check=False accepts a non-zero exit
+    (for example rev-parse --verify of a missing object)."""
+    proc = subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                          text=True, errors="replace")
+    if check and proc.returncode:
+        raise GitError(f"git {' '.join(args[:3])} exited {proc.returncode}: "
+                       f"{proc.stderr.strip()[:300]}")
+    return proc.stdout
+
+
+def diff_hunks(repo, a, b):
+    """The hunks from blob a to blob b. A null blob gives no hunks: git
+    cannot diff it, and the replay treats that case as no change."""
+    if NULL_BLOB in (a, b):
+        return []
+    return parse_hunks(git_out(repo, "diff", "-U0", "--no-color", a, b))
 
 
 def parse_hunks(diff_text):
@@ -85,10 +103,10 @@ def real_parent_sources(repo, path):
     """Real parents, blobs and blob diffs straight from git, one call each."""
     def blob_at(sha):
         return git_out(repo, "rev-parse", "-q", "--verify",
-                       f"{sha}:{path}").strip() or NULL_BLOB
+                       f"{sha}:{path}", check=False).strip() or NULL_BLOB
 
     def diff_blobs(a, b):
-        return parse_hunks(git_out(repo, "diff", "-U0", "--no-color", a, b))
+        return diff_hunks(repo, a, b)
 
     return dict(real_parents=lambda sha: git_out(
                     repo, "log", "-1", "--format=%P", sha).split(),
