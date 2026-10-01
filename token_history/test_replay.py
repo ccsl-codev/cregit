@@ -266,3 +266,37 @@ def test_merge_that_brings_a_new_file_to_main(tmp_path):
                     **real_parent_sources(str(r), "n.c")).run()
     born, _ = tip_born(rp, r, "n.c")
     assert born == blame(r, "n.c")
+
+
+def test_path_log_drops_a_merge_that_brings_no_change(tmp_path):
+    # --simplify-merges: a side branch that never touches the path adds no
+    # merge to its log, so no merge is replayed for nothing
+    r = tmp_path / "r"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    write(r, "a.c", ["a"])
+    commit(r, "base", "2020-01-01T00:00:00")
+    git(r, "checkout", "-q", "-b", "side")
+    write(r, "o.c", ["o"])
+    commit(r, "side", "2020-01-02T00:00:00")
+    git(r, "checkout", "-q", "main")
+    write(r, "a.c", ["a", "m"])
+    commit(r, "main", "2020-01-03T00:00:00")
+    git(r, "merge", "-q", "--no-ff", "-m", "merge", "side")
+    assert [len(c.parents) for c in parse_log(path_log(str(r), "a.c"))] \
+        == [0, 1]
+
+
+def test_a_commit_with_no_diff_keeps_the_parent_blob():
+    # git log can list a commit with no diff for the path; it has the
+    # parent's content, not an empty file
+    a, b = "a" * 40, "b" * 40
+    blob = "1" * 40
+    text = (f"\x01{a} \t1\n:000000 100644 {NULL_BLOB} {blob} A\ta.c\n"
+            "@@ -0,0 +1,2 @@\n+x\n+y\n"
+            f"\x01{b} {a}\t2\n")
+    commits = parse_log(text)
+    rp = PathReplay(commits)
+    rp.run()
+    assert commits[1].blob == blob
+    assert rp.state[b] == rp.state[a]

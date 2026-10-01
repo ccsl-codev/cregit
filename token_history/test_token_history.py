@@ -55,3 +55,13 @@ def test_a_good_repo_still_works(tmp_path):
     assert mainline_changes(str(r), [])["a.c"][0][0] == sha
     assert list_paths(argparse.Namespace(paths=None, repo=str(r),
                                          pathspec=[])) == ["a.c"]
+
+
+def test_an_error_in_one_path_is_a_record_not_a_stop(monkeypatch):
+    import token_history
+
+    def broken(path):
+        raise ValueError("bad path")
+    monkeypatch.setattr(token_history, "replay_path", broken)
+    r = token_history.work("a.c")
+    assert r["path"] == "a.c" and "ValueError" in r["error"]
