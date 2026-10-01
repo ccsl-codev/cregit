@@ -159,7 +159,10 @@ def commit_runs(con):
             FROM r)
         SELECT t.sha, t.run_no, t.kind, t.whole_file, t.file_path, t.tid,
                tok.token
-        FROM t JOIN tokens tok
+        -- tokens has one row per mainline interval; a token with two
+        -- intervals must still be one place in its run
+        FROM t JOIN (SELECT DISTINCT file_path, token_id, token
+                     FROM tokens) tok
           ON tok.file_path = t.file_path AND tok.token_id = t.tid
         ORDER BY t.sha, t.run_no, t.pos""")
     sha, runs, texts, cur_run = None, [], {}, None
