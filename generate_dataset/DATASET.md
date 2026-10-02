@@ -461,9 +461,26 @@ persons.db ─────────────┤
 
 For each `.blame` file:
 1. Parse each line as `commit_sha;token_content`
-2. Walk through the original source file character-by-character to match tokens
-3. Classify each token (structural vs content, type, value)
-4. Insert into SQLite `token_map`
+2. Repair the token line (see below)
+3. Walk through the original source file character-by-character to match tokens
+4. Classify each token (structural vs content, type, value)
+5. Insert into SQLite `token_map`
+
+The walk consumes one source character per token character. So a token line
+with wrong text also moves `source_line`, `source_col` and `source_text` of
+every later token in the file. Step 2 corrects three such defects before the
+walk:
+
+| Defect | Files | Repair |
+| --- | --- | --- |
+| The prebuilt srcML 1.1.0 binary reads UTF-8 as Latin-1 (`ö` becomes `Ã¶`) | not `.rs`, no byte-order mark, strict UTF-8 | a token that holds a lead-byte/continuation-byte pair, and that decodes as UTF-8 after a Latin-1 encode, gets the decoded text |
+| The Rust tokenizer writes `line:col<TAB>` (also `N:-` and `-:-`) before each line | all | the prefix is removed |
+| The tokenizers drop a byte-order mark, but the source read kept it | all | the source is read as `utf-8-sig` |
+
+The run prints the three counts on the `Repaired:` line. A file outside the
+gate of the first row keeps the token text as the tokenizer wrote it: in a
+`.rs` or byte-order-mark file the text is already correct, and in a file that
+is not UTF-8 the true text is unknown.
 
 ### Phase 2: DuckDB JOIN → Parquet
 
