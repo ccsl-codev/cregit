@@ -24,7 +24,7 @@ from generate_dataset import (DEFAULT_MEMORY_LIMIT, FIRM_FIELDS,
                               check_key_is_unique, firm_sql, is_ws,
                               load_project_meta, parse_memory_limit,
                               process_blame_file, project_meta_sql,
-                              skip_comment, skip_literal, skip_token,
+                              repair_token_line, skip_comment, skip_literal, skip_token,
                               sql_literal, undo_mojibake)
 
 
@@ -915,3 +915,30 @@ def test_the_repairs_are_counted(tmp_path):
          stats=stats)
     walk(tmp_path, "b.c", b"\xef\xbb\xbfint\n", "keyword|int", stats=stats)
     assert stats == Counter(mojibake_tokens=1, position_prefix=2, bom_files=1)
+
+
+def test_a_line_from_the_fixed_rust_tokenizer_is_kept(tmp_path):
+    # The tokenizer no longer writes the prefix without --position. Such a
+    # line must pass unchanged: the repair removes text, it never moves a
+    # position by a fixed amount.
+    stats = Counter()
+    rows = walk(tmp_path, "m.rs", b"fn main\n",
+                "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1",
+                "keyword|fn", "identifier|main", "end_unit", stats=stats)
+    assert [r[0] for r in rows] == ["begin_unit", "keyword", "identifier",
+                                    "end_unit"]
+    assert [r[3:5] for r in rows[1:3]] == [(1, 1), (1, 4)]
+    assert stats["position_prefix"] == 0
+
+
+@pytest.mark.parametrize("line, repairable, expected", [
+    ("12:5\tkeyword|fn", False, "keyword|fn"),
+    ("12:-\tDECL|fn|f", False, "DECL|fn|f"),
+    ("-:-\tend_unit", False, "end_unit"),
+    ("keyword|fn", False, "keyword|fn"),
+    ("comment|HÃ¶", True, "comment|Hö"),
+    ("comment|HÃ¶", False, "comment|HÃ¶"),
+    ("12:5|keyword|fn", False, "12:5|keyword|fn"),  # --position form: a pipe
+])
+def test_repair_token_line(line, repairable, expected):
+    assert repair_token_line(line, repairable, Counter()) == expected

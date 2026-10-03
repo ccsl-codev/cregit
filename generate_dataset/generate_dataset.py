@@ -350,6 +350,27 @@ def read_source(source_path: Path) -> tuple[str, bool, bool]:
     return text, has_bom, repairable
 
 
+def repair_token_line(token_content: str, repairable: bool,
+                      stats: Counter) -> str:
+    """Return the token line with the Rust position prefix removed and, when
+    `repairable`, the srcML mojibake undone. Count each repair in `stats`.
+
+    This must run before classify_and_skip: the walk consumes one source
+    character per token character, so a wrong token text also moves every
+    later position in the file.
+    """
+    prefix = _POSITION_PREFIX.match(token_content)
+    if prefix:
+        stats["position_prefix"] += 1
+        token_content = token_content[prefix.end():]
+    if repairable and _MOJIBAKE.search(token_content):
+        fixed = undo_mojibake(token_content)
+        if fixed != token_content:
+            stats["mojibake_tokens"] += 1
+            token_content = fixed
+    return token_content
+
+
 def process_blame_file(
     blame_path: Path, source_path: Path, rel_path: str, db_cursor,
     stats: Counter | None = None,
@@ -375,19 +396,7 @@ def process_blame_file(
                 continue
             commit_sha, token_content = parsed
 
-            # Both repairs run before classify_and_skip, because the walk
-            # consumes one source character per token character: a wrong
-            # token text also moves every later position.
-            prefix = _POSITION_PREFIX.match(token_content)
-            if prefix:
-                stats["position_prefix"] += 1
-                token_content = token_content[prefix.end():]
-            if repairable and _MOJIBAKE.search(token_content):
-                fixed = undo_mojibake(token_content)
-                if fixed != token_content:
-                    stats["mojibake_tokens"] += 1
-                    token_content = fixed
-
+            token_content = repair_token_line(token_content, repairable, stats)
             info = classify_and_skip(token_content, reader)
             counted[0] += 1
             yield (
