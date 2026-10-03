@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 
 import pytest
 
@@ -22,8 +23,9 @@ from generate_dataset import (DEFAULT_MEMORY_LIMIT, FIRM_FIELDS,
                               PROJECT_META_FIELDS, SourceReader,
                               check_key_is_unique, firm_sql, is_ws,
                               load_project_meta, parse_memory_limit,
-                              project_meta_sql, skip_comment, skip_literal,
-                              skip_token, sql_literal)
+                              process_blame_file, project_meta_sql,
+                              repair_token_line, skip_comment, skip_literal, skip_token,
+                              sql_literal, undo_mojibake)
 
 
 def reader(text: str) -> SourceReader:
@@ -794,3 +796,149 @@ def test_a_missing_canonical_table_stops_the_run_before_phase_1(
         run_main(monkeypatch, tmp_path,
                  argv_extra=("--firm-map", str(firm_map),
                              "--firm-canonical", str(tmp_path / "absent.csv")))
+
+
+# --------------------------------------------------------------------------- #
+# Token-line repairs before the source walk: srcML mojibake, the Rust position
+# prefix, and the byte-order mark. Each one moved the walk, so each test checks
+# the text and the position of the token after the defect.
+# --------------------------------------------------------------------------- #
+
+def walk(tmp_path, name, source: bytes, *token_lines, stats=None):
+    """Run process_blame_file on one file and return its token_map rows."""
+    (tmp_path / name).write_bytes(source)
+    blame = tmp_path / f"{name}.blame"
+    blame.write_text("".join(f"{SHA};;\t{t}\n" for t in token_lines),
+                     encoding="utf-8")
+    con = sqlite3.connect(":memory:")
+    con.execute("""CREATE TABLE token_map (file_path TEXT, token_index INTEGER,
+        commit_sha CHAR(40), token_type TEXT, token_value TEXT,
+        source_text TEXT, source_line INTEGER, source_col INTEGER,
+        is_structural INTEGER, func_name TEXT)""")
+    process_blame_file(blame, tmp_path / name, name, con.cursor(), stats)
+    return con.execute("""SELECT token_type, token_value, source_text,
+        source_line, source_col, is_structural FROM token_map
+        ORDER BY token_index""").fetchall()
+
+
+C_SOURCE = "/* Högskolan */\nint x;\n".encode()
+C_MOJIBAKE = ("comment|/* HÃ¶gskolan */", "keyword|int", "name|x",
+              "operator|;")
+
+
+def test_undo_mojibake_restores_the_utf8_text():
+    assert undo_mojibake("HÃ¶gskolan") == "Högskolan"
+    assert undo_mojibake("â\x80\x94") == "\u2014"
+
+
+@pytest.mark.parametrize("text", [
+    "Högskolan",      # correct text: o-umlaut is above the lead-byte range
+    "é¿",             # a lead byte with too few continuation bytes
+    "ĀÃ¶",            # a character above U+00FF cannot be Latin-1
+    "plain ascii",
+])
+def test_undo_mojibake_leaves_other_text_alone(text):
+    assert undo_mojibake(text) == text
+
+
+def test_a_mojibake_token_gets_the_true_text_and_the_walk_stays_aligned(tmp_path):
+    rows = walk(tmp_path, "a.c", C_SOURCE, *C_MOJIBAKE)
+    assert rows[0][1] == "/* Högskolan */"
+    assert rows[0][2].startswith("/* Högskolan */")
+    # The next token is where the source has it: line 2, column 1.
+    assert rows[1][1:5] == ("int", "int ", 2, 1)
+    assert rows[2][3:5] == (2, 5)
+
+
+def test_a_correct_token_is_not_changed(tmp_path):
+    rows = walk(tmp_path, "a.c", C_SOURCE, "comment|/* Högskolan */",
+                *C_MOJIBAKE[1:])
+    assert rows[0][1] == "/* Högskolan */"
+    assert rows[1][3:5] == (2, 1)
+
+
+@pytest.mark.parametrize("name, source", [
+    # srcML decodes a BOM file correctly, so the pair is the true text.
+    ("a.c", b"\xef\xbb\xbf/* H\xc3\x83\xc2\xb6 */\nint x;\n"),
+    # Not UTF-8: nothing tells what the true text is.
+    ("a.c", b"/* H\xc3\xb6 \xff */\nint x;\n"),
+    # The Rust tokenizer does not use srcML.
+    ("a.rs", "/* HÃ¶ */\nint x;\n".encode()),
+])
+def test_the_gate_keeps_a_matching_token_as_it_is(tmp_path, name, source):
+    rows = walk(tmp_path, name, source, "comment|/* HÃ¶ */", "keyword|int")
+    assert rows[0][1] == "/* HÃ¶ */"
+
+
+def test_a_rust_line_loses_its_position_prefix(tmp_path):
+    rows = walk(tmp_path, "m.rs", b"fn main() {}\n",
+                "-:-\tbegin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1",
+                "1:1\tkeyword|fn", "1:4\tidentifier|main", "1:8\top|(",
+                "1:9\top|)", "1:11\top|{", "1:12\top|}", "-:-\tend_unit")
+    assert [r[0] for r in rows] == ["begin_unit", "keyword", "identifier",
+                                    "op", "op", "op", "op", "end_unit"]
+    assert rows[0][5] == 1 and rows[-1][5] == 1
+    # The walk now agrees with the position the tokenizer wrote.
+    assert [r[3:5] for r in rows[1:7]] == [(1, 1), (1, 4), (1, 8), (1, 9),
+                                           (1, 11), (1, 12)]
+    assert rows[2][2] == "main"
+
+
+def test_a_decl_line_prefix_is_removed_too(tmp_path):
+    rows = walk(tmp_path, "m.rs", b"fn f\n", "1:-\tDECL|fn|f",
+                "1:1\tkeyword|fn")
+    assert rows[0][0] == "DECL"
+    assert rows[1][3:5] == (1, 1)
+
+
+def test_a_c_line_that_starts_with_digits_is_kept(tmp_path):
+    rows = walk(tmp_path, "a.c", b"1\n", "literal|1")
+    assert rows[0][:2] == ("literal", "1")
+
+
+def test_a_byte_order_mark_does_not_move_the_walk(tmp_path):
+    rows = walk(tmp_path, "a.c", b"\xef\xbb\xbfint x;\n", "keyword|int",
+                "name|x", "operator|;")
+    assert rows[0][2:5] == ("int ", 1, 1)
+    assert rows[1][2:5] == ("x", 1, 5)
+
+
+def test_windows_line_ends_still_read_as_one_newline(tmp_path):
+    rows = walk(tmp_path, "a.c", b"int\r\nx;\r\n", "keyword|int", "name|x")
+    assert rows[1][3:5] == (2, 1)
+
+
+def test_the_repairs_are_counted(tmp_path):
+    stats = Counter()
+    walk(tmp_path, "a.c", C_SOURCE, *C_MOJIBAKE, stats=stats)
+    walk(tmp_path, "m.rs", b"fn\n", "1:1\tkeyword|fn", "-:-\tend_unit",
+         stats=stats)
+    walk(tmp_path, "b.c", b"\xef\xbb\xbfint\n", "keyword|int", stats=stats)
+    assert stats == Counter(mojibake_tokens=1, position_prefix=2, bom_files=1)
+
+
+def test_a_line_from_the_fixed_rust_tokenizer_is_kept(tmp_path):
+    # The tokenizer no longer writes the prefix without --position. Such a
+    # line must pass unchanged: the repair removes text, it never moves a
+    # position by a fixed amount.
+    stats = Counter()
+    rows = walk(tmp_path, "m.rs", b"fn main\n",
+                "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1",
+                "keyword|fn", "identifier|main", "end_unit", stats=stats)
+    assert [r[0] for r in rows] == ["begin_unit", "keyword", "identifier",
+                                    "end_unit"]
+    assert [r[3:5] for r in rows[1:3]] == [(1, 1), (1, 4)]
+    assert stats["position_prefix"] == 0
+
+
+@pytest.mark.parametrize("line, repairable, expected", [
+    ("12:5\tkeyword|fn", False, "keyword|fn"),
+    ("12:-\tDECL|fn|f", False, "DECL|fn|f"),
+    ("-:-\tend_unit", False, "end_unit"),
+    ("keyword|fn", False, "keyword|fn"),
+    ("comment|HÃ¶", True, "comment|Hö"),
+    ("comment|HÃ¶", False, "comment|HÃ¶"),
+    ("12:5|keyword|fn", False, "12:5|keyword|fn"),  # --position form: a pipe
+])
+def test_repair_token_line(line, repairable, expected):
+    assert repair_token_line(line, repairable, Counter()) == expected

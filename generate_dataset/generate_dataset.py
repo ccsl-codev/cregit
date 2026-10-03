@@ -25,12 +25,14 @@ Usage:
 """
 
 import argparse
+import io
 import logging
 import os
 import re
 import sqlite3
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -293,14 +295,93 @@ def parse_blame_line(line: str) -> tuple[str, str] | None:
     return commit_sha, token_content
 
 
+# The Rust tokenizer puts its position and a TAB before every token line:
+# `5:7<TAB>identifier|x`, `N:-` on a DECL line, `-:-` on a unit marker. The
+# pipeline never asks for positions, and classify_and_skip splits on the first
+# pipe, so the prefix went into token_type and the walk skipped its length as
+# well. Nothing else writes a line that starts with digits, a colon and a TAB.
+_POSITION_PREFIX = re.compile(r"^(?:\d+|-):(?:\d+|-)\t")
+
+# The prebuilt srcML 1.1.0 binary reads UTF-8 source as Latin-1: `ö` (C3 B6)
+# comes out as the two characters `Ã¶`. A UTF-8 lead byte read as Latin-1 lies
+# in U+00C2..U+00F4, and a continuation byte in U+0080..U+00BF. Text the build
+# wrote correctly almost never holds that pair, and undo_mojibake also needs
+# the whole token to decode as UTF-8 before it changes anything.
+_MOJIBAKE = re.compile("[Â-ô][\u0080-¿]")
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def undo_mojibake(text: str) -> str:
+    """Return the UTF-8 text that srcML misread as Latin-1, or `text` as is."""
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
+def read_source(source_path: Path) -> tuple[str, bool, bool]:
+    """Read a source file for the walk. Return its text, whether it started
+    with a byte-order mark, and whether the mojibake repair can apply to its
+    tokens.
+
+    The text loses a leading byte-order mark. The tokenizers drop it, so a
+    BOM kept as a character puts the walk one character ahead to the end of
+    the file.
+
+    The repair applies only when the file is strict UTF-8, has no BOM and is
+    not Rust. srcML decodes a BOM file correctly, and the Rust tokenizer does
+    not use srcML. In those files, and in a file that is not UTF-8, a token
+    that matches _MOJIBAKE is the true text.
+    """
+    raw = source_path.read_bytes()
+    has_bom = raw.startswith(_UTF8_BOM)
+    try:
+        raw.decode("utf-8")
+        strict = True
+    except UnicodeDecodeError:
+        strict = False
+    # TextIOWrapper, not raw.decode: it keeps the newline translation of the
+    # text-mode open() that this replaces, so all other files read the same.
+    with io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8-sig",
+                          errors="replace") as f:
+        text = f.read()
+    repairable = strict and not has_bom and not str(source_path).endswith(".rs")
+    return text, has_bom, repairable
+
+
+def repair_token_line(token_content: str, repairable: bool,
+                      stats: Counter) -> str:
+    """Return the token line with the Rust position prefix removed and, when
+    `repairable`, the srcML mojibake undone. Count each repair in `stats`.
+
+    This must run before classify_and_skip: the walk consumes one source
+    character per token character, so a wrong token text also moves every
+    later position in the file.
+    """
+    prefix = _POSITION_PREFIX.match(token_content)
+    if prefix:
+        stats["position_prefix"] += 1
+        token_content = token_content[prefix.end():]
+    if repairable and _MOJIBAKE.search(token_content):
+        fixed = undo_mojibake(token_content)
+        if fixed != token_content:
+            stats["mojibake_tokens"] += 1
+            token_content = fixed
+    return token_content
+
+
 def process_blame_file(
-    blame_path: Path, source_path: Path, rel_path: str, db_cursor
+    blame_path: Path, source_path: Path, rel_path: str, db_cursor,
+    stats: Counter | None = None,
 ) -> int:
     with open(blame_path, encoding="utf-8", errors="replace") as f:
         blame_lines = f.readlines()
 
-    with open(source_path, encoding="utf-8", errors="replace") as f:
-        source_text = f.read()
+    source_text, has_bom, repairable = read_source(source_path)
+    if stats is None:
+        stats = Counter()
+    stats["bom_files"] += has_bom
 
     reader = SourceReader(source_text)
     counted = [0]
@@ -315,6 +396,7 @@ def process_blame_file(
                 continue
             commit_sha, token_content = parsed
 
+            token_content = repair_token_line(token_content, repairable, stats)
             info = classify_and_skip(token_content, reader)
             counted[0] += 1
             yield (
@@ -727,6 +809,7 @@ def main():
     cursor = sync_conn.cursor()
     total_tokens = 0
     files_processed = 0
+    repairs = Counter()
 
     for bf in blame_files:
         rel = bf.relative_to(blame_root)
@@ -741,7 +824,7 @@ def main():
 
         if args.verbose:
             print(f"  {bf.name} -> {rel_str}")
-        count = process_blame_file(bf, source_path, rel_str, cursor)
+        count = process_blame_file(bf, source_path, rel_str, cursor, repairs)
         total_tokens += count
         files_processed += 1
 
@@ -758,6 +841,9 @@ def main():
     sync_conn.close()
 
     print(f"Synced {files_processed} files, {total_tokens} tokens")
+    print(f"Repaired: {repairs['mojibake_tokens']} mojibake tokens, "
+          f"{repairs['position_prefix']} position prefixes, "
+          f"{repairs['bom_files']} files with a byte-order mark")
 
     if total_tokens == 0:
         print("ERROR: no tokens processed, nothing to output", file=sys.stderr)

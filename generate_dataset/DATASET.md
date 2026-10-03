@@ -461,9 +461,10 @@ persons.db ─────────────┤
 
 For each `.blame` file:
 1. Parse each line as `commit_sha;token_content`
-2. Walk through the original source file character-by-character to match tokens
-3. Classify each token (structural vs content, type, value)
-4. Insert into SQLite `token_map`
+2. Repair non-ASCII conversion problems and correct .rs token placements directly into the dataset
+3. Walk through the original source file character-by-character to match tokens
+4. Classify each token (structural vs content, type, value)
+5. Insert into SQLite `token_map`
 
 ### Phase 2: DuckDB JOIN → Parquet
 
