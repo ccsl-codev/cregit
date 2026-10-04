@@ -33,25 +33,25 @@ TYPES = dict(token_id="BIGINT", born_in_merge="INTEGER", copy_of="BIGINT",
 MAX_LINE = 16_000_000
 
 
-def read_tsv(con, name, pattern, columns, key=None):
-    """Load TSV parts; drop repeated rows (a path written twice by a resume).
-
-    key: the columns that identify a row; the full-row DISTINCT runs only
-    when they repeat, since it is costly on a whole kernel.
-    """
+def read_tsv(con, name, pattern, columns):
+    """Load TSV parts. A run that stopped after the rows of a path, before
+    paths-done.txt, writes the path again on resume, in a new part file:
+    keep each path from one file only, the one with the most rows."""
     cols = ", ".join(f"'{c}': '{TYPES.get(c, 'VARCHAR')}'" for c in columns)
     keep_text = ", force_not_null=['token']" if "token" in columns else ""
     con.execute(f"""
         CREATE TABLE {name} AS SELECT * FROM read_csv(
             '{pattern}', delim='{SEP}', header=false, quote='', escape='',
             nullstr='', auto_detect=false, max_line_size={MAX_LINE}{keep_text},
-            columns={{{cols}}})""")
-    key = ", ".join(key or columns)
-    rows, keys = con.execute(f"SELECT count(*), count(DISTINCT ({key})) "
-                             f"FROM {name}").fetchone()
-    if rows != keys:
-        con.execute(f"CREATE OR REPLACE TABLE {name} AS "
-                    f"SELECT DISTINCT * FROM {name}")
+            filename=true, columns={{{cols}}})""")
+    con.execute(f"""
+        DELETE FROM {name} t USING (
+            SELECT file_path, arg_max(filename, n) AS keep
+            FROM (SELECT file_path, filename, count(*) AS n
+                  FROM {name} GROUP BY ALL)
+            GROUP BY file_path HAVING count(*) > 1) d
+        WHERE t.file_path = d.file_path AND t.filename <> d.keep""")
+    con.execute(f"ALTER TABLE {name} DROP COLUMN filename")
 
 
 def resolve_origins(con):
@@ -187,8 +187,7 @@ def commit_runs(con):
 
 
 def load(con, out):
-    read_tsv(con, "tokens", os.path.join(out, "part-*.tsv"), COLUMNS,
-             key=["file_path", "token_id", "mainline_in_sha"])
+    read_tsv(con, "tokens", os.path.join(out, "part-*.tsv"), COLUMNS)
     if glob.glob(os.path.join(out, "runs-*.tsv")):
         read_tsv(con, "runs", os.path.join(out, "runs-*.tsv"), RUN_COLUMNS)
     else:

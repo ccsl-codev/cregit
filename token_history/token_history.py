@@ -117,13 +117,14 @@ WORKER = {}
 
 
 def init_worker(repo, merges, changes, out_dir, run_min_alnum):
-    pid = os.getpid()
+    # unique per worker, even when a later run reuses a pid
+    tag = f"{os.getpid()}-{time.time_ns()}"
     WORKER.update(
         src=GitSource(repo, merges), changes=changes,
         run_min_alnum=run_min_alnum,
-        out=open(os.path.join(out_dir, f"part-{pid}.tsv"), "a",
+        out=open(os.path.join(out_dir, f"part-{tag}.tsv"), "a",
                  encoding="utf-8"),
-        runs=open(os.path.join(out_dir, f"runs-{pid}.tsv"), "a",
+        runs=open(os.path.join(out_dir, f"runs-{tag}.tsv"), "a",
                   encoding="utf-8"))
 
 
