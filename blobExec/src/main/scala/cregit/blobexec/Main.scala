@@ -71,11 +71,11 @@ object Main {
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--tokenizer-worker <path>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--tokenizer-worker=<path>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
-      |  --tokenizer-worker <path>
+      |  --tokenizer-worker=<path>
       |                    keep one protocol-speaking tokenizer process alive per
       |                    available processor and route blob requests through it.
       |                    The worker receives BFG_MEMO_DIR and BFG_TOKENIZE_CMD
@@ -141,30 +141,14 @@ object Main {
       |""".stripMargin
 
   def main(args: Array[String]): Unit = {
-    val remainingArgs = Vector.newBuilder[String]
-    var tokenizerWorkerPath: Option[java.nio.file.Path] = None
-    var argIndex = 0
-    while (argIndex < args.length) {
-      if (args(argIndex) == "--tokenizer-worker") {
-        if (tokenizerWorkerPath.isDefined || argIndex + 1 >= args.length) {
-          System.err.println("Error: --tokenizer-worker requires exactly one path")
-          System.err.println(Usage)
-          sys.exit(1)
-        }
-        tokenizerWorkerPath = Some(Paths.get(args(argIndex + 1)))
-        argIndex += 2
-      } else {
-        remainingArgs += args(argIndex)
-        argIndex += 1
-      }
-    }
-    val (flags, positional) = remainingArgs.result().partition(_.startsWith("-"))
+    val (flags, positional) = args.partition(_.startsWith("-"))
 
     var abortOnError = false
     var pipeline     = false
     var pipelineTrees = false
     var shard: Option[(Int, Int)] = None
     var warmPath: Option[java.nio.file.Path] = None
+    var tokenizerWorkerPath: Option[java.nio.file.Path] = None
     var blobTimeoutSeconds = BlobExec.DefaultTimeoutSeconds
     var stallTimeoutSeconds = Walker.DefaultStallTimeoutSeconds
     var stallExplicit = false
@@ -194,6 +178,8 @@ object Main {
           sys.exit(1)
         }
         warmPath = Some(p)
+      case w if w.startsWith("--tokenizer-worker=") =>
+        tokenizerWorkerPath = Some(Paths.get(w.stripPrefix("--tokenizer-worker=")))
       case t if t.startsWith("--blob-timeout=") =>
         val spec = t.stripPrefix("--blob-timeout=")
         parsePositiveSeconds(spec) match {

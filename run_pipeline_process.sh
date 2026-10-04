@@ -203,7 +203,7 @@ WORK="../cregit-files"
 MEMO_DIR=""
 SKIP_HTML=0
 GC_MODE="plain"
-TOKENIZER_WORKER=0
+TOKENIZER_WORKER=""
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
 # Empty means "do not pass the flag", as above: step 10 then emits the
@@ -493,7 +493,7 @@ case "$MODE" in
     serial|pipeline|pipeline-trees|sharded) ;;
     *) echo "invalid --mode: $MODE (serial|pipeline|pipeline-trees|sharded)" >&2; exit 2 ;;
 esac
-if [ "$TOKENIZER_WORKER" = 1 ] && [ "$MODE" != pipeline ] && [ "$MODE" != pipeline-trees ]; then
+if [ -n "$TOKENIZER_WORKER" ] && [ "$MODE" != pipeline ] && [ "$MODE" != pipeline-trees ]; then
     echo "--tokenizer-worker needs --mode pipeline or pipeline-trees" >&2; exit 2
 fi
 if [ "$MODE" = "sharded" ]; then
@@ -753,12 +753,8 @@ else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
-  TOKENIZER_WORKER_FLAGS=()
-  if [ "$TOKENIZER_WORKER" = 1 ]; then
-      TOKENIZER_WORKER_FLAGS=("--tokenizer-worker" "${CREGIT}/tokenizeByBlobId/tokenWorker.pl")
-  fi
   java -jar "$BFG" $MODE_FLAG \
-    ${TOKENIZER_WORKER_FLAGS[@]+"${TOKENIZER_WORKER_FLAGS[@]}"} \
+    ${TOKENIZER_WORKER:+"--tokenizer-worker=${CREGIT}/tokenizeByBlobId/tokenWorker.pl"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
     ${STALL_TIMEOUT:+--stall-timeout=$STALL_TIMEOUT} \
     "$REPO_PATH_ORIGINAL_BARE" \
