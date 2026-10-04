@@ -51,8 +51,8 @@ sub fixture {
     write_file("$tok/rustTokenizer/target/release/rust_tokenizer", "RUST TOKENIZER v1\n");
     make_path("$tok/m4Tokenizer");
     write_file("$tok/m4Tokenizer/m4.py", "M4 v1\n");
-    write_file("$dir/srcml2token", "SRCML2TOKEN v1\n");
-    write_file("$dir/srcml",       "SRCML v1\n");
+    write_srcml2token($dir, "v1");
+    write_file("$dir/libsrcml",    "LIBSRCML v1\n");
     write_file("$dir/ctags",       "CTAGS v1\n");
     return $dir;
 }
@@ -65,11 +65,15 @@ sub write_file {
     chmod 0755, $path;
 }
 
+sub write_srcml2token {
+    my ($dir, $version) = @_;
+    write_file("$dir/srcml2token", "#!/bin/sh\n# SRCML2TOKEN $version\necho '$dir/libsrcml'\n");
+}
+
 sub identity {
     my ($dir, @extra) = @_;
     my @cmd = ("perl", "$dir/tokenize/tokenizerIdentity.pl",
                "--srcml2token=$dir/srcml2token",
-               "--srcml=$dir/srcml",
                "--ctags=$dir/ctags", @extra);
     open(my $ph, '-|', @cmd) or die "run: $!";
     my $out = do { local $/; <$ph> };
@@ -126,12 +130,13 @@ for my $ext (grep { $_ ne 'rs' } sort keys %baseMap) {
 
 # ---------------------------------------------------------------------------
 # 3, the other direction — the srcML chain moves the srcML-routed extensions and
-# not Rust. Each of the three binaries counts: the token stream is the product of
-# all of them.
-for my $component (qw(srcml2token srcml ctags)) {
+# not Rust. Each of the three components counts: the token stream is the product
+# of all of them.
+for my $component (qw(srcml2token libsrcml ctags)) {
     my $d = fixture();
     my ($before) = identity($d);
-    write_file("$d/$component", "$component v2\n");
+    if ($component eq "srcml2token") { write_srcml2token($d, "v2") }
+    else                             { write_file("$d/$component", "$component v2\n") }
     my ($after) = identity($d);
     my %b = as_map($before);
     my %a = as_map($after);
@@ -177,7 +182,7 @@ for my $shared (qw(tokenize.pl CregitLanguages.pm)) {
     my $d = fixture();
     unlink("$d/tokenize/rustTokenizer/target/release/rust_tokenizer");
     my @cmd = ("perl", "$d/tokenize/tokenizerIdentity.pl",
-               "--srcml2token=$d/srcml2token", "--srcml=$d/srcml", "--ctags=$d/ctags");
+               "--srcml2token=$d/srcml2token", "--ctags=$d/ctags");
     my $err = `@cmd 2>&1 1>/dev/null`;
     isnt($?, 0, "an unbuilt Rust tokenizer is fatal, not omitted");
     like($err, qr/rust_tokenizer/, "and the message names the file");
@@ -185,10 +190,18 @@ for my $shared (qw(tokenize.pl CregitLanguages.pm)) {
 
 {
     my $d = fixture();
-    my @cmd = ("perl", "$d/tokenize/tokenizerIdentity.pl", "--srcml=$d/srcml", "--ctags=$d/ctags");
+    my @cmd = ("perl", "$d/tokenize/tokenizerIdentity.pl", "--ctags=$d/ctags");
     my $err = `@cmd 2>&1 1>/dev/null`;
     isnt($?, 0, "omitting --srcml2token is fatal: .c tokens depend on it");
     like($err, qr/--srcml2token/, "and the message names the flag");
+}
+
+{
+    my $d = fixture();
+    write_file("$d/srcml2token", "#!/bin/sh\nexit 0\n");
+    my ($out, $status) = identity($d);
+    isnt($status, 0, "an srcml2token that does not name its libsrcml is fatal");
+    is($out, "", "and prints no identity");
 }
 
 # ---------------------------------------------------------------------------

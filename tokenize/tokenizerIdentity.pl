@@ -32,10 +32,10 @@
 #   * its language's parser (CregitLanguages::LANG_PARSER_REL) — the tokenizer
 #     itself. For Rust that is the compiled cargo artifact, which is exactly the
 #     file that went stale.
-#   * srcml2token, srcml and ctags, for the srcML-routed languages only. The
-#     token stream is the product of all three: srcml2token transcodes srcML's
-#     XML, and tokenizeSrcMl.pl merges ctags output into it. A change in any of
-#     them changes the tokens.
+#   * srcml2token, the libsrcml it loads, and ctags, for the srcML-routed
+#     languages only. srcml2token parses with libsrcml, and tokenizeSrcMl.pl
+#     merges ctags output into its tokens. A change in any of them changes the
+#     tokens.
 #   * tokenize.pl and CregitLanguages.pm, for every extension. tokenize.pl is
 #     the dispatcher that decides which parser runs and with which flags
 #     (--position among them, which the token format depends on), and
@@ -69,21 +69,18 @@ Prints blobExec's --tokenizer-identity value for this checkout:
   ext=<sha256>,ext=<sha256>,...
 
 Options:
-   --srcml2token=<path>   the built C++ transcoder (required for C/C++/Java)
-   --srcml=<path>         the srcml binary       (required for C/C++/Java)
+   --srcml2token=<path>   the built srcML tokenizer (required for C/C++/Java)
    --ctags=<path>         the ctags binary       (required for C/C++/Java)
    --all-extensions       cover every extension in the table, not only the
                           masked ones (.am/.ac are routed but not masked)
 ";
 
 my $srcml2tokenPath = "";
-my $srcmlPath       = "";
 my $ctagsPath       = "";
 my $allExtensions   = 0;
 
 GetOptions(
     "srcml2token=s"  => \$srcml2tokenPath,
-    "srcml=s"        => \$srcmlPath,
     "ctags=s"        => \$ctagsPath,
     "all-extensions" => \$allExtensions,
 ) or die($usage);
@@ -119,6 +116,19 @@ sub digest_of {
     return $sha->hexdigest;
 }
 
+sub libsrcml_of {
+    my ($srcml2token) = @_;
+    open(my $ph, '-|', $srcml2token, "--libsrcml-path")
+        or die "tokenizerIdentity: cannot run [$srcml2token]: $!\n";
+    my $path = <$ph> // "";
+    close $ph;
+    chomp $path;
+    die "tokenizerIdentity: [$srcml2token] does not answer --libsrcml-path, so it is\n"
+      . "  not the srcml2token that parses with libsrcml. Rebuild it: make -C tokenize/srcMLtoken\n"
+        if $? != 0 or $path eq "";
+    return $path;
+}
+
 my %digestCache;
 sub cached_digest {
     my ($path) = @_;
@@ -127,6 +137,7 @@ sub cached_digest {
 }
 
 my @pairs;
+my $libsrcml;
 for my $ext (@extensions) {
     my $language = $CregitLanguages::EXT_LANG{$ext};
     die "tokenizerIdentity: no language for extension [$ext]\n" unless defined $language;
@@ -135,12 +146,10 @@ for my $ext (@extensions) {
 
     my @components = (@shared, $parser);
 
-    # The srcML chain is three binaries deep and all three shape the tokens.
     # Required rather than optional: an identity for .c computed without
     # srcml2token would not move when srcml2token does.
     if ($CregitLanguages::LANG_PARSER_REL{$language} eq $CregitLanguages::SRCML_PARSER_REL) {
         for my $pair (["--srcml2token", $srcml2tokenPath],
-                      ["--srcml",       $srcmlPath],
                       ["--ctags",       $ctagsPath]) {
             my ($flag, $path) = @$pair;
             die "tokenizerIdentity: $flag is required, because extension [$ext] is parsed by\n"
@@ -148,6 +157,8 @@ for my $ext (@extensions) {
                 if $path eq "";
             push @components, $path;
         }
+        $libsrcml //= libsrcml_of($srcml2tokenPath);
+        push @components, $libsrcml;
     }
 
     # Digest of the component digests, not of the concatenated bytes: the list is

@@ -69,4 +69,5 @@ in
   languages.rust.enable = true;
 
   env.LEGACY_JAVA_HOME = "${legacyJdk}";
+  env.SRCML_PREFIX = "${srcml}";
 }

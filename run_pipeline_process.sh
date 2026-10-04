@@ -1204,25 +1204,24 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 export BFG_MEMO_DIR="$MEMO_DIR"
 
 # Route through the tokenize.pl dispatcher (not tokenizeSrcMl.pl directly) so it can
-# fan out by language: srcML for .c/.h, rustTokenizer for .rs, etc. The --srcml* /
-# --ctags paths are forwarded only to the srcML parser. Behavior-preserving for C.
+# fan out by language: srcML for .c/.h, rustTokenizer for .rs, etc. The
+# --srcml2token / --ctags paths are forwarded only to the srcML parser.
 export BFG_TOKENIZE_CMD="${CREGIT}/tokenize/tokenize.pl \
   --srcml2token=${SRCML2TOKEN} \
-  --srcml=$(which srcml) \
   --ctags=$(which ctags)"
 
 # Which tokenizer produced which extension's tokens, so blobExec can refuse to
-# reuse a cache built by a different one. Computed from the same three binaries
-# BFG_TOKENIZE_CMD above pins, plus each language's parser and the dispatcher, by
-# tokenize/tokenizerIdentity.pl. The failure it closes: `command` is the constant
-# path tokenizeByBlobId/tokenBySha.pl and `mask` says which files, not how, so a
-# rebuilt tokenizer moved neither and every cached row stayed a hit.
+# reuse a cache built by a different one. Computed from the two binaries
+# BFG_TOKENIZE_CMD above pins, the libsrcml that srcml2token loads, each
+# language's parser and the dispatcher, by tokenize/tokenizerIdentity.pl. The
+# failure it closes: `command` is the constant path tokenizeByBlobId/tokenBySha.pl
+# and `mask` says which files, not how, so a rebuilt tokenizer moved neither and
+# every cached row stayed a hit.
 #
 # Fatal if it cannot be computed. An empty identity would make the whole check a
 # no-op, and the pipeline would go back to reusing caches it cannot vouch for.
 TOKENIZER_IDENTITY=$(perl "${CREGIT}/tokenize/tokenizerIdentity.pl" \
     --srcml2token="${SRCML2TOKEN}" \
-    --srcml="$(which srcml)" \
     --ctags="$(which ctags)") \
   || die "cannot compute the tokenizer identity (tokenize/tokenizerIdentity.pl).
      blobExec needs it to tell a cache built by this tokenizer from one built by a

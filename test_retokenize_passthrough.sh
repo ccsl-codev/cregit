@@ -98,6 +98,9 @@ repo_fixture() {
         echo "placeholder v1" > "$f/$p"
         chmod +x "$f/$p"
     done
+    # The identity also digests the libsrcml that srcml2token names.
+    printf '#!/bin/sh\necho "%s/libsrcml"\n' "$f" > "$f/tokenize/srcMLtoken/srcml2token"
+    echo "placeholder v1" > "$f/libsrcml"
     printf '%s' "$f"
 }
 

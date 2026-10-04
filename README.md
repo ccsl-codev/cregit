@@ -88,7 +88,7 @@ This builds, in dependency order:
 
 | artifact                                                      | module              | toolchain                 |
 | ------------------------------------------------------------- | ------------------- | ------------------------- |
-| `tokenize/srcMLtoken/srcml2token`                              | C++ transcoder      | gcc + xerces-c            |
+| `tokenize/srcMLtoken/srcml2token`                              | srcML tokenizer     | gcc + xerces-c + libsrcml |
 | `tokenize/rustTokenizer` binary                                | Rust tokenizer      | cargo                     |
 | `blobExec/target/scala-2.13/blobExec-0.1.0-assembly.jar`       | tokenization driver | sbt, JDK 21               |
 | `{slickGitLog,persons,remapCommits}/target/scala-2.10/*-one-jar.jar` | history / persons / remap tools | sbt 0.13, JDK 8 |

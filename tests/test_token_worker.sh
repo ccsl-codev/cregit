@@ -14,6 +14,6 @@ FIXTURES=("$ROOT"/tests/fixtures/* "$ROOT/tokenize/t/fixtures/srcml-position-cra
 python3 "$ROOT/tests/token_worker_driver.py" \
     --worker "$ROOT/tokenizeByBlobId/tokenWorker.pl" \
     --token-by-sha "$ROOT/tokenizeByBlobId/tokenBySha.pl" \
-    --tokenize-command "$ROOT/tokenize/tokenize.pl --srcml2token=$SRCML2TOKEN --srcml=$(command -v srcml) --ctags=$(command -v ctags)" \
+    --tokenize-command "$ROOT/tokenize/tokenize.pl --srcml2token=$SRCML2TOKEN --ctags=$(command -v ctags)" \
     "${FIXTURES[@]/#/--fixture=}" \
     --temp-root "$TEMP_ROOT"
