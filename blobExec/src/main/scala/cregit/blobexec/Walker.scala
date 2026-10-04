@@ -20,30 +20,18 @@ final case class WalkStats(
     blobsCacheHit: Int,
     refsProjected: Int,
     aborted: Boolean,
-    /** Blobs whose command was killed for exceeding its budget. Each one is a
-      * file left holding raw source instead of tokens, so a non-zero count must
-      * reach the caller rather than living only in stderr. */
+    /** Blobs whose command was killed for exceeding its budget, and so
+      * excluded from the rewrite as failed. */
     blobsTimedOut: Long,
-    /** Distinct mask-matched blobs excluded from the rewrite because JGit will
-      * not materialise an object that large. Unlike [[blobsTimedOut]] this is
-      * explainable and deterministic, so it is reported but does not block
-      * publication: see [[Walker.MaxBlobBytes]]. */
+    /** Distinct mask-matched blobs excluded because JGit will not materialise an
+      * object that large: see [[Walker.MaxBlobBytes]]. */
     blobsOversized: Long,
     /** Distinct mask-matched blobs excluded because they are on the shipped blob
-      * denylist ([[BlobDenylist]]): srcML 1.1.0 does not terminate on them, the
-      * defect is diagnosed and cited, and excluding them is deterministic. Like
-      * [[blobsOversized]] and unlike [[blobsTimedOut]] this is reported but does
-      * not block publication. */
+      * denylist ([[BlobDenylist]]). */
     blobsDenylisted: Long,
-    /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]: srcML died
-      * on a signal, or the token stream came back empty. Like [[blobsTimedOut]]
-      * and unlike [[blobsOversized]]/[[blobsDenylisted]] this DOES block
-      * publication, because an unexplained parser death is exactly the defect that
-      * used to be written out as a silent 0-byte tokenization. It is a separate
-      * counter rather than more timeouts because the two need different fixes: a
-      * timeout wants --blob-timeout, a crash wants the blob denylisting or srcML
-      * fixing. Defaulted so that adding it did not have to touch callers that
-      * construct [[WalkStats]] for other reasons. */
+    /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]
+      * (srcML died on a signal, or the token stream came back empty), and so
+      * excluded from the rewrite as failed. */
     blobsParserCrashed: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
@@ -874,7 +862,7 @@ final class Walker(
       // materialise, or on the blob denylist. Both take the same downstream path
       // — no id, no tree entry, no blob_map row — which is why one result covers
       // them. readBlob has already counted and explained whichever it was.
-      case None        => BlobResult.Oversized(task.origId)
+      case None        => BlobResult.Excluded(task.origId)
       case Some(bytes) => executeBlobTask(task, bytes)
     }
 
@@ -884,9 +872,7 @@ final class Walker(
     inFlightBlobs.put(label, System.nanoTime())
     try {
       blobCommandExecutions.increment()
-      // Set by either callback below: both mean "this blob's tokenization is
-      // unusable, so nothing about it may be persisted".
-      val unusable = new AtomicBoolean(false)
+      val failure = new AtomicReference[String]()
       val outcome = BlobExec.run(
         bytes        = bytes,
         origSha      = task.origId.name,
@@ -896,17 +882,13 @@ final class Walker(
         abortOnError = abortOnError,
         inserter     = workerInserter,
         timeoutSeconds = blobTimeoutSeconds,
-        onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-        onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
+        onTimeout      = () => { blobsTimedOut.increment(); failure.set("timeout") },
+        onParserCrash  = () => { blobsParserCrashed.increment(); failure.set("parser-crash") }
       )
       val res = outcome match {
-        case BlobExec.Outcome.Skip if unusable.get() =>
-          // The tree must still reference something, so keep the original bytes
-          // available — but report it as TimedOut so nothing gets persisted. A
-          // parser crash takes this same branch: the name is now narrower than the
-          // meaning, which is "unusable, persist nothing".
-          ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
-          BlobResult.TimedOut(task.origId)
+        case BlobExec.Outcome.Skip if failure.get() != null =>
+          noteFailed(task, failure.get())
+          BlobResult.Excluded(task.origId)
         case BlobExec.Outcome.Skip =>
           ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
           BlobResult.Resolved(task.origId)
@@ -1037,15 +1019,13 @@ final class Walker(
     // blob_map row and no dataset row. See readBlob and resolveEntry.
     val futures = unique.map { task =>
       Future {
-        readBlob(task).map { bytes =>
+        readBlob(task).flatMap { bytes =>
           val workerInserter = dst.newObjectInserter()
           val label = s"${task.origId.name} (${task.fullPath})"
           inFlightBlobs.put(label, System.nanoTime())
           try {
             blobCommandExecutions.increment()
-            // Set by either callback below: both mean "this blob's tokenization is
-      // unusable, so nothing about it may be persisted".
-      val unusable = new AtomicBoolean(false)
+            val failure = new AtomicReference[String]()
             val outcome = BlobExec.run(
               bytes        = bytes,
               origSha      = task.origId.name,
@@ -1055,21 +1035,24 @@ final class Walker(
               abortOnError = abortOnError,
               inserter     = workerInserter,
               timeoutSeconds = blobTimeoutSeconds,
-              onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
-              onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) }
+              onTimeout      = () => { blobsTimedOut.increment(); failure.set("timeout") },
+              onParserCrash  = () => { blobsParserCrashed.increment(); failure.set("parser-crash") }
             )
-            // For Skip outcomes (identical output, a non-zero exit with
-            // abortOnError=false, or a timeout) we keep the original blob id, so
-            // the dst tree will reference it — meaning the bytes must exist in
-            // dst. For Replace outcomes the worker has already inserted the new
-            // blob. For Abort we do nothing (caller short-circuits).
+            val failed = Option(failure.get())
+            failed.foreach(noteFailed(task, _))
+            // For Skip outcomes (identical output, or a non-zero exit with
+            // abortOnError=false) we keep the original blob id, so the dst tree will
+            // reference it — meaning the bytes must exist in dst. For Replace
+            // outcomes the worker has already inserted the new blob. For Abort we do
+            // nothing (caller short-circuits). A failed blob is excluded.
             outcome match {
-              case BlobExec.Outcome.Skip => ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
-              case _                     => ()
+              case BlobExec.Outcome.Skip if failed.isEmpty =>
+                ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
+              case _ => ()
             }
             workerInserter.flush()
             progress(s"blob $label")
-            (task, outcome, unusable.get())
+            if (failed.isDefined) None else Some((task, outcome))
           } finally {
             inFlightBlobs.remove(label)
             workerInserter.close()
@@ -1079,23 +1062,20 @@ final class Walker(
     }
 
     // Unbounded: the stall watchdog is the backstop, not a budget. `flatten`
-    // drops the oversized blobs: they are excluded, not resolved.
+    // drops the excluded blobs: oversized, denylisted or failed.
     val results = Await.result(Future.sequence(futures), Duration.Inf).flatten
 
-    val abort = results.exists { case (_, o, _) => o.isInstanceOf[BlobExec.Outcome.Abort] }
+    val abort = results.exists { case (_, o) => o.isInstanceOf[BlobExec.Outcome.Abort] }
     if (abort) MissResolution(IMap.empty, abort = true, timedOutKeys = Set.empty)
     else {
       val ids = results.iterator.collect {
-        case (task, BlobExec.Outcome.Replace(newId), _) =>
+        case (task, BlobExec.Outcome.Replace(newId)) =>
           (task.origId.name, task.fullPath) -> newId
-        case (task, BlobExec.Outcome.Skip, _) =>
-          // identical, non-zero-exit (with abortOnError=false), or timed out
+        case (task, BlobExec.Outcome.Skip) =>
+          // identical, or non-zero-exit (with abortOnError=false)
           (task.origId.name, task.fullPath) -> task.origId
       }.toMap
-      val timedOutKeys = results.iterator.collect {
-        case (task, _, true) => (task.origId.name, task.fullPath)
-      }.toSet
-      MissResolution(ids, abort = false, timedOutKeys = timedOutKeys)
+      MissResolution(ids, abort = false, timedOutKeys = Set.empty)
     }
   }
 
@@ -1133,6 +1113,7 @@ final class Walker(
     // into a microsecond and a logged exclusion.
     val denied = denylist.entryFor(task.origId.name)
     if (denied.isDefined) { noteDenylisted(task, denied.get); return None }
+    if (failedKeys.contains((task.origId.name, task.fullPath))) return None
 
     val r = src.newObjectReader()
     try {
@@ -1161,6 +1142,18 @@ final class Walker(
     * deliberate omission from a missing-key bug. Kept separate from
     * `oversizedKeys` so the two exclusions can never be confused in the counts. */
   private val denylistedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
+
+  /** `(origSha, fullPath)` of every blob whose tokenizer timed out or crashed in
+    * this run. Excluded like a denylisted blob, and checked in [[readBlob]] so
+    * that one failing blob costs one tokenizer run, not one per commit. */
+  private val failedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
+
+  private def noteFailed(task: BlobMissTask, reason: String): Unit =
+    if (failedKeys.add((task.origId.name, task.fullPath)))
+      System.err.println(
+        s"blobExec: EXCLUDED failed blob: sha=${task.origId.name} path=${task.fullPath} " +
+          s"reason=$reason. The blob is left out of the rewritten tree, so it produces no " +
+          "blame and no dataset row. The walk carries on.")
 
   /** Count and explain one denylisted blob, once per `(sha, path)`. The sha, the
     * path, the reason and the citation are all in the line, because this line is
@@ -1290,13 +1283,14 @@ final class Walker(
         // Excluded as oversized or by the denylist (see readBlob): drop the entry,
         // so the file is absent from the rewritten tree rather than present as raw
         // source.
-        case None if oversizedKeys.contains(key) || denylistedKeys.contains(key) => None
+        case None if oversizedKeys.contains(key) || denylistedKeys.contains(key) ||
+                     failedKeys.contains(key) => None
         // Anything else missing is a bug, and used to surface as a bare
         // NoSuchElementException. Keep it fatal and say which blob it was.
         case None =>
           throw new IllegalStateException(
             s"blob ${origId.name} ($fullPath) is a mask-matched miss with no resolution " +
-              "and was excluded neither as oversized nor by the blob denylist")
+              "and was excluded neither as oversized, by the blob denylist, nor as failed")
       }
   }
 
@@ -1710,11 +1704,11 @@ object Walker {
       * a `Resolved`: nothing about this blob, the trees containing it, or its
       * commit may be persisted, or a re-run would treat raw source as done. */
     final case class TimedOut(origId: ObjectId) extends BlobResult
-    /** Too large for JGit to materialise, so excluded from the rewrite. It is
-      * deliberately neither `Resolved` nor `TimedOut`: it contributes no id, so
+    /** Excluded from the rewrite: oversized, denylisted, or its tokenizer failed.
+      * It is deliberately neither `Resolved` nor `TimedOut`: it contributes no id, so
       * every `collect` that builds a tree/blob_map map drops it, `resolveEntry`
       * omits the path, and the run is still publishable. */
-    final case class Oversized(origId: ObjectId) extends BlobResult
+    final case class Excluded(origId: ObjectId) extends BlobResult
   }
 
   /** Items flowing producer -> consumer across the bounded queue. */

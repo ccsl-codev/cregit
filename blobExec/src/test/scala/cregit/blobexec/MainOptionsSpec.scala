@@ -39,11 +39,8 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.parsePositiveSeconds("10.5") shouldEqual None
   }
 
-  test("timeout and stall have distinct exit statuses, and neither collides") {
-    Main.TimedOutExitStatus shouldEqual 4
+  test("the stall status collides with no other exit status") {
     Walker.StalledExitStatus shouldEqual 5
-    Main.TimedOutExitStatus should not equal Walker.StalledExitStatus
-    Set(0, 1, 2, 3) should not contain Main.TimedOutExitStatus
     Set(0, 1, 2, 3) should not contain Walker.StalledExitStatus
   }
 
@@ -89,13 +86,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
   }
 
-  // -- which counters gate publication ----------------------------------------
-  //
-  // The denylist only earns its place if it does NOT gate the exit status: the
-  // four blobs it holds hang srcml, the timeout path answers that with exit 4
-  // ("incomplete, do not publish"), and a project cannot sit unpublishable
-  // forever over a diagnosed third-party parser bug. A timeout is different — it
-  // is a hang nobody has explained — and it must keep blocking.
+  // -- which counters change the exit status ----------------------------------
 
   private def stats(
       aborted: Boolean = false,
@@ -129,10 +120,11 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(blobsOversized = 3, blobsDenylisted = 4)) shouldEqual 0
   }
 
-  test("a timeout still blocks publication, even alongside a denylisted blob") {
-    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual Main.TimedOutExitStatus
-    Main.exitStatus(stats(blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual
-      Main.TimedOutExitStatus
+  test("a failed blob does not change the exit status: it is excluded") {
+    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual 0
+    Main.exitStatus(stats(blobsParserCrashed = 36)) shouldEqual 0
+    Main.exitStatus(stats(blobsTimedOut = 1, blobsParserCrashed = 1, blobsDenylisted = 4,
+      blobsOversized = 3)) shouldEqual 0
   }
 
   test("an abort still wins over everything") {
@@ -141,44 +133,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
   }
 
-  // A parser crash is a defect nobody has explained — srcML 1.1.0 dying on a
-  // signal — so it gates publication the way a timeout does, and unlike an
-  // oversized or denylisted blob. It gets its OWN status because the remedies
-  // differ: --blob-timeout does nothing for a segfault.
-
-  test("a parser crash blocks publication, with its own status") {
-    Main.exitStatus(stats(blobsParserCrashed = 1)) shouldEqual Main.ParserCrashedExitStatus
-    Main.exitStatus(stats(blobsParserCrashed = 36)) shouldEqual Main.ParserCrashedExitStatus
-  }
-
-  test("a parser crash still blocks alongside explained exclusions") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
-      Main.ParserCrashedExitStatus
-  }
-
-  // Regression: this status was first written as 5, which is already
-  // Walker.StalledExitStatus — so a parser crash would have been reported to
-  // run_pipeline_process.sh as a stall, sending the operator to --blob-timeout for
-  // a segfault and writing the wrong marker file. Every status blobExec can exit
-  // with must be distinct, so assert the whole set rather than just one pair.
-  test("the parser-crash status collides with no other blobExec exit status") {
-    val others = Map(
-      "clean"       -> 0,
-      "usage"       -> 1,
-      "aborted"     -> 2,
-      "maskChanged" -> 3,
-      "timedOut"    -> Main.TimedOutExitStatus,
-      "stalled"     -> Walker.StalledExitStatus
-    )
-    others.foreach { case (name, status) =>
-      withClue(s"parser-crash status must differ from $name ($status): ") {
-        Main.ParserCrashedExitStatus should not equal status
-      }
-    }
-  }
-
-  // The ineffective-invalidation status needs the same treatment, and for the
-  // same reason: run_pipeline_process.sh maps blobExec's statuses onto different
+  // The ineffective-invalidation status must be distinct: run_pipeline_process.sh maps blobExec's statuses onto different
   // remedies and different marker files, so a collision sends the operator to the
   // wrong one. This status specifically must not be 0 — "--retokenize did
   // nothing" reported as success is the failure the flag exists to prevent — and
@@ -189,9 +144,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
       "usage"        -> 1,
       "aborted"      -> 2,
       "maskChanged"  -> 3,
-      "timedOut"     -> Main.TimedOutExitStatus,
-      "stalled"      -> Walker.StalledExitStatus,
-      "parserCrash"  -> Main.ParserCrashedExitStatus
+      "stalled"      -> Walker.StalledExitStatus
     )
     others.foreach { case (name, status) =>
       withClue(s"ineffective-retokenize status must differ from $name ($status): ") {

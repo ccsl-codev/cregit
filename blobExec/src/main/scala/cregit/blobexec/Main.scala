@@ -33,21 +33,6 @@ object Main {
     * killed for exceeding its budget. Durable because the skip is durable. */
   private[blobexec] val BlobsTimedOutMetaKey = "blobs_timed_out"
 
-  /** Exit status when any blob in this memo has ever timed out: the walk itself
-    * succeeded, but the output is incomplete and must not be validated. */
-  private[blobexec] val TimedOutExitStatus = 4
-
-  /** Exit status when any blob's tokenizer reported a parser crash: srcML died on
-    * a signal, or produced no tokens. Distinct from [[TimedOutExitStatus]] on
-    * purpose — both block publication, but they need different remedies, and an
-    * operator who cannot tell them apart will reach for --blob-timeout, which does
-    * nothing whatsoever for a segfault.
-    *
-    * 6, not 5: 5 is already [[Walker.StalledExitStatus]]. The statuses in use are
-    * 1 (usage), 2 (abort), 3 (mask changed), 4 (timed out), 5 (stalled), so 6 is
-    * the next free one. `parserCrashStatusIsUnique` in MainOptionsSpec pins that. */
-  private[blobexec] val ParserCrashedExitStatus = 6
-
   /** Exit status when `--retokenize` was asked for and would have invalidated
     * nothing.
     *
@@ -61,38 +46,11 @@ object Main {
     * `retokenizeStatusIsUnique` in MainOptionsSpec pins that. */
   private[blobexec] val RetokenizeIneffectiveExitStatus = 7
 
-  /** The process exit status for a finished walk.
-    *
-    * A function, and taking the whole [[WalkStats]], so that "which counters gate
-    * publication" is a property something can be asserted about rather than a
-    * conditional buried in `main`. Exactly two things gate it: an abort, and a
-    * blob whose tokenizer was killed on its budget. Deliberately NOT gating:
-    *
-    *   - `blobsOversized` — jgit will not materialise the object; deterministic,
-    *     explained per blob, and the file is absent rather than wrong.
-    *   - `blobsDenylisted` — srcML 1.1.0 does not terminate on it; diagnosed, with
-    *     an upstream citation, in a data file a paper can cite. Gating on this
-    *     would mean tencent__tencentkona-21 could never publish, while telling us
-    *     nothing we do not already know.
-    *
-    * The distinction is the whole point of the denylist: a timeout is a hang
-    * nobody has explained yet, and that must keep blocking publication.
-    *
-    * `blobsParserCrashed` joins the gating set for exactly that reason. A srcML
-    * signal death is, today, a defect nobody has explained — so it belongs with a
-    * timeout, not with the denylist. Once a specific crashing blob is diagnosed and
-    * cited it can be moved onto the denylist, which is the documented way for a
-    * known third-party parser bug to stop blocking publication. Until then, failing
-    * closed is the point: the alternative is the 0-byte tokenization that shipped.
-    *
-    * A timeout is checked first only because it is the older and broader signal;
-    * when both fire, either status correctly means "do not publish".
-    */
+  /** The process exit status for a finished walk: 2 on an abort, else 0.
+    * Excluded blobs (oversized, denylisted, or whose tokenizer failed) are
+    * named on EXCLUDED lines and do not change it. */
   private[blobexec] def exitStatus(stats: WalkStats): Int =
-    if (stats.aborted) 2
-    else if (stats.blobsTimedOut > 0) TimedOutExitStatus
-    else if (stats.blobsParserCrashed > 0) ParserCrashedExitStatus
-    else 0
+    if (stats.aborted) 2 else 0
 
   /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
     * positive whole number, else None (which the caller reports and exits 1 on).
@@ -237,16 +195,8 @@ object Main {
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
-      |                    killed (whole process group) and that single blob is
-      |                    left untokenized; the run continues, and
-      |                    --abort-on-error does not turn a timeout into a
-      |                    whole-run abort. The count is reported on the done
-      |                    line and the process then exits ${TimedOutExitStatus},
-      |                    so the caller cannot publish a project whose tokens are
-      |                    incomplete. Nothing durable is recorded for the blob,
-      |                    the trees above it or its commit, so another run over
-      |                    the same memo retries just that blob (from the
-      |                    pipeline: resume at step 2, never step 1).
+      |                    killed (whole process group) and that blob is
+      |                    excluded as failed (see below); the run continues.
       |  --stall-timeout=<seconds>
       |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}); must be larger than
       |                    --blob-timeout, since a pure-blob commit's only
@@ -267,12 +217,14 @@ object Main {
       |  upstream, and a diagnosed exclusion must not block publication the way an
       |  unexplained timeout does.
       |
+      |  A blob whose tokenizer times out or reports a parser crash is excluded
+      |  the same way: dropped from the rewritten trees, counted as blobsTimedOut
+      |  or blobsParserCrashed, named on an 'EXCLUDED failed blob' line, and tried
+      |  only once per run. It does NOT change the exit status.
+      |
       |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
       |               3 = memo meta mismatch (including a changed tokenizer with
-      |               no --retokenize), ${TimedOutExitStatus} = completed
-      |               but some blob timed out (output incomplete, re-run to
-      |               retry), ${Walker.StalledExitStatus} = killed by the stall watchdog,
-      |               ${ParserCrashedExitStatus} = a tokenizer reported a parser crash,
+      |               no --retokenize), ${Walker.StalledExitStatus} = killed by the stall watchdog,
       |               ${RetokenizeIneffectiveExitStatus} = --retokenize would have invalidated nothing.
       |  --pipeline        use the look-ahead pipelined walker (producer runs
       |                    ahead so the blob-command pool stays saturated);
@@ -692,41 +644,13 @@ object Main {
       )
     }
 
-    if (stats.blobsTimedOut > 0) {
+    if (stats.blobsTimedOut + stats.blobsParserCrashed > 0) {
       System.err.println(
-        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsTimedOut} blob(s) timed out this " +
-          s"run ($timedOutEver ever for this memo, see meta['$BlobsTimedOutMetaKey'] in $dbPath). " +
-          "Their files would carry raw source instead of tokens, so the walk stopped at that " +
-          s"commit and recorded nothing for it: no blob row, no tree row, no commit row. " +
-          s"Exiting $TimedOutExitStatus. Recovery is another blobExec run over this same memo: it " +
-          "retries exactly those blobs and needs no changes to the database. Driven from " +
-          "run_pipeline_process.sh, that means resuming at step 2 (trailing '2', or ctp.py " +
-          "--from-step 2) — a step-1 run deletes the work directory first, memo included. " +
-          "If the same blobs keep failing, check which kind of failure it is: a child killed on " +
-          s"its budget is slowness, and the knob is --blob-timeout (currently ${blobTimeoutSeconds}s; " +
-          "run_pipeline_process.sh --blob-timeout N, or CREGIT_BLOB_TIMEOUT=N in the environment). " +
-          "A child reporting status 137 was SIGKILLed, which on a memory-tight host usually means " +
-          "the kernel's OOM killer took it — more time will not help; give the run more memory or " +
-          "exclude that blob via the mask."
-      )
-    }
-
-    if (stats.blobsParserCrashed > 0) {
-      System.err.println(
-        s"blobExec: INCOMPLETE, DO NOT PUBLISH: ${stats.blobsParserCrashed} blob(s) had their " +
-          "tokenizer report a parser crash this run. Each one is named on a 'reported a parser " +
-          "crash' line above, with the failing stage and signal. This is srcML dying on a signal " +
-          "(SIGSEGV or SIGABRT) on a C/C++ input, or returning no tokens at all; before this was " +
-          "detected such a blob became a silent 0-byte tokenization and the file simply vanished " +
-          "from the dataset with nothing counting it. Nothing was recorded for the containing " +
-          s"commit: no blob row, no tree row, no commit row. Exiting $ParserCrashedExitStatus. " +
-          "Unlike a timeout this is deterministic, so re-running alone will NOT clear it and " +
-          "--blob-timeout is irrelevant — more time does not help a segfault. The two real " +
-          "remedies are: fix or upgrade srcML (1.1.0 faults in its C/C++ position tracking, and " +
-          "--position cannot be dropped because the token format depends on it), or, once a " +
-          "specific blob is diagnosed, add it to the blob denylist with its reason and citation " +
-          s"(${BlobDenylist.ResourcePath}) so it is excluded deterministically and reported " +
-          "without blocking publication."
+        s"blobExec: ${stats.blobsTimedOut + stats.blobsParserCrashed} blob(s) were excluded because " +
+          s"their tokenizer failed (${stats.blobsTimedOut} timed out after ${blobTimeoutSeconds}s, " +
+          s"${stats.blobsParserCrashed} reported a parser crash). Each one is named on an " +
+          "'EXCLUDED failed blob' line above; those lines are the record of what this project's " +
+          "dataset does not contain. This does not affect the exit status."
       )
     }
 
