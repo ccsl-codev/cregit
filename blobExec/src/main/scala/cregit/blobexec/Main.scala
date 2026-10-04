@@ -266,6 +266,10 @@ object Main {
         System.err.println(s"Error: tokenizer worker [$path] is not an executable file")
         sys.exit(1)
       }
+      if (!(pipeline || pipelineTrees)) {
+        System.err.println("Error: --tokenizer-worker needs --pipeline or --pipeline-trees")
+        sys.exit(1)
+      }
     }
     if (mask.isEmpty) {
       System.err.println("Error: fileMaskRegex must be non-empty")

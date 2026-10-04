@@ -85,7 +85,8 @@ Output:
   --tokenizer-worker
                     keep one tokenizeByBlobId/tokenWorker.pl process alive per
                     blobExec worker slot instead of spawning the full wrapper
-                    chain for every blob (default: off).
+                    chain for every blob (default: off). Needs --mode
+                    pipeline or pipeline-trees.
   --memory-limit SIZE
                     cap the DuckDB heap in the dataset generator (step 10).
                     Omit to accept that script's own default of 8GB. Takes an
@@ -492,6 +493,9 @@ case "$MODE" in
     serial|pipeline|pipeline-trees|sharded) ;;
     *) echo "invalid --mode: $MODE (serial|pipeline|pipeline-trees|sharded)" >&2; exit 2 ;;
 esac
+if [ "$TOKENIZER_WORKER" = 1 ] && [ "$MODE" != pipeline ] && [ "$MODE" != pipeline-trees ]; then
+    echo "--tokenizer-worker needs --mode pipeline or pipeline-trees" >&2; exit 2
+fi
 if [ "$MODE" = "sharded" ]; then
     [ "$SHARDS" -ge 1 ] 2>/dev/null || { echo "--shards must be a positive integer" >&2; exit 2; }
 fi
