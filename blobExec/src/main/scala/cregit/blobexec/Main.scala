@@ -228,9 +228,9 @@ object Main {
       |                    changing anything, when: another extension's tokenizer
       |                    also changed and was not named; no tokenized row
       |                    carries any named extension (status ${RetokenizeIneffectiveExitStatus}); the memo held
-      |                    none of the affected blobs (status ${RetokenizeIneffectiveExitStatus}, and that
-      |                    means the --memo-dir is not this project's); or a
-      |                    RETAINED new_blob id does not resolve in <dst.git>.
+      |                    none of the affected blobs and --memo-dir is not
+      |                    $$BFG_MEMO_DIR, the memo tokenBySha.pl reads (status ${RetokenizeIneffectiveExitStatus});
+      |                    or a RETAINED new_blob id does not resolve in <dst.git>.
       |  --memo-dir=<dir>  the memo directory ($$BFG_MEMO_DIR) whose entries
       |                    --retokenize must purge. Only read with --retokenize;
       |                    passing it alone is an error rather than a no-op.
@@ -571,7 +571,9 @@ object Main {
           catch { case _: Exception => None }
           finally reader.close()
         }),
-        report = msg => println(s"blobExec: $msg")
+        report = msg => println(s"blobExec: $msg"),
+        memoDirIsTokenizerMemo =
+          memoDir.exists(d => TokenizerMemo.isTokenizerMemo(d, sys.env.get("BFG_MEMO_DIR")))
       ))
 
     val mapping = try Mapping.open(dbPath, command, mask, warmPath, widening,
