@@ -187,6 +187,8 @@ def commit_runs(con):
 
 
 def load(con, out):
+    if not glob.glob(os.path.join(out, "part-*.tsv")):
+        raise SystemExit(f"build: no part-*.tsv in {out}: run token_history.py")
     read_tsv(con, "tokens", os.path.join(out, "part-*.tsv"), COLUMNS)
     if glob.glob(os.path.join(out, "runs-*.tsv")):
         read_tsv(con, "runs", os.path.join(out, "runs-*.tsv"), RUN_COLUMNS)

@@ -1,4 +1,5 @@
 import duckdb
+import pytest
 
 from build import commit_runs, load
 from token_history import SEP
@@ -36,3 +37,8 @@ def test_a_path_written_again_by_a_resume_is_loaded_once(tmp_path):
     assert con.execute("SELECT count(*), count(DISTINCT (file_path, token_id))"
                        " FROM tokens").fetchone() == (2, 2)
     assert len(con.execute("SELECT * FROM tokens").description) == 12
+
+
+def test_no_part_files_is_a_clear_error(tmp_path):
+    with pytest.raises(SystemExit, match="no part"):
+        load(duckdb.connect(), str(tmp_path))
