@@ -938,8 +938,8 @@ object Main {
           "blobs are, so the dataset has no row for them and no raw source in their place. " +
           skippedTsv.map(p => s"See $p (${skipLog.all.size} row(s) in all). ").getOrElse(
             "No --skipped-tsv was given, so the 'SKIPPED blob' lines above are the only record. ") +
-          "A timed-out blob is tried again by the next run over this memo. To require a clean " +
-          "run instead, use --strict-tokenize."
+          "A later run tries a timed-out blob again, unless it is given --no-retry-timed-out. " +
+          "To require a clean run instead, use --strict-tokenize."
       )
     }
 

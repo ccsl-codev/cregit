@@ -1239,20 +1239,12 @@ final class Walker(
       skipLog.record(SkipLog.Row(sha, task.fullPath, f.reason, f.detail,
         SkipLog.tokenizerFor(tokenizerIdentity, task.fullPath)))
       val next =
-        if (f.reason == BlobExec.Failure.Timeout)
-          "A timeout depends on load, so the next run over this memo tries this blob again."
-        else
-          "A parser crash or empty output is deterministic for this tokenizer, so a re-run " +
-            "does not try it again " +
-            "unless the tokenizer identity changes (--retokenize)."
+        if (f.reason == BlobExec.Failure.Timeout) " A later run without --no-retry-timed-out tries it again."
+        else " A re-run tries it again only if the tokenizer identity changes (--retokenize)."
       System.err.println(
         s"blobExec: SKIPPED blob: sha=$sha path=${task.fullPath} reason=${f.reason} " +
-          s"detail=${f.detail}. The tokenizer output is not usable, so the blob is dropped from " +
-          "the rewritten tree, as a denylisted blob is: it gives no blame and no dataset row, " +
-          "and the file is not in the tokenized repository as raw source. The walk continues. " +
-          next +
-          skipLog.path.map(p => s" Recorded in $p.").getOrElse("")
-      )
+          s"detail=${f.detail}. It is dropped from the rewritten tree, as a denylisted blob is. " +
+          "The walk continues." + next + skipLog.path.map(p => s" Recorded in $p.").getOrElse(""))
     }
   }
 

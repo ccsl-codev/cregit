@@ -135,7 +135,7 @@ Target repository:
   --blob-timeout N  wall-clock budget in seconds for one blob's tokenizer
                     (blobExec default: 600). A child that exceeds it is killed,
                     and the blob is skipped as described under
-                    --strict-tokenize. The next step-2 run tries it again.
+                    --strict-tokenize, and tried again as described there.
                     Also settable as CREGIT_BLOB_TIMEOUT in the environment,
                     which is how to reach it through ctp.py.
   --strict-tokenize stop step 2 on the first tokenizer failure, as all earlier
@@ -151,9 +151,10 @@ Target repository:
                     denylisted and oversized blobs included, with the header
                       sha  path  reason  detail  tokenizer   (tab-separated)
                     It is next to <name>-dataset.parquet in the work directory.
-                    A timed-out blob is tried again on the next step-2 run. If
-                    it then tokenizes, blobExec folds all of history again, and
-                    the runner removes the outputs made from the old commits.
+                    A later step-2 run tries a timed-out blob again while no
+                    blame output exists (see --retry-skipped). If it then
+                    tokenizes, blobExec folds all of history again, and the
+                    runner removes the outputs made from the old commits.
                     With --strict-tokenize, a timeout stops step 2 with exit 4
                     and a parser crash with exit 6, as described under
                     --force-clean. --mode sharded is always strict.
@@ -612,9 +613,9 @@ report_skipped_blobs() {
         END { for (r in c) printf "%s%s=%d", (s++ ? ", " : ""), r, c[r] }' "$SKIPPED_TSV")
     log "WARNING: $n blobs skipped, see $SKIPPED_TSV ($by_reason)."
     log "  The dataset has no row for these blobs. They are not in the tokenized"
-    log "  repository, not as raw source and not as empty tokenizations. A timeout"
-    log "  is tried again by the next step-2 run. To require a clean run, use"
-    log "  --strict-tokenize (or CREGIT_STRICT_TOKENIZE=1)."
+    log "  repository, not as raw source and not as empty tokenizations. The next"
+    log "  step-2 run tries a timeout again only if no blame output exists, or with"
+    log "  --retry-skipped. To require a clean run, use --strict-tokenize (or CREGIT_STRICT_TOKENIZE=1)."
 }
 
 # blame_file_count <max>: the number of .blame files in the blame output, stopping
