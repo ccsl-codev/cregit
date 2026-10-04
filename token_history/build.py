@@ -247,7 +247,7 @@ def main():
     # Links go to disk commit by commit: on a whole kernel they do not fit
     # in memory. A born token has one birth commit, so it has one link.
     links_file = os.path.join(args.out, f"links-{args.mode}.tsv")
-    if args.reuse and os.path.exists(links_file):
+    if reuse and os.path.exists(links_file):
         log(f"build: reuse {links_file}")
     else:
         write_links(con, links_file, args.mode, args.min_alnum)
