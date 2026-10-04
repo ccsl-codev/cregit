@@ -5,7 +5,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path}
+import java.nio.file.{Files, Path, Paths}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -62,6 +62,11 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
          |    my $body = read_exact($body_len);
          |
          |    if ($filename eq 'hang.c') {
+         |        my $child = fork() // exit 3;
+         |        exec 'sleep', '300' if $child == 0;
+         |        open(my $pidFile, '>', "$0.grandchild") or exit 3;
+         |        print {$pidFile} $child;
+         |        close($pidFile);
          |        sleep 300 while 1;
          |    } elsif ($filename eq 'slow.c') {
          |        sleep 2;
@@ -112,7 +117,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
     } finally pool.close()
   }
 
-  test("times out a wedged worker, replaces it, and serves the next request") {
+  test("times out a wedged worker, kills its children, replaces it, and serves the next request") {
     val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
     try {
       val started = System.nanoTime()
@@ -121,6 +126,8 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
 
       hung shouldBe a[Killed]
       elapsed should be < 15.seconds
+      val grandchild = Files.readString(Paths.get(s"$worker.grandchild")).trim.toLong
+      eventuallyStopped(Seq(grandchild)) shouldBe true
       val (nextExit, nextOut, nextErr) =
         exited(request(pool, "next.c", "next", "d" * 40, timeoutSeconds = 1))
       nextExit shouldEqual 0

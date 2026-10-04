@@ -84,9 +84,9 @@ final class TokenizerWorkerPool(
     reader.setDaemon(true)
     reader.start()
 
-    val backstopSeconds = math.max(1, timeoutSeconds).toLong + 5L + 5L
+    val backstopSeconds = ChildRunner.maxLifetimeSeconds(timeoutSeconds)
     if (!finished.await(backstopSeconds, TimeUnit.SECONDS)) {
-      replaceWorker(worker, force = true)
+      replaceWorker(worker)
       ChildRunner.Outcome.Killed(s"no response within ${backstopSeconds}s; worker replaced")
     } else {
       response.get() match {
@@ -250,7 +250,7 @@ final class TokenizerWorkerPool(
   private def failedWorker(worker: Worker, failure: Throwable): ChildRunner.Outcome = {
     val workerExit = if (worker.process.waitFor(100, TimeUnit.MILLISECONDS)) Some(worker.process.exitValue()) else None
     val diagnostics = worker.takeDiagnostics()
-    replaceWorker(worker, force = true)
+    replaceWorker(worker)
     if (workerExit.contains(WorkerTimeoutExitCode))
       ChildRunner.Outcome.Killed(s"worker exited $WorkerTimeoutExitCode (timeout)")
     else {
@@ -261,13 +261,13 @@ final class TokenizerWorkerPool(
 
   private def returnWorker(worker: Worker): Unit = {
     if (worker.process.isAlive && !closed.get()) idle.put(worker)
-    else replaceWorker(worker, force = true)
+    else replaceWorker(worker)
   }
 
-  private def replaceWorker(worker: Worker, force: Boolean): Unit = {
+  private def replaceWorker(worker: Worker): Unit = {
     workers.remove(worker)
     try worker.stdin.close() catch { case _: IOException => () }
-    if (force && worker.process.isAlive) worker.process.destroyForcibly()
+    if (worker.process.isAlive) ChildRunner.killTree(worker.process)
     if (!closed.get()) {
       val replacement = startWorker(worker.index)
       workers.add(replacement)
