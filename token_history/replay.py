@@ -99,20 +99,6 @@ def parse_hunks(diff_text):
     return parse_log(f"{HEADER}x\t0\n{diff_text}")[0].diffs[0].hunks
 
 
-def real_parent_sources(repo, path):
-    """Real parents, blobs and blob diffs straight from git, one call each."""
-    def blob_at(sha):
-        return git_out(repo, "rev-parse", "-q", "--verify",
-                       f"{sha}:{path}", check=False).strip() or NULL_BLOB
-
-    def diff_blobs(a, b):
-        return diff_hunks(repo, a, b)
-
-    return dict(real_parents=lambda sha: git_out(
-                    repo, "log", "-1", "--format=%P", sha).split(),
-                blob_at=blob_at, diff_blobs=diff_blobs)
-
-
 def align(parent_len, hunks):
     """For each child line: the parent line index it keeps, or its new text."""
     child, pos = [], 0

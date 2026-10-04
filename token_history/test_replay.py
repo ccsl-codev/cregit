@@ -4,8 +4,8 @@ import subprocess
 
 import pytest
 
-from replay import (NULL_BLOB, PathReplay, align, Hunk, parse_log, path_log,
-                    real_parent_sources)
+from replay import NULL_BLOB, PathReplay, align, Hunk, parse_log, path_log
+from token_history import GitSource, mainline_changes, merge_parents
 
 
 def git(repo, *args, date=None):
@@ -61,6 +61,12 @@ def replay(repo, path):
     return PathReplay(parse_log(path_log(str(repo), path))).run()
 
 
+def real_replay(repo, path, mainline=None):
+    """The replay of the runner, with the real parents and blobs of git."""
+    return GitSource(str(repo), merge_parents(str(repo))).replay(
+        path, mainline, None)
+
+
 def tip_born(rp, repo, path):
     tip = git(repo, "rev-parse", f"HEAD:{path}").strip()
     ids = rp.state_of_blob(tip, 2**62)
@@ -108,14 +114,7 @@ def test_deleted_file_and_recreated(repo):
 
 def test_mainline_intervals(repo):
     rp = replay(repo, "a.c")
-    fp = git(repo, "log", "--first-parent", "--reverse", "-m", "--raw",
-             "--no-abbrev", "--format=\x01%H %ct", "--", "a.c")
-    changes, sha = [], None
-    for line in fp.splitlines():
-        if line.startswith("\x01"):
-            sha, ct = line[1:].split()
-        elif line.startswith(":"):
-            changes.append((sha, int(ct), line.split()[3]))
+    changes = mainline_changes(str(repo), [])["a.c"]
     iv = rp.mainline_intervals(changes)
     side1 = next(i for i, t in enumerate(rp.tokens) if t.text == "side1")
     merge = git(repo, "rev-parse", "HEAD~1").strip()
@@ -153,8 +152,7 @@ def test_merge_follows_real_parent_order(repo):
     git(repo, "merge", "-q", "--no-ff", "--no-commit", "redo")
     write(repo, "a.c", base + ["tail", "merged"])
     commit(repo, "merge redo", "2020-07-03T00:00:00")
-    rp = PathReplay(parse_log(path_log(str(repo), "a.c")),
-                    **real_parent_sources(str(repo), "a.c")).run()
+    rp = real_replay(repo, "a.c")
     born, _ = tip_born(rp, repo, "a.c")
     assert born == blame(repo, "a.c")
 
@@ -174,30 +172,16 @@ def test_merge_equal_to_second_parent_takes_it_whole(repo):
     git(repo, "merge", "-q", "--no-ff", "--no-commit", "same")
     write(repo, "a.c", base + ["s"])
     commit(repo, "merge same", "2020-07-05T00:00:00")
-    rp = PathReplay(parse_log(path_log(str(repo), "a.c")),
-                    **real_parent_sources(str(repo), "a.c")).run()
+    rp = real_replay(repo, "a.c")
     born, _ = tip_born(rp, repo, "a.c")
     assert born == blame(repo, "a.c")
 
 
-def first_parent_changes(repo, path):
-    fp = git(repo, "log", "--first-parent", "--reverse", "-m", "--raw",
-             "--no-abbrev", "--format=\x01%H %ct", "--", path)
-    changes, sha, ct = [], None, 0
-    for line in fp.splitlines():
-        if line.startswith("\x01"):
-            sha, ct = line[1:].split()
-        elif line.startswith(":"):
-            changes.append((sha, int(ct), line.split()[3]))
-    return changes
-
-
 def test_freeing_states_changes_nothing(repo):
     test_merge_follows_real_parent_order(repo)
-    changes = first_parent_changes(repo, "a.c")
-    src = real_parent_sources(str(repo), "a.c")
-    full = PathReplay(parse_log(path_log(str(repo), "a.c")), **src).run()
-    lean = PathReplay(parse_log(path_log(str(repo), "a.c")), **src).run(changes)
+    changes = mainline_changes(str(repo), [])["a.c"]
+    full = real_replay(repo, "a.c")
+    lean = real_replay(repo, "a.c", changes)
     assert len(lean.state) < len(full.state)
     assert lean.tokens == full.tokens
     assert lean.mainline_intervals(changes) == full.mainline_intervals(changes)
@@ -236,8 +220,7 @@ def test_a_line_kept_from_two_parents_becomes_a_copy(tmp_path):
                     "--no-commit", "keep"], capture_output=True)
     write(r, "d.c", ["A", "P", "Q", "A"])
     commit(r, "merge keeps both", "2021-01-04T00:00:00")
-    rp = PathReplay(parse_log(path_log(str(r), "d.c")),
-                    **real_parent_sources(str(r), "d.c")).run()
+    rp = real_replay(r, "d.c")
     for ids in rp.state.values():
         assert len(ids) == len(set(ids))
     born, _ = tip_born(rp, r, "d.c")
@@ -262,8 +245,7 @@ def test_merge_that_brings_a_new_file_to_main(tmp_path):
     commit(r, "merge topic with a fix", "2022-01-04T00:00:00")
     write(r, "n.c", ["a", "b", "c", "fixed in merge", "later"])
     commit(r, "later", "2022-01-05T00:00:00")
-    rp = PathReplay(parse_log(path_log(str(r), "n.c")),
-                    **real_parent_sources(str(r), "n.c")).run()
+    rp = real_replay(r, "n.c")
     born, _ = tip_born(rp, r, "n.c")
     assert born == blame(r, "n.c")
 
