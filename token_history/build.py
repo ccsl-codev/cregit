@@ -14,14 +14,12 @@ import argparse
 import glob
 import os
 import shutil
-import sys
 import time
 
 import duckdb
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from moves import MODES, link  # noqa: E402
-from token_history import COLUMNS, RUN_COLUMNS, SEP, log  # noqa: E402
+from moves import MODES, link
+from token_history import COLUMNS, RUN_COLUMNS, SEP, log
 
 TYPES = dict(token_id="BIGINT", born_in_merge="INTEGER", copy_of="BIGINT",
              tip_index="BIGINT", origin_token_id="BIGINT",

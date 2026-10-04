@@ -16,14 +16,12 @@ import multiprocessing as mp
 import os
 import re
 import subprocess
-import sys
 import time
 import traceback
 from datetime import datetime
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from replay import (HEADER, NULL_BLOB, GitError, PathReplay,  # noqa: E402
-                    diff_hunks, git_out, parse_log, path_log)
+from replay import (HEADER, NULL_BLOB, GitError, PathReplay, diff_hunks,
+                    git_out, parse_log, path_log)
 
 MASK = re.compile(r"\.[ch]$")
 SEP = "\x1f"
