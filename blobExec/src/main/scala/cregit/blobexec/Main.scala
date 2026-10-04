@@ -78,9 +78,9 @@ object Main {
       |  --tokenizer-worker=<path>
       |                    keep one protocol-speaking tokenizer process alive per
       |                    available processor and route blob requests through it.
-      |                    The worker receives BFG_MEMO_DIR and BFG_TOKENIZE_CMD
-      |                    from this process; without this flag <command> is run
-      |                    once per blob as before.
+      |                    The worker inherits this process's environment. Needs
+      |                    --pipeline or --pipeline-trees; without this flag
+      |                    <command> is run once per blob.
       |  --blob-timeout=<seconds>
       |                    budget for one <command> invocation (default ${BlobExec.DefaultTimeoutSeconds}).
       |                    A child that exceeds it is killed with everything
@@ -297,10 +297,7 @@ object Main {
     val (stats, timedOutEver) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
       workerPool = tokenizerWorkerPath.map { path =>
-        val workerEnv = Seq("BFG_MEMO_DIR", "BFG_TOKENIZE_CMD").flatMap { key =>
-          sys.env.get(key).map(key -> _)
-        }.toMap
-        new TokenizerWorkerPool(Seq(path.toString), workerEnv, parallelism)
+        new TokenizerWorkerPool(Seq(path.toString), parallelism)
       }
       workerShutdownHook = workerPool.map { pool =>
         val hook = new Thread(() => pool.close(), "tokenizer-worker-pool-shutdown")

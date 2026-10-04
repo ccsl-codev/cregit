@@ -94,7 +94,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   override def afterAll(): Unit = deleteRecursive(tmpDir)
 
   test("round-trips bytes and preserves parser crash status") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), size = 1)
     try {
       val (exit, stdout, stderr) = exited(request(pool, "hello.c", "hello", "a" * 40))
       exit shouldEqual 0
@@ -110,7 +110,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   }
 
   test("sends each request's own budget to the worker") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), size = 1)
     try {
       exited(request(pool, "budget.c", "x", "9" * 40, timeoutSeconds = 7))._2 shouldEqual "7".getBytes(UTF_8)
       exited(request(pool, "budget.c", "x", "9" * 40, timeoutSeconds = 21))._2 shouldEqual "21".getBytes(UTF_8)
@@ -118,7 +118,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   }
 
   test("times out a wedged worker, kills its children, replaces it, and serves the next request") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), size = 1)
     try {
       val started = System.nanoTime()
       val hung = request(pool, "hang.c", "hang", "c" * 40, timeoutSeconds = 1)
@@ -138,7 +138,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
 
   test("serves pool-sized requests in parallel") {
     implicit val ec: ExecutionContext = ExecutionContext.global
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 3)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), size = 3)
     try {
       val started = System.nanoTime()
       val requests = (1 to 3).map { n =>
@@ -154,7 +154,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   }
 
   test("maps worker timeout status and respawns after mid-request death") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), size = 1)
     try {
       val timedOut = request(pool, "timeout.c", "slow", "e" * 40)
       timedOut shouldBe a[Killed]
@@ -171,7 +171,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   }
 
   test("close terminates every worker process") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 2)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), size = 2)
     val pids = pool.currentWorkerPids
     pids should have size 2
 

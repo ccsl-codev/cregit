@@ -8,7 +8,6 @@ import scala.jdk.CollectionConverters._
 
 final class TokenizerWorkerPool(
     workerCommand: Seq[String],
-    env: Map[String, String],
     size: Int
 ) extends AutoCloseable {
 
@@ -122,7 +121,6 @@ final class TokenizerWorkerPool(
 
   private def startWorker(index: Int): Worker = {
     val builder = new ProcessBuilder(workerCommand: _*)
-    builder.environment().putAll(env.asJava)
     val process = builder.start()
     val worker = new Worker(
       index,
