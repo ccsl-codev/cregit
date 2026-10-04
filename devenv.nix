@@ -1,42 +1,7 @@
 { pkgs, ... }:
 
 let
-  # srcml is not in nixpkgs — package the official prebuilt binary.
-  # On feat/blob-exec-as-library we work on macOS arm64; on Linux x86_64
-  # the upstream Linux binary still works.
-  srcml =
-    if pkgs.stdenv.hostPlatform.isDarwin then
-      pkgs.stdenv.mkDerivation {
-        pname = "srcml";
-        version = "1.1.0";
-        src = pkgs.fetchurl {
-          url = "https://github.com/srcML/srcML/releases/download/v1.1.0/srcml-1.1.0-macOS-arm64.tar.gz";
-          sha256 = "1hxb6rzdbbfcqssirgzsrk81hcls4sjgdrz0zq34lar9v6n7zriq";
-        };
-        sourceRoot = "srcml-1.1.0-macOS-arm64";
-        installPhase = ''
-          mkdir -p $out
-          cp -r usr/local/bin usr/local/lib usr/local/share $out/
-        '';
-      }
-    else
-      pkgs.stdenv.mkDerivation {
-        pname = "srcml";
-        version = "1.1.0";
-        src = pkgs.fetchurl {
-          url = "https://github.com/srcML/srcML/releases/download/v1.1.0/srcml_1.1.0-1_linux_amd64.tar.bz2";
-          sha256 = "1hh9ii5fr4gv6xn81g99a9nr29x166hvmjkci4ygjriwkj63g7mz";
-        };
-        nativeBuildInputs = [ pkgs.autoPatchelfHook ];
-        buildInputs = [ pkgs.stdenv.cc.cc.lib ];
-        sourceRoot = ".";
-        installPhase = ''
-          mkdir -p $out/bin $out/lib $out/share
-          install -m755 bin/srcml $out/bin/
-          cp -P lib/libsrcml.so.1 lib/libsrcml.so.1.1.0 $out/lib/
-          cp -r share/. $out/share/
-        '';
-      };
+  srcml = pkgs.callPackage ./nix/srcml.nix { };
 
   EmailFind = pkgs.perlPackages.buildPerlPackage rec {
     pname = "Email-Find";
