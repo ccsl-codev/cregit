@@ -95,8 +95,8 @@ jobs:
       # Without this step the coverage rule never reaches the dataset code.
       # devenv.nix already supplies pytest (see the comment beside
       # python3.withPackages), so only the CI step was missing.
-      - name: Python tests (pytest, generate_dataset)
-        run: devenv shell -- pytest generate_dataset -q --junitxml=junit-generate-dataset.xml
+      - name: Python tests (pytest, generate_dataset, token_history)
+        run: devenv shell -- pytest generate_dataset token_history -q --junitxml=junit-generate-dataset.xml
 
       # `devenv shell -- pytest` does not flush its summary line, so the printed
       # count is not trustworthy. Read the counts from the XML instead, and fail
