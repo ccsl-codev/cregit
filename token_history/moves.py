@@ -85,29 +85,3 @@ def link(runs, text_of, mode, min_alnum):
                 links[b] = d
                 used.add(d)
     return links
-
-
-def origins(links):
-    """Follow each chain of moves back to the token's first identity."""
-    root = {}
-
-    def find(key):
-        chain = []
-        while key in links and key not in root:
-            chain.append(key)
-            key = links[key]
-        top = root.get(key, key)
-        for k in chain:
-            root[k] = top
-        return top
-
-    for key in links:
-        find(key)
-    return root
-
-
-def by_commit(run_rows):
-    grouped = defaultdict(list)
-    for sha, kind, whole, path, ids in run_rows:
-        grouped[sha].append((kind, whole, path, ids))
-    return grouped

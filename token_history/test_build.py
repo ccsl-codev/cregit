@@ -1,7 +1,7 @@
 import duckdb
 import pytest
 
-from build import commit_runs, load
+from build import commit_runs, load, resolve_origins
 from token_history import SEP
 
 
@@ -42,3 +42,13 @@ def test_a_path_written_again_by_a_resume_is_loaded_once(tmp_path):
 def test_no_part_files_is_a_clear_error(tmp_path):
     with pytest.raises(SystemExit, match="no part"):
         load(duckdb.connect(), str(tmp_path))
+
+
+def test_origins_follow_chains():
+    con = duckdb.connect()
+    con.execute("CREATE TABLE links (file_path VARCHAR, token_id BIGINT, "
+                "origin_path VARCHAR, origin_token_id BIGINT)")
+    con.execute("INSERT INTO links VALUES ('c', 1, 'b', 1), ('b', 1, 'a', 1)")
+    resolve_origins(con)
+    assert sorted(con.execute("FROM links").fetchall()) == [
+        ("b", 1, "a", 1), ("c", 1, "a", 1)]

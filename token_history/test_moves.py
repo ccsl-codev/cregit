@@ -1,8 +1,4 @@
-from moves import link, origins
-
-
-def texts(d):
-    return lambda key: d[key]
+from moves import link, matching_blocks
 
 
 RUN = ["int", "alpha_long_identifier", ";", "beta_long_identifier"]
@@ -15,7 +11,7 @@ def runs_and_text(moved_whole=True):
         tx[("new.c", i)] = t
     runs = [("died", moved_whole, "old.c", [10, 11, 12, 13]),
             ("born", moved_whole, "new.c", [0, 1, 2, 3])]
-    return runs, texts(tx)
+    return runs, tx.__getitem__
 
 
 def test_off_links_nothing():
@@ -41,14 +37,8 @@ def test_short_runs_do_not_move():
     assert link(runs, tx, "moves", 10_000) == {}
 
 
-def test_origins_follow_chains():
-    links = {("c", 1): ("b", 1), ("b", 1): ("a", 1)}
-    assert origins(links) == {("c", 1): ("a", 1), ("b", 1): ("a", 1)}
-
-
 def test_matching_blocks_on_a_long_repetitive_run():
     import time
-    from moves import matching_blocks
     a = [";", "}", "x", ";"] * 20000 + ["unique_tail_token"] * 10
     b = ["new"] + a
     t = time.time()
