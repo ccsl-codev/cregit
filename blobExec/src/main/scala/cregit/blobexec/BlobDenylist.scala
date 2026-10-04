@@ -10,11 +10,10 @@ import scala.util.Using
   *
   * The corpus holds four blobs on which srcML 1.1.0 does not terminate: it
   * produces 0 bytes, pegs one core and never finishes, at every budget from 5 s to
-  * 600 s. The per-blob timeout (see [[BlobExec]]) contains that, but at the price
-  * of exit 4 — "incomplete, do not publish" — which is the right answer for a hang
-  * nobody has diagnosed and the wrong one here: this hang IS diagnosed, with a
-  * minimal reproducer and an open upstream defect. Blocking the project forever on
-  * a known third-party parser bug is not a finding, it is a stuck pipeline.
+  * 600 s. The per-blob timeout (see [[BlobExec]]) excludes such a blob too, but
+  * only after it has spent the whole budget on it in every run. This hang is
+  * diagnosed, with a minimal reproducer and an open upstream defect, so the list
+  * excludes it at once and records the reason.
   *
   * So a denylisted blob takes the exclusion path instead, the same one an
   * oversized blob takes: excluded in milliseconds, dropped from every rewritten
@@ -57,8 +56,8 @@ object BlobDenylist {
   private val ShaPattern = "^[0-9a-f]{40}$".r
 
   /** Parse the TSV. Malformed input throws: a denylist that silently drops a line
-    * would silently re-introduce a blob that hangs the whole run for 600 s and then
-    * blocks publication, which is precisely the failure this list removes.
+    * would silently re-introduce a blob that costs a 600 s timeout in every run,
+    * which is precisely the cost this list removes.
     *
     * `where` names the source in any error message, because the same parser reads
     * the shipped resource and a test fixture.

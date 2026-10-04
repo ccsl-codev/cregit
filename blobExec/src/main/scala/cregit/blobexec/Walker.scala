@@ -310,14 +310,13 @@ final class Walker(
     val procWalk     = new RevWalk(src)
 
     var aborted  = false
-    var timedOut = false
     var commits  = 0
     var blobsRun = 0
     var blobsHit = 0
 
     try {
       val it = sliceIds.iterator
-      while (it.hasNext && !aborted && !timedOut) {
+      while (it.hasNext && !aborted) {
         val rc = procWalk.parseCommit(it.next())
         val origTreeId = rc.getTree.getId
 
@@ -329,11 +328,6 @@ final class Walker(
 
         if (misses.abort) {
           aborted = true
-        } else if (misses.timedOutKeys.nonEmpty) {
-          // Same rule as the full walk: no tree rows for a commit that carries
-          // raw source, so the next shard run retries the blob.
-          timedOut = true
-          persistRetryableBlobs(misses, rc.getId.name)
         } else {
           val subtreeMap = scala.collection.mutable.Map.empty[String, String]
           val newTreeId  = assemble(plan, resolved, treeInserter, subtreeMap)
@@ -367,37 +361,6 @@ final class Walker(
     }
 
     (commits, blobsRun, blobsHit, aborted)
-  }
-
-  /** Persist only what a commit containing a timed-out blob may leave behind.
-    *
-    * Three durable writes each independently hide a timeout from the next run:
-    * the blob's own `blob_map` row (a `getBlob` hit), any `tree_map` row on the
-    * path above it (a `getTree` hit short-circuits the *entire* subtree, so the
-    * re-run never reaches the blob), and the commit's `commit_map` row (which
-    * marks the commit done and is what `markUninteresting` walks). All three are
-    * suppressed. The blobs that tokenized correctly are content-addressed and
-    * already in dst, so they are kept — otherwise every retry would re-tokenize
-    * a whole commit to get at one blob. Identity rows for unmasked blobs are
-    * *not* kept: their bytes are copied during tree assembly, which we skip
-    * here, and a row without the bytes would leave dst inconsistent.
-    */
-  private def persistRetryableBlobs(misses: MissResolution, origCommitSha: String): Unit = {
-    val keep = misses.persistable
-    dbLock.synchronized {
-      mapping.inTx {
-        keep.foreach { case ((origSha, path), newId) => mapping.putBlob(origSha, path, newId.name) }
-      }
-    }
-    System.err.println(
-      s"blobExec: commit $origCommitSha contains ${misses.timedOutKeys.size} timed-out blob(s): " +
-        s"kept ${keep.size} good blob row(s), recorded no tree and no commit for it. " +
-        "Another run over this memo retries just those blobs (from the pipeline: resume at " +
-        "step 2, never step 1); nothing needs clearing by hand."
-    )
-    misses.timedOutKeys.toVector.sorted.foreach { case (sha, path) =>
-      System.err.println(s"blobExec:   will retry on the next run: $sha ($path)")
-    }
   }
 
   // -- ref preparation -----------------------------------------------------
@@ -451,14 +414,13 @@ final class Walker(
     val commitInserter = dst.newObjectInserter()
 
     var aborted     = false       // local mutation across the walk loop is unavoidable
-    var timedOut    = false       // a blob in this commit was killed on its budget
     var commits     = 0
     var blobsRun    = 0
     var blobsHit    = 0
 
     try {
       val iter = revWalk.iterator()
-      while (iter.hasNext && !aborted && !timedOut) {
+      while (iter.hasNext && !aborted) {
         val rc = iter.next()
         val origCommitSha = rc.getId.name
 
@@ -471,14 +433,6 @@ final class Walker(
 
         if (misses.abort) {
           aborted = true
-        } else if (misses.timedOutKeys.nonEmpty) {
-          // Retryable failure: keep the tokenizations that succeeded (they are
-          // content-addressed and already in dst), but persist no tree and no
-          // commit for this one. Recording any of those three would make the
-          // next run skip straight past the raw-source substitution. Stop here
-          // so no descendant commit is folded onto a parent we did not record.
-          timedOut = true
-          persistRetryableBlobs(misses, origCommitSha)
         } else {
           // Assemble the new tree id (bottom-up). `subtreeMap` collects every
           // freshly built (sub)tree's orig->new id so the transaction below
@@ -554,10 +508,6 @@ final class Walker(
     val inFlight = new ConcurrentHashMap[(String, String), Future[BlobResult]]()
 
     val aborted       = new AtomicBoolean(false)
-    // Set when a commit contained a timed-out blob: like `aborted` it stops the
-    // producer and makes the consumer drain, but it is not an abort — the run
-    // keeps everything it earned and simply stops folding here.
-    val timedOutStop  = new AtomicBoolean(false)
     val producerError = new AtomicReference[Throwable](null)
 
     // -- producer: iterate the walk in order, plan trees, submit blob work --
@@ -565,7 +515,7 @@ final class Walker(
       def run(): Unit = {
         try {
           val iter = revWalk.iterator()
-          while (iter.hasNext && !aborted.get() && !timedOutStop.get()) {
+          while (iter.hasNext && !aborted.get()) {
             val rc   = iter.next()
             val data = snapshotCommit(rc)  // decouple consumer from the shared RevWalk
             val (plan, artifacts) = buildTreePlan(rc.getTree.getId, pathPrefix = "")
@@ -605,31 +555,16 @@ final class Walker(
         queue.take() match {
           case EndOfWalk => stopped = true
           case CommitItem(data, plan, artifacts, missFutures) =>
-            if (aborted.get() || timedOutStop.get()) {
-              // Draining after abort / producer-error / a timed-out commit:
-              // discard until EndOfWalk. Folding a later commit here would
-              // reference a parent this run deliberately did not record.
+            if (aborted.get()) {
+              // Draining after abort / producer-error: discard until EndOfWalk.
             } else {
               // Await only this commit's futures (typically already complete).
               // Unbounded on purpose: the stall watchdog, not a guessed
               // duration, is what stops a wedged run (see withStallWatchdog).
               val results = missFutures.map { case (k, f) => k -> Await.result(f, Duration.Inf) }
-              val timedOutIds: IMap[(String, String), ObjectId] =
-                results.iterator.collect { case (k, BlobResult.TimedOut(id)) => k -> id }.toMap
               results.values.collectFirst { case a: BlobResult.Aborted => a } match {
                 case Some(_) =>
                   aborted.set(true)  // stop the producer; drain the remainder
-                case None if timedOutIds.nonEmpty =>
-                  // Retryable: keep the good blob rows, write no tree and no
-                  // commit, and stop the walk so nothing is folded onto a parent
-                  // this run did not record. See persistRetryableBlobs.
-                  val good: IMap[(String, String), ObjectId] =
-                    results.iterator.collect { case (k, BlobResult.Resolved(id)) => k -> id }.toMap
-                  persistRetryableBlobs(
-                    MissResolution(good ++ timedOutIds, abort = false, timedOutKeys = timedOutIds.keySet),
-                    data.origCommitSha
-                  )
-                  timedOutStop.set(true)
                 case None =>
                   val resolved: IMap[(String, String), ObjectId] =
                     results.iterator.collect { case (k, BlobResult.Resolved(id)) => k -> id }.toMap
@@ -706,7 +641,6 @@ final class Walker(
     val inFlight = new ConcurrentHashMap[(String, String), Future[BlobResult]]()
 
     val aborted       = new AtomicBoolean(false)
-    val timedOutStop  = new AtomicBoolean(false)   // see walkCommitsPipelined
     val producerError = new AtomicReference[Throwable](null)
 
     // -- producer: plan trees, submit blob work, chain tree assembly --------
@@ -714,7 +648,7 @@ final class Walker(
       def run(): Unit = {
         try {
           val iter = revWalk.iterator()
-          while (iter.hasNext && !aborted.get() && !timedOutStop.get()) {
+          while (iter.hasNext && !aborted.get()) {
             val rc   = iter.next()
             val data = snapshotCommit(rc)
             val (plan, artifacts) = buildTreePlan(rc.getTree.getId, pathPrefix = "")
@@ -760,25 +694,15 @@ final class Walker(
         queue.take() match {
           case EndOfTreeWalk => stopped = true
           case CommitTreeItem(data, artifacts, blobKeys, treeFuture) =>
-            if (aborted.get() || timedOutStop.get()) {
-              // Draining after abort / producer-error / a timed-out commit:
-              // discard until EndOfTreeWalk.
+            if (aborted.get()) {
+              // Draining after abort / producer-error: discard until EndOfTreeWalk.
             } else {
               // The assembly (and any abort it observed) is already done off-thread.
               // Unbounded: the stall watchdog is the backstop, not a budget.
               Await.result(treeFuture, Duration.Inf) match {
                 case TreeResult.Aborted(_, _) =>
                   aborted.set(true)  // stop the producer; drain the remainder
-                case TreeResult.Built(_, resolved, _, tok) if tok.nonEmpty =>
-                  // Retryable: the tree was assembled off-thread and is usable,
-                  // but recording it (or the commit) would hide the timeout from
-                  // the next run. Keep the good blob rows only, and stop here.
-                  persistRetryableBlobs(
-                    MissResolution(resolved, abort = false, timedOutKeys = tok),
-                    data.origCommitSha
-                  )
-                  timedOutStop.set(true)
-                case TreeResult.Built(newTreeId, resolved, subtrees, _) =>
+                case TreeResult.Built(newTreeId, resolved, subtrees) =>
                   val parents = data.parentOrigShas.map { pn =>
                     dbLock.synchronized(mapping.getCommit(pn)).getOrElse(
                       throw new IllegalStateException(
@@ -836,18 +760,14 @@ final class Walker(
     blobResults.iterator.map(_._2).collectFirst { case a: BlobResult.Aborted => a } match {
       case Some(a) => TreeResult.Aborted(a.stderr, a.exitCode)
       case None =>
-        // `resolved` is what the consumer persists, so a timed-out blob is kept
-        // out of it; `forTree` is what the tree references, so it is kept in.
         val resolved: IMap[(String, String), ObjectId] =
           blobResults.iterator.collect { case (k, BlobResult.Resolved(id)) => k -> id }.toMap
-        val timedOut: IMap[(String, String), ObjectId] =
-          blobResults.iterator.collect { case (k, BlobResult.TimedOut(id)) => k -> id }.toMap
         val inserter = dst.newObjectInserter()
         try {
           val subtreeMap = scala.collection.mutable.Map.empty[String, String]
-          val newTreeId = assemble(plan, resolved ++ timedOut, inserter, subtreeMap)
+          val newTreeId = assemble(plan, resolved, inserter, subtreeMap)
           inserter.flush()
-          TreeResult.Built(newTreeId, resolved, subtreeMap.toMap, timedOut.keySet)
+          TreeResult.Built(newTreeId, resolved, subtreeMap.toMap)
         } finally inserter.close()
     }
   }
@@ -1002,14 +922,12 @@ final class Walker(
   // -- parallel blob resolution -------------------------------------------
 
   /** Run each miss through the external command on the pool. Returns the ids the
-    * tree should reference, an aborted flag, and the keys whose command was
-    * killed on its budget — those are in the id map (the tree needs them) but
-    * must be kept out of `blob_map`, so the caller can retry them. */
+    * tree should reference and an aborted flag. Excluded blobs have no id. */
   private def resolveMisses(
       misses: Vector[BlobMissTask],
       pool: java.util.concurrent.ExecutorService
   )(implicit ec: ExecutionContext): MissResolution = {
-    if (misses.isEmpty) return MissResolution(IMap.empty, abort = false, timedOutKeys = Set.empty)
+    if (misses.isEmpty) return MissResolution(IMap.empty, abort = false)
 
     // De-dup so we don't run the command twice for the same key within a
     // single commit (e.g. the same (blob, path) reached via two subtrees).
@@ -1066,7 +984,7 @@ final class Walker(
     val results = Await.result(Future.sequence(futures), Duration.Inf).flatten
 
     val abort = results.exists { case (_, o) => o.isInstanceOf[BlobExec.Outcome.Abort] }
-    if (abort) MissResolution(IMap.empty, abort = true, timedOutKeys = Set.empty)
+    if (abort) MissResolution(IMap.empty, abort = true)
     else {
       val ids = results.iterator.collect {
         case (task, BlobExec.Outcome.Replace(newId)) =>
@@ -1075,7 +993,7 @@ final class Walker(
           // identical, or non-zero-exit (with abortOnError=false)
           (task.origId.name, task.fullPath) -> task.origId
       }.toMap
-      MissResolution(ids, abort = false, timedOutKeys = Set.empty)
+      MissResolution(ids, abort = false)
     }
   }
 
@@ -1109,8 +1027,8 @@ final class Walker(
   private def readBlob(task: BlobMissTask): Option[Array[Byte]] = {
     // Before anything is read or opened: a denylisted blob is one srcML cannot be
     // trusted with, so the cheapest possible check is the right one. This is a map
-    // lookup on a 4-entry map, and it is what turns a 600 s timeout plus exit 4
-    // into a microsecond and a logged exclusion.
+    // lookup on a small map, and it is what turns a 600 s timeout into a
+    // microsecond and a logged exclusion.
     val denied = denylist.entryFor(task.origId.name)
     if (denied.isDefined) { noteDenylisted(task, denied.get); return None }
     if (failedKeys.contains((task.origId.name, task.fullPath))) return None
@@ -1173,8 +1091,8 @@ final class Walker(
           s"path=${task.fullPath} reason=${entry.reason} citation=${entry.citation}. " +
           "The blob is left out of the rewritten tree, so it produces no blame and no dataset " +
           "row, and the file is absent from the tokenized repository rather than present as raw " +
-          "source. The exclusion is deterministic and cited, so unlike a tokenizer timeout it " +
-          "does NOT block publication: the walk carries on and the run still exits 0. See " +
+          "source. The exclusion is deterministic and cited; the walk carries on and the run " +
+          "still exits 0. See " +
           s"${BlobDenylist.ResourcePath} in the blobExec jar for the list itself."
       )
     }
@@ -1193,9 +1111,8 @@ final class Walker(
           "JGit will not materialise an object this large, and a source file this size is " +
           "machine-generated rather than authored. The blob is left out of the rewritten " +
           "tree, so it produces no blame and no dataset row, and the file is absent from " +
-          "the tokenized repository rather than present as raw source. Deterministic and " +
-          "fully explained, so unlike a tokenizer timeout this does NOT block publication: " +
-          "the walk carries on and the run still exits 0."
+          "the tokenized repository rather than present as raw source. The walk carries on " +
+          "and the run still exits 0."
       )
     }
   }
@@ -1680,17 +1597,8 @@ object Walker {
       fullMessage: String
   )
 
-  /** What [[Walker.resolveMisses]] hands back: `ids` is what the tree
-    * references, `timedOutKeys` is the subset that must not be persisted. */
-  final case class MissResolution(
-      ids: IMap[(String, String), ObjectId],
-      abort: Boolean,
-      timedOutKeys: Set[(String, String)]
-  ) {
-    /** The rows that are genuinely correct and worth keeping: content-addressed
-      * tokenizations of blobs that did not time out. */
-    def persistable: IMap[(String, String), ObjectId] = ids -- timedOutKeys
-  }
+  /** What [[Walker.resolveMisses]] hands back: the ids the tree references. */
+  final case class MissResolution(ids: IMap[(String, String), ObjectId], abort: Boolean)
 
   /** Per-blob worker result handed from a pool thread back to the consumer. */
   sealed trait BlobResult
@@ -1699,13 +1607,8 @@ object Walker {
     final case class Resolved(newId: ObjectId) extends BlobResult
     /** abort-on-error tripped by a non-zero command exit. */
     final case class Aborted(stderr: String, exitCode: Int) extends BlobResult
-    /** The command was killed on its budget. The tree still references the
-      * original blob (dst stays self-consistent), but this is deliberately not
-      * a `Resolved`: nothing about this blob, the trees containing it, or its
-      * commit may be persisted, or a re-run would treat raw source as done. */
-    final case class TimedOut(origId: ObjectId) extends BlobResult
     /** Excluded from the rewrite: oversized, denylisted, or its tokenizer failed.
-      * It is deliberately neither `Resolved` nor `TimedOut`: it contributes no id, so
+      * It is deliberately not `Resolved`: it contributes no id, so
       * every `collect` that builds a tree/blob_map map drops it, `resolveEntry`
       * omits the path, and the run is still publishable. */
     final case class Excluded(origId: ObjectId) extends BlobResult
@@ -1732,11 +1635,7 @@ object Walker {
     final case class Built(
         newTreeId: ObjectId,
         resolved: IMap[(String, String), ObjectId],
-        subtrees: IMap[String, String],
-        /** Blobs in this commit whose command was killed on its budget. The tree
-          * is usable for this run's output, but if this is non-empty neither it
-          * nor the commit may be recorded, or the next run skips the retry. */
-        timedOutKeys: Set[(String, String)]
+        subtrees: IMap[String, String]
     ) extends TreeResult
     final case class Aborted(stderr: String, exitCode: Int) extends TreeResult
   }

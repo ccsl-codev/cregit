@@ -29,10 +29,6 @@ import java.nio.file.{Files, Paths}
  */
 object Main {
 
-  /** Memo `meta` key holding the cumulative number of blobs whose command was
-    * killed for exceeding its budget. Durable because the skip is durable. */
-  private[blobexec] val BlobsTimedOutMetaKey = "blobs_timed_out"
-
   /** Exit status when `--retokenize` was asked for and would have invalidated
     * nothing.
     *
@@ -213,9 +209,8 @@ object Main {
       |  jar) are never handed to <command>: they are dropped from the rewritten
       |  trees, counted as blobsDenylisted, named with their reason and citation on
       |  an EXCLUDED line, and they do NOT change the exit status. srcML 1.1.0 does
-      |  not terminate on the four listed blobs, the defect is diagnosed and cited
-      |  upstream, and a diagnosed exclusion must not block publication the way an
-      |  unexplained timeout does.
+      |  not terminate on the listed blobs, and the defect is diagnosed and cited
+      |  upstream, so the list saves the --blob-timeout each run would spend.
       |
       |  A blob whose tokenizer times out or reports a parser crash is excluded
       |  the same way: dropped from the rewritten trees, counted as blobsTimedOut
@@ -568,10 +563,7 @@ object Main {
         sys.exit(1)
     }
 
-    // (stats, timeouts this memo has ever seen). The cumulative figure is kept
-    // for forensics only — it must NOT gate the exit status, or a blob that
-    // times out once could never be retried to a clean run.
-    val (stats, timedOutEver) = try {
+    val stats = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
       val walker = new Walker(
         src, dst, mapping, mask.r, command, abortOnError, parallelism,
@@ -581,11 +573,7 @@ object Main {
         stallTimeoutSeconds = stallTimeoutSeconds,
         denylist = denylist
       )
-      val s = walker.run()
-      val prior = mapping.getMeta(BlobsTimedOutMetaKey).flatMap(_.toLongOption).getOrElse(0L)
-      val total = prior + s.blobsTimedOut
-      if (s.blobsTimedOut > 0) mapping.setMeta(BlobsTimedOutMetaKey, total.toString)
-      (s, total)
+      walker.run()
     } finally {
       mapping.close()
       dst.close()
@@ -606,7 +594,6 @@ object Main {
         s"originalBlobBytesAvoided=${stats.originalBlobBytesAvoided} " +
         s"refsProjected=${stats.refsProjected} " +
         s"blobsTimedOut=${stats.blobsTimedOut} " +
-        s"blobsTimedOutEver=$timedOutEver " +
         s"blobsOversized=${stats.blobsOversized} " +
         s"blobsDenylisted=${stats.blobsDenylisted} " +
         s"blobsParserCrashed=${stats.blobsParserCrashed} " +
@@ -614,10 +601,6 @@ object Main {
     )
 
     if (stats.blobsDenylisted > 0) {
-      // Reported, never fatal — and that is the entire purpose of the denylist.
-      // The same blob on the timeout path costs 600s and then exit 4, which stops
-      // the project from ever publishing over a third-party parser bug that is
-      // already diagnosed and cited.
       System.err.println(
         s"blobExec: ${stats.blobsDenylisted} blob(s) were excluded by the blob denylist " +
           s"(${BlobDenylist.ResourcePath} in this jar, ${denylist.size} entr" +

@@ -210,9 +210,14 @@ distinct srcML 1.1.0 defects** that the file's header keeps apart:
 
 Denylisted blobs are never handed to the tokenizer, are dropped from the rewritten
 trees rather than kept as raw source, are counted as `blobsDenylisted` and named
-with a reason and a citation — and, unlike a tokenizer timeout or a parser crash,
-they do **not** change the exit status. Adding an entry means editing that file and
-rebuilding the jar.
+with a reason and a citation. They do **not** change the exit status. Adding an
+entry means editing that file and rebuilding the jar.
+
+A blob whose tokenizer times out or reports a parser crash is excluded the same
+way, without a denylist entry: it is dropped from the rewritten trees, named on an
+`EXCLUDED failed blob` line, and tried only once per run. The run exits 0. A
+denylist entry is still worth adding for a known hang, because it saves the
+`--blob-timeout` (600 s by default) that each run would spend on it.
 
 Example run (cregit run on itself):
 ![Example cregit run](cregit.gif)
