@@ -293,16 +293,10 @@ object Main {
     // The cumulative figure is forensic only: gating on it would make one past
     // timeout permanent.
     var workerPool: Option[TokenizerWorkerPool] = None
-    var workerShutdownHook: Option[Thread] = None
     val (stats, timedOutEver) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
       workerPool = tokenizerWorkerPath.map { path =>
         new TokenizerWorkerPool(Seq(path.toString), parallelism)
-      }
-      workerShutdownHook = workerPool.map { pool =>
-        val hook = new Thread(() => pool.close(), "tokenizer-worker-pool-shutdown")
-        Runtime.getRuntime.addShutdownHook(hook)
-        hook
       }
       val walker = new Walker(
         src, dst, mapping, mask.r, command, abortOnError, parallelism,
@@ -320,10 +314,6 @@ object Main {
       (s, total)
     } finally {
       workerPool.foreach(_.close())
-      workerShutdownHook.foreach { hook =>
-        try Runtime.getRuntime.removeShutdownHook(hook)
-        catch { case _: IllegalStateException => () }
-      }
       mapping.close()
       dst.close()
       src.close()
