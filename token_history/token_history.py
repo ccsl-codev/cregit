@@ -90,15 +90,13 @@ class GitSource:
         out = line.split()[0]
         return out if len(out) == 40 else NULL_BLOB
 
-    def diff_blobs(self, a, b):
-        return diff_hunks(self.repo, a, b)
-
     def replay(self, path, mainline, run_min_alnum):
         self.path = path
         commits = parse_log(path_log(self.repo, path))
         self.rewritten = {c.sha: c.parents for c in commits}
         return PathReplay(commits, real_parents=self.real_parents,
-                          blob_at=self.blob_at, diff_blobs=self.diff_blobs,
+                          blob_at=self.blob_at,
+                          diff_blobs=lambda a, b: diff_hunks(self.repo, a, b),
                           run_min_alnum=run_min_alnum).run(mainline)
 
 
@@ -153,8 +151,7 @@ def replay_path(path):
     WORKER["runs"].write("".join(runs))
     WORKER["out"].flush()
     WORKER["runs"].flush()
-    n = len(lines)
-    return dict(path=path, tokens=len(rp.tokens), rows=n,
+    return dict(path=path, tokens=len(rp.tokens), rows=len(lines),
                 commits=len(rp.commits), seconds=round(time.time() - t0, 2),
                 missing_parents=rp.missing_parents,
                 unaligned_merges=rp.unaligned_merges,
@@ -174,8 +171,7 @@ class Progress:
         self.done += 1
         if "error" in r:
             self.flags["errors"] += 1
-            r = dict(r, tokens=0, rows=0, seconds=0, missing_parents=0,
-                     unaligned_merges=0, unmapped_mainline=0)
+            r = dict(r, tokens=0, rows=0, seconds=0)
         self.tokens += r["tokens"]
         self.rows += r["rows"]
         for k in self.flags:

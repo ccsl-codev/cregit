@@ -6,6 +6,7 @@ unchanged. At a merge, a line takes its identity from the first parent that
 has it unchanged, as `git blame` does; a line that no parent has is born in
 the merge.
 """
+import functools
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -144,22 +145,12 @@ class PathReplay:
         self.blob_nodes = {}
         self.order = {c.sha: i for i, c in enumerate(commits)}
         self.real_parents = real_parents
-        self.blob_at = blob_at and self.cached(blob_at)
+        self.blob_at = blob_at and functools.cache(blob_at)
         self.diff_blobs = diff_blobs
         self.run_min_alnum = run_min_alnum
         self.runs = []
         self.missing_parents = 0
         self.unaligned_merges = 0
-
-    @staticmethod
-    def cached(fn):
-        cache = {}
-
-        def lookup(sha):
-            if sha not in cache:
-                cache[sha] = fn(sha)
-            return cache[sha]
-        return lookup
 
     def born(self, text, commit, in_merge):
         self.tokens.append(Token(text, commit.sha, in_merge))
