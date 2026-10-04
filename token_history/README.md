@@ -14,7 +14,7 @@ The tip dataset (`generate_dataset`) holds only the tokens alive at HEAD. This s
 
 On the io_uring pilot (96 paths) stage 1 takes 2–3 min and stage 2 under 10 s.
 
-Stage 2 reads only the files of stage 1. Keep them: every mode, and any later change to the move rules, rebuilds from them without a new replay. A change to the replay rules (`replay.py`) needs a new stage 1.
+Stage 2 reads only the files of stage 1. Keep them: every mode, and a change to `moves.py`, rebuilds from them without a new replay, within one limit: stage 1 keeps only runs of at least `--run-min-alnum` (100) alphanumeric characters. So with a `--min-alnum` below 100, a removed or added run shorter than 100 still never links, and `renames` never links a file with fewer than 100. A change to `replay.py` or to `--run-min-alnum` needs a new stage 1.
 
 At kernel scale, stage 2 works in parts so that it stays inside its memory limit (`--memory`, default 6 GB):
 
@@ -36,7 +36,7 @@ At kernel scale, stage 2 works in parts so that it stays inside its memory limit
 - `git blame -C100` diffs a block against the whole old file, so it drops a move that its diff breaks into short pieces. `moves` keeps some of those.
 - Measured on Linux (a 1/32 sample of the tip, 5.49 M tokens, 30 Sep 2026): where the two disagree on the birth time, `-C100` gives the **older** commit in about 87% of the cases (981,149 tokens against 145,019).
 
-On the whole Linux tip, the origin commit agrees with the `-C100` tip dataset on 80.46% of the tokens for `moves` and 81.13% for `renames` (`history/validate-<mode>.json`). A rule that copies `git blame -C` needs only the repository and the stage 1 files, so it can be added to `moves.py` later.
+On the whole Linux tip, the origin commit agrees with the `-C100` tip dataset on 80.46% of the tokens for `moves` and 81.13% for `renames` (`validate.py`). A rule that copies `git blame -C` needs only the repository and the stage 1 files, so it can be added to `moves.py` later.
 
 ## Run
 
@@ -65,7 +65,7 @@ python3 attribute.py --cregit-db X-cregit.db --persons-db X-persons.db \
 
 `validate.py` compares only the dataset rows of the files that the history has (so only `.c` and `.h`). Its `same_text` counts tokens whose text matches the dataset's token type, its token value, or both joined by `|`.
 
-Stage 1 writes `history-progress.json` and a log line every `--ping` seconds. A path that fails goes to `errors.txt` with its traceback, and the run continues. A `git` command that fails for the whole repository (the merge list, the mainline log or the path list) stops the run with `GitError`, so a run cannot end with no data and 0 errors.
+Stage 1 writes `history-progress.json` and a log line every `--ping` seconds. A `git` command that fails stops the run with `GitError`, so a run cannot end with no data and 0 errors. Any other error of a path goes to `errors.txt` with its traceback, and the run continues.
 
 ## Columns of `history-<mode>.parquet`
 
@@ -88,7 +88,7 @@ A token that left the mainline and came back has one row per interval. A token a
 ## Tests
 
 ```sh
-pytest token_history -q
+devenv shell -- pytest token_history -q
 ```
 
 The tests build small git repositories. Each of the seven replay rules (simplify-merges, real parent order, a merge equal to one parent takes it whole, a commit with no diff keeps the parent blob, a line kept twice becomes a copy, a parent without the file is no source, an error in one path is a record) has a test that fails when the rule is removed.
