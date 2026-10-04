@@ -17,6 +17,12 @@ def git(repo, *args, date=None):
                           capture_output=True, text=True, env=env).stdout
 
 
+def init_repo(path):
+    path.mkdir()
+    git(path, "init", "-q", "-b", "main")
+    return path
+
+
 def write(repo, path, lines):
     (repo / path).write_text("".join(f"{x}\n" for x in lines))
 
@@ -35,9 +41,7 @@ def blame(repo, path):
 
 @pytest.fixture
 def repo(tmp_path):
-    r = tmp_path / "r"
-    r.mkdir()
-    git(r, "init", "-q", "-b", "main")
+    r = init_repo(tmp_path / "r")
     write(r, "a.c", ["int", "a", ";", "int", "b", ";"])
     commit(r, "c1", "2020-01-01T00:00:00")
     write(r, "a.c", ["int", "a", ";", "long", "b", ";", "x"])
@@ -205,9 +209,7 @@ def test_runs_mark_a_whole_file_move(repo):
 
 
 def test_a_line_kept_from_two_parents_becomes_a_copy(tmp_path):
-    r = tmp_path / "dup"
-    r.mkdir()
-    git(r, "init", "-q", "-b", "main")
+    r = init_repo(tmp_path / "dup")
     write(r, "d.c", ["A"])
     first = commit(r, "base", "2021-01-01T00:00:00")
     git(r, "checkout", "-q", "-b", "keep")
@@ -229,9 +231,7 @@ def test_a_line_kept_from_two_parents_becomes_a_copy(tmp_path):
 
 
 def test_merge_that_brings_a_new_file_to_main(tmp_path):
-    r = tmp_path / "newfile"
-    r.mkdir()
-    git(r, "init", "-q", "-b", "main")
+    r = init_repo(tmp_path / "newfile")
     write(r, "other.c", ["o"])
     commit(r, "base", "2022-01-01T00:00:00")
     git(r, "checkout", "-q", "-b", "topic")
@@ -253,9 +253,7 @@ def test_merge_that_brings_a_new_file_to_main(tmp_path):
 def test_path_log_drops_a_merge_that_brings_no_change(tmp_path):
     # --simplify-merges: a side branch that never touches the path adds no
     # merge to its log, so no merge is replayed for nothing
-    r = tmp_path / "r"
-    r.mkdir()
-    git(r, "init", "-q", "-b", "main")
+    r = init_repo(tmp_path / "r")
     write(r, "a.c", ["a"])
     commit(r, "base", "2020-01-01T00:00:00")
     git(r, "checkout", "-q", "-b", "side")

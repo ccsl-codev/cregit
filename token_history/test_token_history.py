@@ -3,7 +3,7 @@ import argparse
 import pytest
 
 from replay import NULL_BLOB, GitError, diff_hunks
-from test_replay import commit, git, write
+from test_replay import commit, git, init_repo, write
 from token_history import list_paths, mainline_changes, merge_parents
 
 
@@ -25,9 +25,7 @@ def test_git_failures_stop_the_run(not_a_repo):
 
 
 def test_the_null_blob_diffs_to_no_hunks(tmp_path):
-    r = tmp_path / "r"
-    r.mkdir()
-    git(r, "init", "-q", "-b", "main")
+    r = init_repo(tmp_path / "r")
     write(r, "a.c", ["x", "y"])
     commit(r, "a", "2020-01-01T00:00:00")
     blob = git(r, "rev-parse", "HEAD:a.c").strip()
@@ -38,9 +36,7 @@ def test_the_null_blob_diffs_to_no_hunks(tmp_path):
 
 
 def test_a_good_repo_still_works(tmp_path):
-    r = tmp_path / "r"
-    r.mkdir()
-    git(r, "init", "-q", "-b", "main")
+    r = init_repo(tmp_path / "r")
     write(r, "a.c", ["x"])
     sha = commit(r, "a", "2020-01-01T00:00:00")
     assert merge_parents(str(r)) == {}

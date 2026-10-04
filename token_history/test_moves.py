@@ -1,3 +1,5 @@
+import pytest
+
 from moves import link, matching_blocks
 
 
@@ -14,27 +16,21 @@ def runs_and_text(moved_whole=True):
     return runs, tx.__getitem__
 
 
-def test_off_links_nothing():
-    runs, tx = runs_and_text()
-    assert link(runs, tx, "off", 10) == {}
+EACH_TOKEN = {("new.c", i): ("old.c", 10 + i) for i in range(4)}
 
 
-def test_moves_link_each_token():
-    runs, tx = runs_and_text(moved_whole=False)
-    got = link(runs, tx, "moves", 10)
-    assert got == {("new.c", i): ("old.c", 10 + i) for i in range(4)}
-
-
-def test_renames_need_a_deleted_and_a_created_file():
-    runs, tx = runs_and_text(moved_whole=False)
-    assert link(runs, tx, "renames", 10) == {}
-    runs, tx = runs_and_text(moved_whole=True)
-    assert len(link(runs, tx, "renames", 10)) == 4
-
-
-def test_short_runs_do_not_move():
-    runs, tx = runs_and_text(moved_whole=False)
-    assert link(runs, tx, "moves", 10_000) == {}
+@pytest.mark.parametrize("mode, whole, min_alnum, links", [
+    ("off", True, 10, {}),
+    ("moves", False, 10, EACH_TOKEN),
+    ("moves", False, 10_000, {}),
+    ("renames", False, 10, {}),
+    ("renames", True, 10, EACH_TOKEN),
+], ids=["off links nothing", "moves link each token",
+        "short runs do not move", "renames need a deleted file",
+        "renames link a whole file"])
+def test_link_modes(mode, whole, min_alnum, links):
+    runs, tx = runs_and_text(moved_whole=whole)
+    assert link(runs, tx, mode, min_alnum) == links
 
 
 def test_matching_blocks_on_a_long_repetitive_run():
