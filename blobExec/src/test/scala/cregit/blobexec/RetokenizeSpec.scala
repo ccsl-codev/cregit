@@ -62,14 +62,19 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
       purge: Vector[String] => TokenizerMemo.PurgeReport =
         blobs => TokenizerMemo.PurgeReport(blobs.size.toLong, blobs.size.toLong, 0L, 0L),
       resolves: String => Boolean = resolvesEverything,
-      report: String => Unit = _ => ()
+      report: String => Unit = _ => (),
+      memoDirIsTokenizerMemo: Boolean = false
   ): Mapping.Retokenize =
     Mapping.Retokenize(
       extensions = exts,
       newBlobResolves = resolves,
       purgeMemo = purge,
       report = report,
+      memoDirIsTokenizerMemo = memoDirIsTokenizerMemo,
       nowEpochSeconds = () => 1700000000L)
+
+  private val emptyMemo: Vector[String] => TokenizerMemo.PurgeReport =
+    blobs => TokenizerMemo.PurgeReport(blobs.size.toLong, 0L, blobs.size.toLong, 0L)
 
   // -- recording and refusing ------------------------------------------------
 
@@ -266,10 +271,46 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
             purge = blobs => TokenizerMemo.PurgeReport(blobs.size.toLong, 0L, blobs.size.toLong, 0L))))
       }
       ex.getMessage should include("--memo-dir")
+      ex.getMessage should include("$BFG_MEMO_DIR")
       // And it changed nothing.
       val m = Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV1))
       try m.getBlob("rsblob1", "src/one.rs") shouldBe Some("newrs1")
       finally m.close()
+    }
+  }
+
+  test("an empty memo is accepted when --memo-dir is the memo the tokenizer reads") {
+    withDb { db =>
+      seed(db, id("rs" -> rustV1, "c" -> cV1))
+      val reports = Vector.newBuilder[String]
+      val m = Mapping.open(db, cmd, mask,
+        tokenizerIdentity = id("rs" -> rustV2, "c" -> cV1),
+        retokenize = Some(retokenize(Set("rs"), purge = emptyMemo, report = reports += _,
+          memoDirIsTokenizerMemo = true)))
+      try {
+        m.getBlob("rsblob1", "src/one.rs") shouldBe None
+        m.getBlob("rsblob2", "src/two.rs") shouldBe None
+        m.getBlob("cblob1", "src/one.c") shouldBe Some("newc1")
+        m.storedTokenizerId("rs") shouldBe Some(rustV2)
+        val log = reports.result().mkString("\n")
+        log should include("the memo held none of the 2 affected blob(s)")
+        log should include("Accepted, because --memo-dir is $BFG_MEMO_DIR")
+        log should include("DROPPED 2 tokenized blob_map rows")
+      } finally m.close()
+    }
+  }
+
+  test("a memo that held entries is purged without the empty-memo notice") {
+    withDb { db =>
+      seed(db, id("rs" -> rustV1))
+      val reports = Vector.newBuilder[String]
+      val m = Mapping.open(db, cmd, mask,
+        tokenizerIdentity = id("rs" -> rustV2),
+        retokenize = Some(retokenize(Set("rs"), report = reports += _, memoDirIsTokenizerMemo = true)))
+      try {
+        m.getBlob("rsblob1", "src/one.rs") shouldBe None
+        reports.result().mkString("\n") should not include "Accepted, because"
+      } finally m.close()
     }
   }
 

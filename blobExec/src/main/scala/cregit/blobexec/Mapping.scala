@@ -577,6 +577,7 @@ object Mapping {
       newBlobResolves: String => Boolean,
       purgeMemo: Vector[String] => TokenizerMemo.PurgeReport,
       report: String => Unit,
+      memoDirIsTokenizerMemo: Boolean = false,
       nowEpochSeconds: () => Long = () => System.currentTimeMillis() / 1000L,
       sampleSize: Int = ReachabilitySampleSize)
 
@@ -812,15 +813,21 @@ object Mapping {
 
     val blobs = m.tokenizedOrigBlobsForExtensions(r.extensions)
     val memo = r.purgeMemo(blobs)
-    if (memo.examined > 0L && memo.deleted == 0L)
-      throw new NothingInvalidatedException(
-        s"--retokenize refused: the memo held none of the ${memo.examined} affected blob(s) " +
-          s"(${memo.render}). Every tokenized row in this map was written by " +
-          "tokenizeByBlobId/tokenBySha.pl, which memoizes each one, so an intact memo cannot be " +
-          "missing all of them — the --memo-dir is almost certainly not this project's. That " +
-          "matters because the memo is keyed on sha1(contents) with no tokenizer in the key: " +
-          "dropping the blob_map rows while the real memo keeps its entries just serves the same " +
-          "stale tokens through the other door. Nothing has been changed in the blob map.")
+    if (memo.examined > 0L && memo.deleted == 0L) {
+      if (!r.memoDirIsTokenizerMemo)
+        throw new NothingInvalidatedException(
+          s"--retokenize refused: the memo held none of the ${memo.examined} affected blob(s) " +
+            s"(${memo.render}), and --memo-dir is not the directory in $$BFG_MEMO_DIR, the memo " +
+            "tokenBySha.pl reads. The --memo-dir is almost certainly not this project's. That " +
+            "matters because the memo is keyed on sha1(contents) with no tokenizer in the key: " +
+            "dropping the blob_map rows while the real memo keeps its entries just serves the same " +
+            "stale tokens through the other door. Nothing has been changed in the blob map.")
+      r.report(
+        s"--retokenize: the memo held none of the ${memo.examined} affected blob(s) " +
+          s"(${memo.render}). Accepted, because --memo-dir is $$BFG_MEMO_DIR, the memo " +
+          "tokenBySha.pl reads: no stale entry is left to serve, and every affected blob will run " +
+          "its tokenizer again.")
+    }
 
     val res = m.applyRetokenize(r.extensions, identity, memo, r.nowEpochSeconds())
     r.report(
