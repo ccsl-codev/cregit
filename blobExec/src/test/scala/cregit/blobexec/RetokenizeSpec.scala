@@ -62,14 +62,21 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
       purge: Vector[String] => TokenizerMemo.PurgeReport =
         blobs => TokenizerMemo.PurgeReport(blobs.size.toLong, blobs.size.toLong, 0L, 0L),
       resolves: String => Boolean = resolvesEverything,
-      report: String => Unit = _ => ()
+      report: String => Unit = _ => (),
+      noMemoButTokenizedRepo: Boolean = false,
+      memoDirIsTokenizerMemo: Boolean = false
   ): Mapping.Retokenize =
     Mapping.Retokenize(
       extensions = exts,
       newBlobResolves = resolves,
       purgeMemo = purge,
       report = report,
+      noMemoButTokenizedRepo = noMemoButTokenizedRepo,
+      memoDirIsTokenizerMemo = memoDirIsTokenizerMemo,
       nowEpochSeconds = () => 1700000000L)
+
+  private val emptyMemo: Vector[String] => TokenizerMemo.PurgeReport =
+    blobs => TokenizerMemo.PurgeReport(blobs.size.toLong, 0L, blobs.size.toLong, 0L)
 
   // -- recording and refusing ------------------------------------------------
 
@@ -266,10 +273,90 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
             purge = blobs => TokenizerMemo.PurgeReport(blobs.size.toLong, 0L, blobs.size.toLong, 0L))))
       }
       ex.getMessage should include("--memo-dir")
+      ex.getMessage should include("--no-memo-but-tokenized-repo")
       // And it changed nothing.
       val m = Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV1))
       try m.getBlob("rsblob1", "src/one.rs") shouldBe Some("newrs1")
       finally m.close()
+    }
+  }
+
+  test("--no-memo-but-tokenized-repo, with --memo-dir as the tokenizer's memo, accepts an empty memo") {
+    withDb { db =>
+      seed(db, id("rs" -> rustV1, "c" -> cV1))
+      val reports = Vector.newBuilder[String]
+      val m = Mapping.open(db, cmd, mask,
+        tokenizerIdentity = id("rs" -> rustV2, "c" -> cV1),
+        retokenize = Some(retokenize(Set("rs"), purge = emptyMemo, report = reports += _,
+          noMemoButTokenizedRepo = true, memoDirIsTokenizerMemo = true)))
+      try {
+        m.getBlob("rsblob1", "src/one.rs") shouldBe None
+        m.getBlob("rsblob2", "src/two.rs") shouldBe None
+        m.getBlob("cblob1", "src/one.c") shouldBe Some("newc1")
+        m.storedTokenizerId("rs") shouldBe Some(rustV2)
+        val log = reports.result().mkString("\n")
+        log should include("ACCEPTED A MEMO THAT HELD NONE")
+        log should include("$BFG_MEMO_DIR")
+        log should include("DROPPED 2 tokenized blob_map rows")
+      } finally m.close()
+    }
+  }
+
+  test("--no-memo-but-tokenized-repo is not enough when --memo-dir is not the tokenizer's memo") {
+    withDb { db =>
+      seed(db, id("rs" -> rustV1))
+      val ex = intercept[Mapping.NothingInvalidatedException] {
+        Mapping.open(db, cmd, mask,
+          tokenizerIdentity = id("rs" -> rustV2),
+          retokenize = Some(retokenize(Set("rs"), purge = emptyMemo,
+            noMemoButTokenizedRepo = true, memoDirIsTokenizerMemo = false)))
+      }
+      ex.getMessage should include("--no-memo-but-tokenized-repo was given")
+      ex.getMessage should include("$BFG_MEMO_DIR")
+      val m = Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV1))
+      try {
+        m.getBlob("rsblob1", "src/one.rs") shouldBe Some("newrs1")
+        m.storedTokenizerId("rs") shouldBe Some(rustV1)
+      } finally m.close()
+    }
+  }
+
+  test("--memo-dir as the tokenizer's memo, without --no-memo-but-tokenized-repo, still refuses") {
+    withDb { db =>
+      seed(db, id("rs" -> rustV1))
+      intercept[Mapping.NothingInvalidatedException] {
+        Mapping.open(db, cmd, mask,
+          tokenizerIdentity = id("rs" -> rustV2),
+          retokenize = Some(retokenize(Set("rs"), purge = emptyMemo,
+            noMemoButTokenizedRepo = false, memoDirIsTokenizerMemo = true)))
+      }
+      val m = Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV1))
+      try m.getBlob("rsblob1", "src/one.rs") shouldBe Some("newrs1")
+      finally m.close()
+    }
+  }
+
+  test("--no-memo-but-tokenized-repo over a memo that still held entries purges them and says so") {
+    withDb { db =>
+      seed(db, id("rs" -> rustV1))
+      val purged = Vector.newBuilder[String]
+      val reports = Vector.newBuilder[String]
+      val m = Mapping.open(db, cmd, mask,
+        tokenizerIdentity = id("rs" -> rustV2),
+        retokenize = Some(retokenize(Set("rs"),
+          purge = blobs => {
+            purged ++= blobs
+            TokenizerMemo.PurgeReport(blobs.size.toLong, 1L, blobs.size - 1L, 0L)
+          },
+          report = reports += _,
+          noMemoButTokenizedRepo = true, memoDirIsTokenizerMemo = true)))
+      try {
+        m.getBlob("rsblob1", "src/one.rs") shouldBe None
+        purged.result().sorted shouldEqual Vector("rsblob1", "rsblob2")
+        val log = reports.result().mkString("\n")
+        log should include("the flag changed nothing")
+        log should not include "ACCEPTED A MEMO"
+      } finally m.close()
     }
   }
 

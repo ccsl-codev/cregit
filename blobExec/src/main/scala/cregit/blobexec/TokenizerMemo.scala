@@ -60,6 +60,12 @@ object TokenizerMemo {
   def entryFor(root: Path, sha1Hex: String): Path =
     root.resolve(relativePathFor(sha1Hex))
 
+  def isTokenizerMemo(memoDir: Path, bfgMemoDir: Option[String]): Boolean =
+    bfgMemoDir.filter(_.nonEmpty).exists { env =>
+      try Files.isSameFile(memoDir, java.nio.file.Paths.get(env))
+      catch { case _: java.io.IOException | _: java.nio.file.InvalidPathException => false }
+    }
+
   /** Delete the memo entries of `origBlobs`.
     *
     * `readBytes` turns an original blob sha into its bytes, or None when the

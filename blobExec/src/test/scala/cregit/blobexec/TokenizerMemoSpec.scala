@@ -127,4 +127,25 @@ class TokenizerMemoSpec extends AnyFunSuite with Matchers {
       report.deleted shouldEqual 0L
     }
   }
+
+  test("isTokenizerMemo holds for the same directory, by a symlink or a trailing slash too") {
+    withTempDir { root =>
+      val memo = Files.createDirectory(root.resolve("memo"))
+      val link = Files.createSymbolicLink(root.resolve("link"), memo)
+      TokenizerMemo.isTokenizerMemo(memo, Some(memo.toString)) shouldBe true
+      TokenizerMemo.isTokenizerMemo(memo, Some(memo.toString + "/")) shouldBe true
+      TokenizerMemo.isTokenizerMemo(link, Some(memo.toString)) shouldBe true
+    }
+  }
+
+  test("isTokenizerMemo is false for another directory, an unset or empty variable, or a missing path") {
+    withTempDir { root =>
+      val memo = Files.createDirectory(root.resolve("memo"))
+      val other = Files.createDirectory(root.resolve("other"))
+      TokenizerMemo.isTokenizerMemo(memo, Some(other.toString)) shouldBe false
+      TokenizerMemo.isTokenizerMemo(memo, None) shouldBe false
+      TokenizerMemo.isTokenizerMemo(memo, Some("")) shouldBe false
+      TokenizerMemo.isTokenizerMemo(memo, Some(root.resolve("gone").toString)) shouldBe false
+    }
+  }
 }
