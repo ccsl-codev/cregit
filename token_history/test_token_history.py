@@ -55,6 +55,8 @@ def test_a_good_repo_still_works(tmp_path):
     assert mainline_changes(str(r), [])["a.c"][0][0] == sha
     assert list_paths(argparse.Namespace(paths=None, repo=str(r),
                                          pathspec=[])) == ["a.c"]
+    (tmp_path / "paths").write_text("a.c\nREADME\n")
+    assert list_paths(argparse.Namespace(paths=tmp_path / "paths")) == ["a.c"]
 
 
 def test_an_error_in_one_path_is_a_record_not_a_stop(monkeypatch):

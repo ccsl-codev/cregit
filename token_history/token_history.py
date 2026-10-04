@@ -208,11 +208,9 @@ class Progress:
 
 
 def list_paths(args):
-    if args.paths:
-        return [p for p in open(args.paths).read().split("\n") if p]
-    out = git_out(args.repo, "log", "--diff-filter=A", "--name-only",
-                  "--no-renames", "-m", "--format=", "HEAD", "--",
-                  *args.pathspec)
+    out = open(args.paths).read() if args.paths else git_out(
+        args.repo, "log", "--diff-filter=A", "--name-only", "--no-renames",
+        "-m", "--format=", "HEAD", "--", *args.pathspec)
     return sorted({p for p in out.splitlines() if MASK.search(p)})
 
 
