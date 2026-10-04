@@ -117,10 +117,19 @@ def in_process_checks(args, marker, expected_first):
         encoding="utf-8",
     )
     fake_srcml.chmod(0o755)
+    real_ctags = subprocess.run(["which", "ctags"], stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+    fake_ctags = args.temp_root / "fake-ctags.sh"
+    fake_ctags.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo HELPER_STDERR_MARKER >&2\n"
+        f'exec {real_ctags} "$@"\n',
+        encoding="utf-8",
+    )
+    fake_ctags.chmod(0o755)
     memo = args.temp_root / "inproc-memo"
     memo.mkdir()
-    command = f"{args.tokenize_command} --srcml={fake_srcml}".replace(
-        f"--srcml={real_srcml} ", "")
+    options = [o for o in args.tokenize_command.split() if not o.startswith(("--srcml=", "--ctags="))]
+    command = " ".join(options + [f"--srcml={fake_srcml}", f"--ctags={fake_ctags}"])
     worker = Worker(args.worker, memo, command)
 
     started = time.monotonic()
@@ -134,7 +143,9 @@ def in_process_checks(args, marker, expected_first):
     crash = worker.request("crash.c", "fixtures/crash.c", b"int ABORT_MARKER;\n", 20)
     if crash[0] != 33 or b"killed by signal 6" not in crash[2]:
         raise AssertionError(f"srcml death was not reported as a parser crash: {crash!r}")
-    print("PASS in-process srcml crash exits 33 without output")
+    if b"HELPER_STDERR_MARKER" not in crash[2]:
+        raise AssertionError(f"helper stderr did not reach the request's stderr: {crash!r}")
+    print("PASS in-process srcml crash exits 33 without output, with helper stderr")
 
     if any(memo.rglob("*")):
         raise AssertionError("failed in-process requests were memoized")

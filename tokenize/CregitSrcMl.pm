@@ -7,6 +7,7 @@ use strict;
 use warnings;
 use bytes;
 use Errno qw(EINTR);
+use File::Temp ();
 use POSIX qw(_exit);
 
 our $PARSER_CRASH_EXIT = 33;
@@ -43,12 +44,14 @@ sub tokenize {
     };
     my $error = $@;
     alarm(0);
+    my $helperErr = $self->take_helper_stderr();
 
     if ($self->{timedOut}) {
         $self->shutdown();
-        return (124, "", "tokenize command timed out after [$timeoutSecs] seconds\n");
+        return (124, "", $helperErr . "tokenize command timed out after [$timeoutSecs] seconds\n");
     }
-    return (255, "", $error || "srcml tokenization failed\n") if not $ok;
+    return (255, "", $helperErr . ($error || "srcml tokenization failed\n")) if not $ok;
+    $result[2] = $helperErr . $result[2];
     return @result;
 }
 
@@ -199,8 +202,7 @@ sub read_declarations {
 
 sub drop_ctags {
     my ($self, $language) = @_;
-    my $proc = delete $self->{ctagsProc}{$language};
-    reap_pipe($proc) if $proc;
+    $self->retire(delete $self->{ctagsProc}{$language});
 }
 
 sub json_str {
@@ -279,7 +281,7 @@ sub parse_xml {
     while (1) {
         my $line = readline($proc->{out});
         if (not defined $line) {
-            reap_pipe(delete $self->{s2t});
+            $self->retire(delete $self->{s2t});
             return (undef, \@tokens, $stderr);
         }
         if ($line =~ /\A\x01END ([0-9]+)\n\z/) {
@@ -302,6 +304,7 @@ sub spawn_pipe {
     my ($command) = @_;
     pipe(my $childIn, my $parentOut) or die "unable to create pipe: $!\n";
     pipe(my $parentIn, my $childOut) or die "unable to create pipe: $!\n";
+    my $err = File::Temp->new(TEMPLATE => "cregit-helper-err-XXXXX", TMPDIR => 1);
 
     my $pid = fork();
     die "unable to fork [$command->[0]]: $!\n" if not defined $pid;
@@ -310,6 +313,7 @@ sub spawn_pipe {
         close($parentIn);
         open(STDIN,  '<&', $childIn)  or _exit(255);
         open(STDOUT, '>&', $childOut) or _exit(255);
+        open(STDERR, '>>', $err->filename) or _exit(255);
         close($childIn);
         close($childOut);
         { no warnings 'exec'; exec @$command; }
@@ -320,7 +324,29 @@ sub spawn_pipe {
     close($childOut);
     binmode $parentOut;
     binmode $parentIn;
-    return { pid => $pid, in => $parentOut, out => $parentIn };
+    return { pid => $pid, in => $parentOut, out => $parentIn, err => $err };
+}
+
+# A helper's stderr goes to a file, not a pipe: a full pipe would block the
+# helper while the worker waits for its stdout.
+sub take_helper_stderr {
+    my ($self) = @_;
+    my @procs = grep { $_ } values(%{ $self->{ctagsProc} }), $self->{s2t};
+    my $text = "";
+    for my $err (@{ delete $self->{retiredErr} // [] }, map { $_->{err} } @procs) {
+        seek($err, 0, 0);
+        local $/;
+        $text .= <$err> // "";
+        truncate($err, 0);
+    }
+    return $text;
+}
+
+sub retire {
+    my ($self, $proc) = @_;
+    return unless $proc;
+    push @{ $self->{retiredErr} }, $proc->{err};
+    reap_pipe($proc);
 }
 
 sub reap_pipe {
