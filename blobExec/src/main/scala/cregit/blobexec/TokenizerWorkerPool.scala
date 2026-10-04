@@ -33,10 +33,8 @@ final class TokenizerWorkerPool(
       diagnostics.append(line).append('\n')
     }
 
-    def diagnosticsLength: Int = diagnostics.synchronized(diagnostics.length)
-
-    def diagnosticsSince(offset: Int): String = diagnostics.synchronized {
-      diagnostics.substring(math.min(offset, diagnostics.length))
+    def takeDiagnostics(): String = diagnostics.synchronized {
+      try diagnostics.toString finally diagnostics.clear()
     }
   }
 
@@ -65,12 +63,12 @@ final class TokenizerWorkerPool(
     if (closed.get()) throw new IllegalStateException("tokenizer worker pool is closed")
 
     val worker = idle.take()
-    val diagnosticOffset = worker.diagnosticsLength
+    worker.takeDiagnostics()
     try {
       writeRequest(worker, bytes, origSha, filename, fullPath)
     } catch {
       case failure: IOException =>
-        return failedWorker(worker, diagnosticOffset, failure)
+        return failedWorker(worker, failure)
     }
 
     val finished = new CountDownLatch(1)
@@ -98,7 +96,7 @@ final class TokenizerWorkerPool(
             ChildRunner.Outcome.Killed(s"no exit within ${timeoutSeconds}s")
           else ChildRunner.Outcome.Exited(result.exitCode, result.stdout, result.stderr)
         case Left(failure) =>
-          failedWorker(worker, diagnosticOffset, failure)
+          failedWorker(worker, failure)
       }
     }
   }
@@ -248,13 +246,9 @@ final class TokenizerWorkerPool(
     length
   }
 
-  private def failedWorker(
-      worker: Worker,
-      diagnosticOffset: Int,
-      failure: Throwable
-  ): ChildRunner.Outcome = {
+  private def failedWorker(worker: Worker, failure: Throwable): ChildRunner.Outcome = {
     val workerExit = if (worker.process.waitFor(100, TimeUnit.MILLISECONDS)) Some(worker.process.exitValue()) else None
-    val diagnostics = worker.diagnosticsSince(diagnosticOffset)
+    val diagnostics = worker.takeDiagnostics()
     replaceWorker(worker, force = true)
     if (workerExit.contains(WorkerTimeoutExitCode))
       ChildRunner.Outcome.Killed(s"worker exited $WorkerTimeoutExitCode (timeout)")
