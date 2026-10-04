@@ -128,7 +128,7 @@ object BlobExec {
       // where tokens belong must not be invisible to the run's statistics.
       System.err.println(
         s"Warning: command [$command] timed out after ${timeoutSeconds}s on blob $origSha " +
-          s"at path [$fullPath]: child killed, blob left untokenized"
+          s"at path [$fullPath]: child killed, blob excluded"
       )
       onTimeout()
       Outcome.Skip
@@ -144,8 +144,8 @@ object BlobExec {
       // segfault — and because the operator needs to know which one happened.
       System.err.println(
         s"Warning: command [$command] reported a parser crash (exit $exitCode) on blob $origSha " +
-          s"at path [$fullPath]: srcML died or produced no tokens, so this blob is left " +
-          "untokenized rather than written as an empty tokenization"
+          s"at path [$fullPath]: srcML died or produced no tokens, so this blob is excluded " +
+          "rather than written as an empty tokenization"
       )
       if (stderr.nonEmpty) {
         System.err.println(s"--- stderr from $command on $origSha ($fullPath) ---")
@@ -173,7 +173,7 @@ object BlobExec {
       System.err.println(
         s"Warning: command [$command] exited 0 but produced no output for the ${bytes.length}-byte " +
           s"blob $origSha at path [$fullPath]. Refusing to write an empty tokenization: counting " +
-          "this as a parser crash and leaving the blob untokenized."
+          "this as a parser crash and excluding the blob."
       )
       onParserCrash()
       Outcome.Skip
