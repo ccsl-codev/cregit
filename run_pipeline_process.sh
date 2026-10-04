@@ -872,30 +872,21 @@ for _tv in "BLOB_TIMEOUT:$BLOB_TIMEOUT:--blob-timeout" "STALL_TIMEOUT:$STALL_TIM
     esac
 done
 
-case "$STRICT_TOKENIZE" in
-    0|1) ;;
-    *) echo "invalid CREGIT_STRICT_TOKENIZE: '$STRICT_TOKENIZE' (want 0 or 1)" >&2; exit 2 ;;
+refuse_value() {  # <name> <value> <what is wanted>
+    echo "invalid $1: '$2' (want $3)" >&2; exit 2
+}
+case "$STRICT_TOKENIZE" in 0|1) ;; *) refuse_value CREGIT_STRICT_TOKENIZE "$STRICT_TOKENIZE" "0 or 1" ;; esac
+case "$RETRY_SKIPPED" in 0|1) ;; *) refuse_value CREGIT_RETRY_SKIPPED "$RETRY_SKIPPED" "0 or 1" ;; esac
+case "$MAX_RETRIES" in
+    *[!0-9]*) refuse_value --max-retries "$MAX_RETRIES" "a whole number from 0 to 100" ;;
+    ?*) [ "$MAX_RETRIES" -le 100 ] || refuse_value --max-retries "$MAX_RETRIES" "a whole number from 0 to 100" ;;
 esac
-case "$RETRY_SKIPPED" in
-    0|1) ;;
-    *) echo "invalid CREGIT_RETRY_SKIPPED: '$RETRY_SKIPPED' (want 0 or 1)" >&2; exit 2 ;;
+case "$LOAD_LIMIT" in
+    *[!0-9.]*|*.*.*|.) refuse_value CREGIT_LOAD_LIMIT "$LOAD_LIMIT" "a number >= 0" ;;
 esac
-if [ -n "$MAX_RETRIES" ]; then
-    case "$MAX_RETRIES" in
-        *[!0-9]*) echo "invalid --max-retries: '$MAX_RETRIES' (want a whole number from 0 to 100)" >&2; exit 2 ;;
-    esac
-    [ "$MAX_RETRIES" -le 100 ] || { echo "invalid --max-retries: '$MAX_RETRIES' (want a whole number from 0 to 100)" >&2; exit 2; }
-fi
-if [ -n "$LOAD_LIMIT" ]; then
-    case "$LOAD_LIMIT" in
-        *[!0-9.]*|*.*.*|.|'') echo "invalid CREGIT_LOAD_LIMIT: '$LOAD_LIMIT' (want a number >= 0)" >&2; exit 2 ;;
-    esac
-fi
-if [ -n "$TIMEOUT_RETRY_FACTOR" ]; then
-    case "$TIMEOUT_RETRY_FACTOR" in
-        *[!0-9]*) echo "invalid --timeout-retry-factor: '$TIMEOUT_RETRY_FACTOR' (want a whole number >= 0)" >&2; exit 2 ;;
-    esac
-fi
+case "$TIMEOUT_RETRY_FACTOR" in
+    *[!0-9]*) refuse_value --timeout-retry-factor "$TIMEOUT_RETRY_FACTOR" "a whole number >= 0" ;;
+esac
 
 # The target repository is mandatory (only --build-only runs without one).
 if [ "$BUILD_ONLY" = 0 ]; then
