@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.jdk.CollectionConverters._
 
 class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
@@ -172,13 +173,19 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
 
   test("close terminates every worker process") {
     val pool = new TokenizerWorkerPool(Seq(worker.toString), size = 2)
-    val pids = pool.currentWorkerPids
+    val pids = workerPids()
     pids should have size 2
 
     pool.close()
 
     eventuallyStopped(pids) shouldBe true
   }
+
+  private def workerPids(): Seq[Long] =
+    ProcessHandle.current().children().iterator().asScala
+      .filter(_.info().commandLine().orElse("").contains(worker.toString))
+      .map(_.pid())
+      .toVector
 
   private def eventuallyStopped(pids: Seq[Long]): Boolean = {
     val deadline = System.nanoTime() + 5.seconds.toNanos

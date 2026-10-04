@@ -164,7 +164,6 @@ def main():
     parser.add_argument("--tokenize-command", required=True)
     parser.add_argument("--fixture", action="append", required=True, type=pathlib.Path)
     parser.add_argument("--temp-root", required=True, type=pathlib.Path)
-    parser.add_argument("--in-process", action="store_true")
     args = parser.parse_args()
 
     worker_memo = args.temp_root / "worker-memo"
@@ -242,8 +241,7 @@ def main():
     timeout_worker.close()
     print(f"PASS timeout exits 124 in {elapsed:.2f}s with no child left")
 
-    if args.in_process:
-        in_process_checks(args, marker, expected_outputs[0])
+    in_process_checks(args, marker, expected_outputs[0])
 
     print("ALL TOKEN WORKER TESTS PASSED")
 

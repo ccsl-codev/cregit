@@ -100,9 +100,6 @@ final class TokenizerWorkerPool(
     }
   }
 
-  private[blobexec] def currentWorkerPids: Seq[Long] =
-    workers.asScala.toVector.map(_.process.pid())
-
   override def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
       val snapshot = workers.asScala.toVector

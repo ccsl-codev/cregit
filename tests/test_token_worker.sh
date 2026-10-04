@@ -24,5 +24,4 @@ python3 "$ROOT/tests/token_worker_driver.py" \
     --fixture "$ROOT/tests/fixtures/Tiny.java" \
     --fixture "$ROOT/tests/fixtures/empty.c" \
     --fixture "$ROOT/tests/fixtures/upper.H" \
-    --in-process \
     --temp-root "$TEMP_ROOT"
