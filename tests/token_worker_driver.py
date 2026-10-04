@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import time
@@ -105,32 +106,33 @@ def assert_no_timeout_process(marker):
         )
 
 
-def in_process_checks(args, marker, expected_first):
-    real_srcml = subprocess.run(["which", "srcml"], stdout=subprocess.PIPE, check=True).stdout.decode().strip()
-    fake_srcml = args.temp_root / "fake-srcml.sh"
-    fake_srcml.write_text(
-        "#!/usr/bin/env bash\n"
+def write_script(path, body):
+    path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def in_process_command(args, marker):
+    fake_srcml = write_script(
+        args.temp_root / "fake-srcml.sh",
         'src="${@: -3:1}"\n'
         f'grep -q SLEEP_MARKER "$src" && exec perl -e "sleep 100" {marker}\n'
         'grep -q ABORT_MARKER "$src" && kill -ABRT $$\n'
-        f'exec {real_srcml} "$@"\n',
-        encoding="utf-8",
+        f'exec {shutil.which("srcml")} "$@"\n',
     )
-    fake_srcml.chmod(0o755)
-    real_ctags = subprocess.run(["which", "ctags"], stdout=subprocess.PIPE, check=True).stdout.decode().strip()
-    fake_ctags = args.temp_root / "fake-ctags.sh"
-    fake_ctags.write_text(
-        "#!/usr/bin/env bash\n"
+    fake_ctags = write_script(
+        args.temp_root / "fake-ctags.sh",
         "echo HELPER_STDERR_MARKER >&2\n"
-        f'exec {real_ctags} "$@"\n',
-        encoding="utf-8",
+        f'exec {shutil.which("ctags")} "$@"\n',
     )
-    fake_ctags.chmod(0o755)
+    options = [o for o in args.tokenize_command.split() if not o.startswith(("--srcml=", "--ctags="))]
+    return " ".join(options + [f"--srcml={fake_srcml}", f"--ctags={fake_ctags}"])
+
+
+def in_process_checks(args, marker, fixture, expected):
     memo = args.temp_root / "inproc-memo"
     memo.mkdir()
-    options = [o for o in args.tokenize_command.split() if not o.startswith(("--srcml=", "--ctags="))]
-    command = " ".join(options + [f"--srcml={fake_srcml}", f"--ctags={fake_ctags}"])
-    worker = Worker(args.worker, memo, command)
+    worker = Worker(args.worker, memo, in_process_command(args, marker))
 
     started = time.monotonic()
     timed_out = worker.request("timeout.c", "fixtures/timeout.c", b"int SLEEP_MARKER;\n", 1)
@@ -149,27 +151,18 @@ def in_process_checks(args, marker, expected_first):
 
     if any(memo.rglob("*")):
         raise AssertionError("failed in-process requests were memoized")
-    recovered = worker.request(args.fixture[0].name, f"fixtures/{args.fixture[0].name}",
-                               args.fixture[0].read_bytes(), 20)
-    if recovered != (0, expected_first, b""):
+    recovered = request_fixture(worker, fixture)
+    if recovered != (0, expected, b""):
         raise AssertionError(f"in-process worker did not recover: {recovered!r}")
     worker.close()
     print("PASS in-process worker recovers after timeout and crash")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", required=True, type=pathlib.Path)
-    parser.add_argument("--token-by-sha", required=True, type=pathlib.Path)
-    parser.add_argument("--tokenize-command", required=True)
-    parser.add_argument("--fixture", action="append", required=True, type=pathlib.Path)
-    parser.add_argument("--temp-root", required=True, type=pathlib.Path)
-    args = parser.parse_args()
+def request_fixture(worker, fixture):
+    return worker.request(fixture.name, f"fixtures/{fixture.name}", fixture.read_bytes(), 20)
 
-    worker_memo = args.temp_root / "worker-memo"
-    worker_memo.mkdir()
-    worker = Worker(args.worker, worker_memo, args.tokenize_command)
 
+def byte_identity_checks(args, worker, worker_memo):
     expected_outputs = []
     for index, fixture in enumerate(args.fixture):
         reference_memo = args.temp_root / f"reference-memo-{index}"
@@ -182,51 +175,34 @@ def main():
                 f"reference failed for {fixture}: "
                 f"{expected.stderr.decode(errors='replace')}"
             )
-        actual = worker.request(
-            fixture.name,
-            f"fixtures/{fixture.name}",
-            fixture.read_bytes(),
-            20,
-        )
+        actual = request_fixture(worker, fixture)
         if actual[0] != 0 or actual[1] != expected.stdout:
             raise AssertionError(f"worker output differs for {fixture}")
         if memo_file(worker_memo, fixture.read_bytes()).read_bytes() != expected.stdout:
             raise AssertionError(f"worker memo differs for {fixture}")
         expected_outputs.append(expected.stdout)
         print(f"PASS byte-identical: {fixture.name}")
+    return expected_outputs
 
-    repeated = worker.request(
-        args.fixture[0].name,
-        f"fixtures/{args.fixture[0].name}",
-        args.fixture[0].read_bytes(),
-        20,
-    )
-    if repeated != (0, expected_outputs[0], b""):
+
+def memo_and_recovery_checks(worker, fixture, expected):
+    if request_fixture(worker, fixture) != (0, expected, b""):
         raise AssertionError("memo-hit response changed bytes")
     print("PASS repeated request uses identical memo bytes")
 
     unknown = worker.request("unknown.xyzzy", "fixtures/unknown.xyzzy", b"x", 20)
     if unknown[0] == 0 or b"unknown file extension" not in unknown[2]:
         raise AssertionError(f"unknown extension was not rejected: {unknown!r}")
-    recovered = worker.request(
-        args.fixture[0].name,
-        f"fixtures/{args.fixture[0].name}",
-        args.fixture[0].read_bytes(),
-        20,
-    )
-    if recovered[0] != 0 or recovered[1] != expected_outputs[0]:
+    recovered = request_fixture(worker, fixture)
+    if recovered[0] != 0 or recovered[1] != expected:
         raise AssertionError("worker did not recover after unknown extension")
     print("PASS unknown extension is non-fatal to worker")
-    worker.close()
 
-    timeout_script = args.temp_root / "timeout-parser.sh"
-    marker = f"cregit-token-worker-timeout-{os.getpid()}"
-    timeout_script.write_text(
-        "#!/usr/bin/env bash\n"
-        f"exec perl -e 'sleep 100' {marker}\n",
-        encoding="utf-8",
+
+def timeout_checks(args, marker):
+    timeout_script = write_script(
+        args.temp_root / "timeout-parser.sh", f"exec perl -e 'sleep 100' {marker}\n"
     )
-    timeout_script.chmod(0o755)
     timeout_memo = args.temp_root / "timeout-memo"
     timeout_memo.mkdir()
     timeout_worker = Worker(args.worker, timeout_memo, str(timeout_script))
@@ -241,7 +217,26 @@ def main():
     timeout_worker.close()
     print(f"PASS timeout exits 124 in {elapsed:.2f}s with no child left")
 
-    in_process_checks(args, marker, expected_outputs[0])
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", required=True, type=pathlib.Path)
+    parser.add_argument("--token-by-sha", required=True, type=pathlib.Path)
+    parser.add_argument("--tokenize-command", required=True)
+    parser.add_argument("--fixture", action="append", required=True, type=pathlib.Path)
+    parser.add_argument("--temp-root", required=True, type=pathlib.Path)
+    args = parser.parse_args()
+
+    worker_memo = args.temp_root / "worker-memo"
+    worker_memo.mkdir()
+    worker = Worker(args.worker, worker_memo, args.tokenize_command)
+    expected_outputs = byte_identity_checks(args, worker, worker_memo)
+    memo_and_recovery_checks(worker, args.fixture[0], expected_outputs[0])
+    worker.close()
+
+    marker = f"cregit-token-worker-timeout-{os.getpid()}"
+    timeout_checks(args, marker)
+    in_process_checks(args, marker, args.fixture[0], expected_outputs[0])
 
     print("ALL TOKEN WORKER TESTS PASSED")
 
