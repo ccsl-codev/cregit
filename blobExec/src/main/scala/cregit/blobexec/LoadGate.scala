@@ -32,10 +32,9 @@ final case class LoadGate(
       text.split("\\s+").headOption.flatMap(_.toDoubleOption)
     } catch { case _: Exception => None }
 
-  /** Wait while the load is above the limit. `onPoll` is called at each poll with
-    * the load, so the caller can stamp progress (the stall watchdog must not count
-    * a deliberate wait as a stall). Returns the seconds waited. */
-  def await(onPoll: Double => Unit): Long = {
+  /** Returns the seconds waited. No progress is stamped: Main makes the stall
+    * window larger than the longest wait. */
+  def await(): Long = {
     if (!enabled) return 0L
     val start = System.nanoTime()
     val deadline = start + maxWaitSeconds.toLong * 1000000000L
@@ -43,7 +42,6 @@ final case class LoadGate(
     while (waiting) {
       current match {
         case Some(load) if load > limit && System.nanoTime() < deadline =>
-          onPoll(load)
           val left = (deadline - System.nanoTime()) / 1000000L
           try Thread.sleep(math.max(1L, math.min(pollSeconds.toLong * 1000L, left)))
           catch { case _: InterruptedException => Thread.currentThread().interrupt(); waiting = false }

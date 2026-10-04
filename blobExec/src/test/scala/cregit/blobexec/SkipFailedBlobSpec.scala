@@ -514,19 +514,13 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
   test("the load gate waits while the load is above the limit, and no longer than its cap") {
     val f = Files.createTempFile(workRoot, "loadavg-", "")
     Files.writeString(f, "99.00 50.00 20.00 3/900 12345\n")
-    var polls = 0
     val gate = LoadGate(limit = 4.0, maxWaitSeconds = 2, pollSeconds = 1, loadavg = f)
-    val t0 = System.nanoTime()
-    gate.await(_ => polls += 1)
-    val secs = (System.nanoTime() - t0) / 1e9
-    secs should be >= 1.9
-    secs should be < 10.0
-    polls should be >= 2
+    gate.await() should (be >= 2L and be < 10L)
 
     Files.writeString(f, "0.50 0.40 0.30 1/900 12345\n")
-    gate.await(_ => fail("no wait at a low load")) shouldEqual 0L
-    LoadGate(4.0, 2, 1, workRoot.resolve("no-such-file")).await(_ => fail("no file, no wait")) shouldEqual 0L
-    LoadGate.disabled.await(_ => fail("disabled")) shouldEqual 0L
+    gate.await() shouldEqual 0L
+    LoadGate(4.0, 2, 1, workRoot.resolve("no-such-file")).await() shouldEqual 0L
+    LoadGate.disabled.await() shouldEqual 0L
   }
 
   test("the longest time for one blob includes every retry and its load wait") {

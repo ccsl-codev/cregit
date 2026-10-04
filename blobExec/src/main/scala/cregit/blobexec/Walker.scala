@@ -1305,7 +1305,7 @@ final class Walker(
     var retries = 0
     while (timedOut(result) && retries < maxRetries) {
       retries += 1
-      val waited = loadGate.await(_ => ())
+      val waited = loadGate.await()
       System.err.println(
         s"blobExec: blob $label timed out (attempt $retries of ${1 + maxRetries}). Waited ${waited}s " +
           s"for the load${if (loadGate.enabled) f" (limit ${loadGate.limit}%.1f)" else ""}; retry " +
