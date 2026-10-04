@@ -108,15 +108,8 @@ sub merge {
             unless $tokenLine =~ /^([0-9]+|-):([0-9]+|-)\s+(.+)$/;
         my ($line, $col, $token) = ($1, $2, $3);
         my $lineNum = $line eq '-' ? 0 : $line;
-        if ($lineNum != $lastLine) {
-            my $names = $listDeclarations->{$line};
-            for my $name (@{ $names || [] }) {
-                my $decl = $declarations->{$line}{$name};
-                die "Illegal value in get declaration [$line][$name]" unless defined $decl;
-                $output .= "$line:-|" if $position;
-                $output .= "DECL|$decl->{type}|$decl->{name}\n";
-            }
-        }
+        $output .= declaration_lines($line, $declarations, $listDeclarations, $position)
+            if $lineNum != $lastLine;
         $lastLine = $lineNum;
         $output .= "$line:$col|" if $position;
         $output .= "$token\n";
@@ -124,6 +117,18 @@ sub merge {
             $output .= "-:-|" if $position;
             $output .= "\n";
         }
+    }
+    return $output;
+}
+
+sub declaration_lines {
+    my ($line, $declarations, $listDeclarations, $position) = @_;
+    my $output = "";
+    for my $name (@{ $listDeclarations->{$line} || [] }) {
+        my $decl = $declarations->{$line}{$name};
+        die "Illegal value in get declaration [$line][$name]" unless defined $decl;
+        $output .= "$line:-|" if $position;
+        $output .= "DECL|$decl->{type}|$decl->{name}\n";
     }
     return $output;
 }
