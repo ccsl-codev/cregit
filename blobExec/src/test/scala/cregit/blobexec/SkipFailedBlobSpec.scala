@@ -120,7 +120,8 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
       denylist: BlobDenylist = BlobDenylist.empty,
       maxRetries: Int = 0,
       retryFactor: Int = 2,
-      retryPass: Boolean = true
+      retryPass: Boolean = true,
+      onRefold: () => Unit = () => ()
   ): WalkStats = {
     val dstExisted = Files.isDirectory(fx.dstPath)
     val dst = FileRepositoryBuilder.create(fx.dstPath.toFile).asInstanceOf[FileRepository]
@@ -142,7 +143,8 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
         tokenizerIdentity = TokenizerIdentity(Map("c" -> "0123456789abcdef")),
         maxRetries = maxRetries,
         timeoutRetryFactor = retryFactor,
-        retryTimedOutPass = retryPass
+        retryTimedOutPass = retryPass,
+        onRefold = onRefold
       ).run()
     finally {
       log.close()
@@ -457,6 +459,25 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
     val retried = run(fx, "serial")
     retried.blobsRecovered shouldEqual 1L
     retried.refolded shouldBe true
+    dstContent(fx, fx.secondCommit, "deep/b.c") shouldEqual Some("BETA\n")
+    withMapping(fx)(_.retryBlobs) shouldBe empty
+  }
+
+  test("a run that stops after the first recovery still re-folds next time, and has the marker") {
+    val fx = fixture("timeout")
+    run(fx, "serial")
+    Files.delete(fx.marker)
+    // A row that sorts after b.c's and cannot be read: the retry pass throws there.
+    val bad = "z" * 40
+    withMapping(fx)(_.putRetry(bad, "deep/x.c"))
+    val refoldMarker = fx.dir.resolve("REFOLDED")
+    an[IllegalArgumentException] should be thrownBy
+      run(fx, "serial", onRefold = () => Files.writeString(refoldMarker, "x"))
+    Files.exists(refoldMarker) shouldBe true
+    withMapping(fx)(_.deleteRetry(bad, "deep/x.c"))
+
+    val next = run(fx, "serial")
+    next.commitsProcessed shouldEqual 2
     dstContent(fx, fx.secondCommit, "deep/b.c") shouldEqual Some("BETA\n")
     withMapping(fx)(_.retryBlobs) shouldBe empty
   }

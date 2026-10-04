@@ -64,9 +64,8 @@ final case class WalkStats(
     /** Blobs that timed out in an earlier run and that tokenized on the retry at
       * the start of this run. Each one changes the trees above it. */
     blobsRecovered: Long = 0L,
-    /** True if this run emptied commit_map, tree_map and ref_map because a retry
-      * recovered a blob. Every rewritten commit then has a new sha, so all of the
-      * outputs made from the tokenized repository are out of date. */
+    /** True if a recovered blob emptied commit_map, tree_map and ref_map: every
+      * rewritten commit then gets a new sha. */
     refolded: Boolean = false,
     /** Retry attempts at timed-out blobs in the same run (see `maxRetries`), and
       * the number of blobs that a retry recovered. A recovered blob is not counted
@@ -117,7 +116,8 @@ final class Walker(
     // (retry_blob). false: keep those blobs dropped, and keep their rows. The
     // runner sets false when blame output exists, because a recovered blob folds
     // all of history again and so deletes the blame.
-    retryTimedOutPass: Boolean = true
+    retryTimedOutPass: Boolean = true,
+    onRefold: () => Unit = () => ()
 ) {
   import Walker._
 
@@ -1271,6 +1271,8 @@ final class Walker(
   private val retryTimeoutSeconds: Int =
     Walker.retryBudget(blobTimeoutSeconds, timeoutRetryFactor)
 
+  private val TimeoutOnly = Set(BlobExec.Failure.Timeout)
+
   /** Run the tokenizer on one blob, and retry a timed-out blob up to `maxRetries`
     * times.
     *
@@ -1353,26 +1355,9 @@ final class Walker(
         "that flag tries them again.")
   }
 
-  /** Try again, before the walk, each blob that timed out in an earlier run.
-    *
-    * These blobs are not in blob_map, and the trees and commits that hold them
-    * ARE in tree_map and commit_map, with the blob omitted. So the walk alone
-    * never gets to them again. For each retry_blob row:
-    *
-    *   - it tokenizes: its blob_map row is written, the row goes, and the skip
-    *     record goes. Then commit_map, tree_map and ref_map are emptied
-    *     ([[Mapping.clearFold]]), so the walk folds all of history again with the
-    *     blob in it. The blob rows stay, so the re-fold runs no tokenizer for the
-    *     blobs that are already done.
-    *   - it times out again: the row stays for the next run, and the blob stays
-    *     dropped. Nothing is folded again.
-    *   - it crashes: the row goes (a crash is deterministic), the skip record
-    *     changes from `timeout` to the crash reason, and the blob stays dropped.
-    *   - it is now denylisted, oversized or not in src: the row goes.
-    *
-    * Sequential, on this thread: there are few rows, and each one can take a
-    * whole budget. Under `strictTokenize` the same retry runs, and a failure
-    * counts as it does in the walk, so the exit status is 4 or 6. */
+  /** The walk alone never reaches these blobs again: the trees that hold them are
+    * in tree_map. So the first recovery empties the fold ([[Mapping.clearFold]])
+    * before its blob row, and a stop at any later point still re-folds. */
   private def retryTimedOutBlobs(): Unit = {
     val pending = mapping.retryBlobs
     if (pending.isEmpty) return
@@ -1380,61 +1365,30 @@ final class Walker(
       s"blobExec: retrying ${pending.size} blob(s) whose tokenizer timed out in an earlier run")
     val inserter = dst.newObjectInserter()
     var recovered = 0L
-    val timeoutOnly = Set(BlobExec.Failure.Timeout)
     try {
       pending.foreach { case (sha, blobPath) =>
         progress(s"retry $sha ($blobPath)")
-        val key  = (sha, blobPath)
         val task = BlobMissTask(ObjectId.fromString(sha), Mapping.basename(blobPath), blobPath)
         val bytes =
           try readBlob(task)
           catch { case _: org.eclipse.jgit.errors.MissingObjectException => None }
         bytes match {
           case None =>
-            mapping.deleteRetry(sha, blobPath)
-            skipLog.forget(sha, blobPath, timeoutOnly)
+            forgetRetry(sha, blobPath)
             System.err.println(s"blobExec: retry: $sha ($blobPath) is excluded or not in src; row removed")
           case Some(b) =>
             blobCommandExecutions.increment()
-            val (outcome, failed) = tokenize(b, task, inserter)
-            (outcome, failed) match {
-              case (BlobExec.Outcome.Skip, Some(f)) =>
-                skippedKeys.add(key)
-                if (f.reason == BlobExec.Failure.Timeout) {
-                  pendingRetry.add(key)
-                  System.err.println(
-                    s"blobExec: retry: $sha ($blobPath) timed out again (${f.detail}). It stays " +
-                      "dropped, and the next run tries it again.")
-                } else {
-                  mapping.deleteRetry(sha, blobPath)
-                  skipLog.forget(sha, blobPath, timeoutOnly)
-                  skipLog.record(SkipLog.Row(sha, blobPath, f.reason, f.detail,
-                    SkipLog.tokenizerFor(tokenizerIdentity, blobPath)))
-                  System.err.println(
-                    s"blobExec: retry: $sha ($blobPath) did not time out, but ${f.reason} " +
-                      s"(${f.detail}). It stays dropped, and it is not tried again.")
-                }
-              case (BlobExec.Outcome.Abort(_, code), _) =>
-                pendingRetry.add(key)
-                skippedKeys.add(key)
-                System.err.println(
-                  s"blobExec: retry: $sha ($blobPath) exited $code. It stays dropped, and the " +
-                    "next run tries it again.")
-              case (other, _) =>
-                val newId = other match {
-                  case BlobExec.Outcome.Replace(id) => id
-                  case _ =>
-                    ensureOriginalBlobAvailable(task.origId, insertHeldBytes(b), inserter)
-                    task.origId
-                }
-                inserter.flush()
+            retryOne(task, b, inserter) match {
+              case Some(newId) =>
+                if (recovered == 0) startRefold()
                 mapping.inTx {
                   mapping.putBlob(sha, blobPath, newId.name)
                   mapping.deleteRetry(sha, blobPath)
                 }
-                skipLog.forget(sha, blobPath, timeoutOnly)
+                skipLog.forget(sha, blobPath, TimeoutOnly)
                 recovered += 1
                 System.err.println(s"blobExec: retry: $sha ($blobPath) tokenized; row removed")
+              case None => ()
             }
         }
       }
@@ -1442,14 +1396,65 @@ final class Walker(
     } finally inserter.close()
 
     if (recovered > 0) {
-      mapping.clearFold()
-      refolded = true
       blobsRecovered.add(recovered)
       System.err.println(
         s"blobExec: $recovered blob(s) recovered on retry. commit_map, tree_map and ref_map are " +
-          "now empty, so this run folds all of history again with those blobs in it. The blob " +
-          "rows stay, so no other blob is tokenized again. Every rewritten commit gets a new " +
-          "sha: all outputs made from the tokenized repository are out of date.")
+          "now empty, so this run folds all of history again with those blobs in it. Every " +
+          "rewritten commit gets a new sha: all outputs made from the tokenized repository are " +
+          "out of date.")
+    }
+  }
+
+  /** Before the first blob row of a recovery: Main writes --refold-marker first. */
+  private def startRefold(): Unit = {
+    onRefold()
+    mapping.clearFold()
+    refolded = true
+  }
+
+  private def forgetRetry(sha: String, blobPath: String): Unit = {
+    mapping.deleteRetry(sha, blobPath)
+    skipLog.forget(sha, blobPath, TimeoutOnly)
+  }
+
+  /** Tokenize one retry_blob row. Returns the id for blob_map, or None if the blob
+    * stays dropped. */
+  private def retryOne(task: BlobMissTask, b: Array[Byte], inserter: ObjectInserter): Option[ObjectId] = {
+    val sha = task.origId.name
+    val blobPath = task.fullPath
+    val key = (sha, blobPath)
+    val (outcome, failed) = tokenize(b, task, inserter)
+    (outcome, failed) match {
+      case (BlobExec.Outcome.Skip, Some(f)) if f.reason == BlobExec.Failure.Timeout =>
+        skippedKeys.add(key)
+        pendingRetry.add(key)
+        System.err.println(
+          s"blobExec: retry: $sha ($blobPath) timed out again (${f.detail}). It stays " +
+            "dropped, and the next run tries it again.")
+        None
+      case (BlobExec.Outcome.Skip, Some(f)) =>
+        skippedKeys.add(key)
+        forgetRetry(sha, blobPath)
+        skipLog.record(SkipLog.Row(sha, blobPath, f.reason, f.detail,
+          SkipLog.tokenizerFor(tokenizerIdentity, blobPath)))
+        System.err.println(
+          s"blobExec: retry: $sha ($blobPath) did not time out, but ${f.reason} " +
+            s"(${f.detail}). It stays dropped, and it is not tried again.")
+        None
+      case (BlobExec.Outcome.Abort(_, code), _) =>
+        pendingRetry.add(key)
+        skippedKeys.add(key)
+        System.err.println(
+          s"blobExec: retry: $sha ($blobPath) exited $code. It stays dropped, and the " +
+            "next run tries it again.")
+        None
+      case (BlobExec.Outcome.Replace(id), _) =>
+        inserter.flush()
+        Some(id)
+      case _ =>
+        ensureOriginalBlobAvailable(task.origId, insertHeldBytes(b), inserter)
+        inserter.flush()
+        Some(task.origId)
     }
   }
 

@@ -113,6 +113,12 @@ object Main {
   private[blobexec] def parsePositiveSeconds(spec: String): Option[Int] =
     spec.toIntOption.filter(_ > 0)
 
+  /** Written before the fold is emptied, so that a run that stops part way still
+    * makes the runner drop the outputs of the old commits. */
+  private def writeRefoldMarker(p: java.nio.file.Path): Unit =
+    Files.write(p, (s"${java.time.Instant.now()} blobExec re-folds all history: a timed-out " +
+      "blob recovered on retry\n").getBytes("UTF-8"))
+
   /** Multiple of `--blob-timeout` used when the stall window has to be widened
     * for it, matching the ratio of the two defaults (600 and 1800). */
   private[blobexec] val StallTimeoutMultiple = 3
@@ -278,8 +284,8 @@ object Main {
       |                    sha, path and reason again. A row is removed when its
       |                    blob tokenizes on a later run.
       |  --refold-marker=<file>
-      |                    create this file when a retry recovered a timed-out blob
-      |                    and the run folded all of history again. Every rewritten
+      |                    create this file when a retry recovers a timed-out blob,
+      |                    before the run folds all of history again. Every rewritten
       |                    commit then has a new sha, so the caller must remove all
       |                    outputs made from the tokenized repository. The caller
       |                    removes the file.
@@ -846,7 +852,8 @@ object Main {
         maxRetries = maxRetries,
         timeoutRetryFactor = timeoutRetryFactor,
         loadGate = LoadGate(loadLimit, loadWaitMax),
-        retryTimedOutPass = retryTimedOutPass
+        retryTimedOutPass = retryTimedOutPass,
+        onRefold = () => refoldMarker.foreach(writeRefoldMarker)
       )
       val s = walker.run()
       retryPending = mapping.retryBlobs.size
@@ -859,13 +866,6 @@ object Main {
       mapping.close()
       dst.close()
       src.close()
-    }
-
-    // Written after the walk, so that it exists only if the re-fold is complete.
-    if (stats.refolded) refoldMarker.foreach { p =>
-      Files.write(p, (s"${java.time.Instant.now()} blobExec re-folded all history: " +
-        s"${stats.blobsRecovered} timed-out blob(s) recovered on retry\n").getBytes("UTF-8"))
-      ()
     }
 
     println(
