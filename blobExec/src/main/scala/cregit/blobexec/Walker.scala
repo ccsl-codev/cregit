@@ -20,10 +20,9 @@ final case class WalkStats(
     blobsCacheHit: Int,
     refsProjected: Int,
     aborted: Boolean,
-    /** Blobs whose command was killed for exceeding its budget. Under
-      * `strictTokenize` the walk stops at the containing commit. Otherwise the
-      * blob is dropped and recorded (see [[blobsSkipped]]). Either way a non-zero
-      * count must reach the caller rather than living only in stderr. */
+    /** Blobs whose command was killed for exceeding its budget, and under
+      * `strictTokenize` also the held ones. A non-zero count must reach the caller
+      * rather than living only in stderr. */
     blobsTimedOut: Long,
     /** Distinct mask-matched blobs excluded from the rewrite because JGit will
       * not materialise an object that large. Unlike [[blobsTimedOut]] this is
@@ -1211,9 +1210,8 @@ final class Walker(
     * `oversizedKeys` so the two exclusions can never be confused in the counts. */
   private val denylistedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
-  /** `(origSha, fullPath)` of every blob this run dropped after a tokenizer
-    * failure. Read by [[readBlob]] (do not run the tokenizer again) and by
-    * [[resolveEntry]] (omit the path). Empty under `strictTokenize`. */
+  /** `(origSha, fullPath)` of every blob dropped after a tokenizer failure. Under
+    * `strictTokenize` only the retry pass and the hold fill it. */
   private val skippedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
   /** Timed-out blobs that an earlier run dropped and that the retry at the start
@@ -1338,10 +1336,8 @@ final class Walker(
     result
   }
 
-  /** The retry pass is off (`retryTimedOutPass = false`): keep each blob that
-    * timed out in an earlier run dropped, and keep its retry_blob row. The walk
-    * does not give such a blob to the tokenizer either, so every tree that holds
-    * it stays the same, and the blame output made from those trees stays valid. */
+  /** Keep each blob with a retry_blob row dropped and untokenized, so the trees
+    * that hold it, and the blame made from them, stay the same. */
   private def holdTimedOutBlobs(): Unit = {
     val pending = mapping.retryBlobs
     if (pending.isEmpty) return
@@ -1349,10 +1345,14 @@ final class Walker(
       skippedKeys.add(key)
       pendingRetry.add(key)
     }
+    // Strict mode must not exit 0 while it keeps blobs dropped.
+    if (strictTokenize) blobsTimedOut.add(pending.size.toLong)
     System.err.println(
       s"blobExec: ${pending.size} blob(s) that timed out in an earlier run stay dropped: the retry " +
         "pass is off (--no-retry-timed-out). Their retry_blob rows stay, so a later run without " +
-        "that flag tries them again.")
+        "that flag tries them again." +
+        (if (strictTokenize) " Under --strict-tokenize they count as timeouts (exit 4); the runner's " +
+          "--retry-skipped tries them." else ""))
   }
 
   /** The walk alone never reaches these blobs again: the trees that hold them are

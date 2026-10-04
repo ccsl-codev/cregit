@@ -323,8 +323,9 @@ tokenizer on it.
 Then the first failure stops step 2, as in earlier versions: blobExec records nothing
 for the containing commit and exits 4 (timeout) or 6 (parser crash), and the runner
 writes `TOKENIZE-TIMEOUTS` or `TOKENIZE-PARSER-CRASHES` and stops. A step-2 resume
-retries exactly those blobs. `--mode sharded` is always strict, because the shard
-merge does not carry the retry records over.
+retries exactly those blobs. A timeout held because blame output exists also counts,
+so a strict step 2 exits 4 until `--retry-skipped`. `--mode sharded` is always strict,
+because the shard merge does not carry the retry records over.
 
 | blobExec exit status | before this change | now, default | now, `--strict-tokenize` |
 | -------------------- | ------------------ | ------------ | ------------------------ |

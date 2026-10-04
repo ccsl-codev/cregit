@@ -463,6 +463,16 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
     withMapping(fx)(_.retryBlobs) shouldBe empty
   }
 
+  test("strict mode with the retry pass off: the held blob counts as a timeout, exit 4") {
+    val fx = fixture("timeout")
+    run(fx, "serial")
+    Files.delete(fx.marker)
+    val held = run(fx, "serial", strict = true, retryPass = false)
+    held.blobsTimedOut shouldEqual 1L
+    fx.callsForB shouldEqual 1
+    Main.exitStatus(held, strictTokenize = true) shouldEqual Main.TimedOutExitStatus
+  }
+
   test("a run that stops after the first recovery still re-folds next time, and has the marker") {
     val fx = fixture("timeout")
     run(fx, "serial")

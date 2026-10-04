@@ -274,6 +274,7 @@ object Main {
       |                    history again and so makes all blame output out of
       |                    date; the pipeline passes this flag when blame output
       |                    exists (see run_pipeline_process.sh --retry-skipped).
+      |                    With --strict-tokenize the held blobs count as timeouts.
       |  --skipped-tsv=<file>
       |                    the record of every blob that the tokenized repository
       |                    does not contain. Tab-separated, with the header
