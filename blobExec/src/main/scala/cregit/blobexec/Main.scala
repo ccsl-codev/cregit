@@ -119,6 +119,14 @@ object Main {
     Files.write(p, (s"${java.time.Instant.now()} blobExec re-folds all history: a timed-out " +
       "blob recovered on retry\n").getBytes("UTF-8"))
 
+  private def flagValue[A](t: String, prefix: String, what: String)(parse: String => Option[A]): A = {
+    val spec = t.stripPrefix(prefix)
+    parse(spec).getOrElse {
+      System.err.println(s"Error: ${prefix.dropRight(1)} must be $what [$spec]")
+      sys.exit(1)
+    }
+  }
+
   /** Multiple of `--blob-timeout` used when the stall window has to be widened
     * for it, matching the ratio of the two defaults (600 and 1800). */
   private[blobexec] val StallTimeoutMultiple = 3
@@ -483,37 +491,16 @@ object Main {
     flags.foreach {
       case "--no-retry-timed-out" => retryTimedOutPass = false
       case t if t.startsWith("--max-retries=") =>
-        val spec = t.stripPrefix("--max-retries=")
-        spec.toIntOption.filter(n => n >= 0 && n <= 100) match {
-          case Some(n) => maxRetries = n
-          case None =>
-            System.err.println(s"Error: --max-retries must be a whole number from 0 to 100 [$spec]")
-            sys.exit(1)
-        }
+        maxRetries = flagValue(t, "--max-retries=", "a whole number from 0 to 100")(
+          _.toIntOption.filter(n => n >= 0 && n <= 100))
       case t if t.startsWith("--timeout-retry-factor=") =>
-        val spec = t.stripPrefix("--timeout-retry-factor=")
-        spec.toIntOption.filter(_ >= 0) match {
-          case Some(n) => timeoutRetryFactor = n
-          case None =>
-            System.err.println(s"Error: --timeout-retry-factor must be a whole number >= 0 [$spec]")
-            sys.exit(1)
-        }
+        timeoutRetryFactor = flagValue(t, "--timeout-retry-factor=", "a whole number >= 0")(
+          _.toIntOption.filter(_ >= 0))
       case t if t.startsWith("--load-limit=") =>
-        val spec = t.stripPrefix("--load-limit=")
-        spec.toDoubleOption.filter(v => v >= 0 && !v.isNaN) match {
-          case Some(v) => loadLimit = v
-          case None =>
-            System.err.println(s"Error: --load-limit must be a number >= 0 [$spec]")
-            sys.exit(1)
-        }
+        loadLimit = flagValue(t, "--load-limit=", "a number >= 0")(_.toDoubleOption.filter(_ >= 0))
       case t if t.startsWith("--load-wait-max=") =>
-        val spec = t.stripPrefix("--load-wait-max=")
-        spec.toIntOption.filter(_ >= 0) match {
-          case Some(n) => loadWaitMax = n
-          case None =>
-            System.err.println(s"Error: --load-wait-max must be a whole number of seconds >= 0 [$spec]")
-            sys.exit(1)
-        }
+        loadWaitMax = flagValue(t, "--load-wait-max=", "a whole number of seconds >= 0")(
+          _.toIntOption.filter(_ >= 0))
       case "--abort-on-error" => abortOnError = true
       case "--strict-tokenize" => strictTokenize = true
       case t if t.startsWith("--skipped-tsv=") && t.length > "--skipped-tsv=".length =>
