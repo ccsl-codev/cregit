@@ -15,6 +15,7 @@ final class TokenizerWorkerPool(
   require(size > 0, "worker pool size must be positive")
 
   private val WorkerTimeoutExitCode = 124
+  private val ReadySeconds = 30L
 
   private final class Response(val exitCode: Int, val stdout: Array[Byte], val stderr: String)
 
@@ -63,40 +64,21 @@ final class TokenizerWorkerPool(
 
     val worker = idle.take()
     worker.takeDiagnostics()
-    try {
-      writeRequest(worker, bytes, origSha, filename, fullPath, timeoutSeconds)
-    } catch {
-      case failure: IOException =>
-        return failedWorker(worker, failure)
-    }
-
-    val finished = new CountDownLatch(1)
-    val response = new AtomicReference[Either[Throwable, Response]]()
-    val reader = new Thread(
-      () => {
-        try response.set(Right(readResponse(worker.stdout)))
-        catch { case failure: Throwable => response.set(Left(failure)) }
-        finally finished.countDown()
-      },
-      s"token-worker-response-${worker.index}"
-    )
-    reader.setDaemon(true)
-    reader.start()
+    try writeRequest(worker, bytes, origSha, filename, fullPath, timeoutSeconds)
+    catch { case failure: IOException => return failedWorker(worker, failure) }
 
     val backstopSeconds = ChildRunner.maxLifetimeSeconds(timeoutSeconds)
-    if (!finished.await(backstopSeconds, TimeUnit.SECONDS)) {
-      replaceWorker(worker)
-      ChildRunner.Outcome.Killed(s"no response within ${backstopSeconds}s; worker replaced")
-    } else {
-      response.get() match {
-        case Right(result) =>
-          returnWorker(worker)
-          if (result.exitCode == WorkerTimeoutExitCode)
-            ChildRunner.Outcome.Killed(s"no exit within ${timeoutSeconds}s")
-          else ChildRunner.Outcome.Exited(result.exitCode, result.stdout, result.stderr)
-        case Left(failure) =>
-          failedWorker(worker, failure)
-      }
+    readWithin(s"token-worker-response-${worker.index}", backstopSeconds)(readResponse(worker.stdout)) match {
+      case None =>
+        replaceWorker(worker)
+        ChildRunner.Outcome.Killed(s"no response within ${backstopSeconds}s; worker replaced")
+      case Some(Left(failure)) =>
+        failedWorker(worker, failure)
+      case Some(Right(result)) =>
+        returnWorker(worker)
+        if (result.exitCode == WorkerTimeoutExitCode)
+          ChildRunner.Outcome.Killed(s"no exit within ${timeoutSeconds}s")
+        else ChildRunner.Outcome.Exited(result.exitCode, result.stdout, result.stderr)
     }
   }
 
@@ -127,48 +109,52 @@ final class TokenizerWorkerPool(
     )
     startStderrForwarder(worker)
 
-    val ready = new AtomicReference[Either[Throwable, String]]()
-    val readyLatch = new CountDownLatch(1)
-    val readyReader = new Thread(
-      () => {
-        try ready.set(Right(readHeader(worker.stdout)))
-        catch { case failure: Throwable => ready.set(Left(failure)) }
-        finally readyLatch.countDown()
-      },
-      s"token-worker-ready-$index"
-    )
-    readyReader.setDaemon(true)
-    readyReader.start()
-
-    if (!readyLatch.await(30, TimeUnit.SECONDS)) {
-      process.destroyForcibly()
-      throw new IllegalStateException(s"tokenizer worker $index did not print READY within 30 seconds")
-    }
-    ready.get() match {
-      case Right("READY") => worker
-      case Right(line) =>
+    readWithin(s"token-worker-ready-$index", ReadySeconds)(readHeader(worker.stdout)) match {
+      case Some(Right("READY")) => worker
+      case notReady =>
         process.destroyForcibly()
-        throw new IllegalStateException(s"tokenizer worker $index printed [$line] instead of READY")
-      case Left(failure) =>
-        process.destroyForcibly()
-        throw new IllegalStateException(s"tokenizer worker $index failed before READY", failure)
+        throw startFailure(index, notReady)
     }
   }
 
+  private def startFailure(index: Int, ready: Option[Either[Throwable, String]]): IllegalStateException =
+    ready match {
+      case None =>
+        new IllegalStateException(s"tokenizer worker $index did not print READY within $ReadySeconds seconds")
+      case Some(Right(line)) =>
+        new IllegalStateException(s"tokenizer worker $index printed [$line] instead of READY")
+      case Some(Left(failure)) =>
+        new IllegalStateException(s"tokenizer worker $index failed before READY", failure)
+    }
+
+  private def readWithin[A](threadName: String, seconds: Long)(read: => A): Option[Either[Throwable, A]] = {
+    val result = new AtomicReference[Either[Throwable, A]]()
+    val done = new CountDownLatch(1)
+    val reader = new Thread(
+      () => {
+        try result.set(Right(read))
+        catch { case failure: Throwable => result.set(Left(failure)) }
+        finally done.countDown()
+      },
+      threadName
+    )
+    reader.setDaemon(true)
+    reader.start()
+    if (done.await(seconds, TimeUnit.SECONDS)) Some(result.get()) else None
+  }
+
   private def startStderrForwarder(worker: Worker): Unit = {
+    def forward(line: String): Unit = {
+      worker.appendDiagnostic(line)
+      System.err.println(s"tokenWorker[${worker.index}]: $line")
+    }
     val thread = new Thread(
       () => {
         val reader = new BufferedReader(new InputStreamReader(worker.process.getErrorStream, UTF_8))
-        try {
-          Iterator.continually(reader.readLine()).takeWhile(_ != null).foreach { line =>
-            worker.appendDiagnostic(line)
-            System.err.println(s"tokenWorker[${worker.index}]: $line")
-          }
-        } catch {
+        try Iterator.continually(reader.readLine()).takeWhile(_ != null).foreach(forward)
+        catch {
           case failure: IOException if worker.process.isAlive =>
-            val line = s"stderr forwarding failed: ${failure.getMessage}"
-            worker.appendDiagnostic(line)
-            System.err.println(s"tokenWorker[${worker.index}]: $line")
+            forward(s"stderr forwarding failed: ${failure.getMessage}")
           case _: IOException => ()
         } finally try reader.close() catch { case _: IOException => () }
       },
