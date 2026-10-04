@@ -47,11 +47,15 @@ object BlobExec {
       timeoutSeconds: Int = DefaultTimeoutSeconds,
       onTimeout: () => Unit = () => (),
       onParserCrash: () => Unit = () => (),
-      invocationResult: Option[ChildRunner.Outcome] = None
+      workerPool: Option[TokenizerWorkerPool] = None
   ): Outcome = {
     val env = Seq("BFG_BLOB" -> origSha, "BFG_FILENAME" -> filename, "BFG_PATH" -> fullPath)
 
-    invocationResult.getOrElse(new ChildRunner(timeoutSeconds).run(command, bytes, env)) match {
+    val ran = workerPool match {
+      case Some(pool) => pool.invoke(bytes, origSha, filename, fullPath, timeoutSeconds)
+      case None       => new ChildRunner(timeoutSeconds).run(command, bytes, env)
+    }
+    ran match {
       case ChildRunner.Outcome.Killed(why) =>
         System.err.println(
           s"Warning: command [$command] on blob $origSha at path [$fullPath] gave no usable " +

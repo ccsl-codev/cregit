@@ -843,8 +843,6 @@ final class Walker(
     try {
       blobCommandExecutions.increment()
       val unusable = new AtomicBoolean(false)
-      val invocationResult =
-        workerPool.map(_.invoke(bytes, task.origId.name, task.filename, task.fullPath))
       val outcome = BlobExec.run(
         bytes        = bytes,
         origSha      = task.origId.name,
@@ -856,7 +854,7 @@ final class Walker(
         timeoutSeconds = blobTimeoutSeconds,
         onTimeout      = () => { blobsTimedOut.increment(); unusable.set(true) },
         onParserCrash  = () => { blobsParserCrashed.increment(); unusable.set(true) },
-        invocationResult = invocationResult
+        workerPool     = workerPool
       )
       val res = outcome match {
         case BlobExec.Outcome.Skip if unusable.get() =>

@@ -9,13 +9,11 @@ import scala.jdk.CollectionConverters._
 final class TokenizerWorkerPool(
     workerCommand: Seq[String],
     env: Map[String, String],
-    size: Int,
-    timeoutSeconds: Int
+    size: Int
 ) extends AutoCloseable {
 
   require(workerCommand.nonEmpty, "workerCommand must not be empty")
   require(size > 0, "worker pool size must be positive")
-  require(timeoutSeconds > 0, "worker timeout must be positive")
 
   private val WorkerTimeoutExitCode = 124
 
@@ -58,14 +56,16 @@ final class TokenizerWorkerPool(
       bytes: Array[Byte],
       origSha: String,
       filename: String,
-      fullPath: String
+      fullPath: String,
+      timeoutSeconds: Int
   ): ChildRunner.Outcome = {
+    require(timeoutSeconds > 0, "worker timeout must be positive")
     if (closed.get()) throw new IllegalStateException("tokenizer worker pool is closed")
 
     val worker = idle.take()
     worker.takeDiagnostics()
     try {
-      writeRequest(worker, bytes, origSha, filename, fullPath)
+      writeRequest(worker, bytes, origSha, filename, fullPath, timeoutSeconds)
     } catch {
       case failure: IOException =>
         return failedWorker(worker, failure)
@@ -188,7 +188,8 @@ final class TokenizerWorkerPool(
       bytes: Array[Byte],
       origSha: String,
       filename: String,
-      fullPath: String
+      fullPath: String,
+      timeoutSeconds: Int
   ): Unit = {
     val filenameBytes = filename.getBytes(UTF_8)
     val pathBytes = fullPath.getBytes(UTF_8)

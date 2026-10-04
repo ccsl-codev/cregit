@@ -18,6 +18,15 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
     case other                          => fail(s"expected Exited, got $other")
   }
 
+  private def request(
+      pool: TokenizerWorkerPool,
+      filename: String,
+      body: String,
+      sha: String,
+      timeoutSeconds: Int = 2
+  ): ChildRunner.Outcome =
+    pool.invoke(body.getBytes(UTF_8), sha, filename, s"src/$filename", timeoutSeconds)
+
   private val tmpDir = Files.createTempDirectory("tokenizer-worker-pool-")
   private val worker = tmpDir.resolve("fake-worker.pl")
 
@@ -62,6 +71,8 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
          |        print "RES 33 0 5\ncrash";
          |    } elsif ($filename eq 'timeout.c') {
          |        print "RES 124 0 7\ntimeout";
+         |    } elsif ($filename eq 'budget.c') {
+         |        print "RES 0 ", length($timeout), " 0\n", $timeout;
          |    } elsif ($filename eq 'die.c') {
          |        print STDERR "worker died\n";
          |        exit 7;
@@ -78,33 +89,40 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   override def afterAll(): Unit = deleteRecursive(tmpDir)
 
   test("round-trips bytes and preserves parser crash status") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1, timeoutSeconds = 2)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
     try {
-      val (exit, stdout, stderr) = exited(pool.invoke(
-        "hello".getBytes(UTF_8), "a" * 40, "hello.c", "src/hello.c"))
+      val (exit, stdout, stderr) = exited(request(pool, "hello.c", "hello", "a" * 40))
       exit shouldEqual 0
       stdout shouldEqual "HELLO".getBytes(UTF_8)
       stderr shouldBe empty
 
       val (crashExit, crashOut, crashErr) =
-        exited(pool.invoke("bad".getBytes(UTF_8), "b" * 40, "crash.c", "src/crash.c"))
+        exited(request(pool, "crash.c", "bad", "b" * 40))
       crashExit shouldEqual BlobExec.ParserCrashExitCode
       crashOut shouldBe empty
       crashErr shouldEqual "crash"
     } finally pool.close()
   }
 
+  test("sends each request's own budget to the worker") {
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
+    try {
+      exited(request(pool, "budget.c", "x", "9" * 40, timeoutSeconds = 7))._2 shouldEqual "7".getBytes(UTF_8)
+      exited(request(pool, "budget.c", "x", "9" * 40, timeoutSeconds = 21))._2 shouldEqual "21".getBytes(UTF_8)
+    } finally pool.close()
+  }
+
   test("times out a wedged worker, replaces it, and serves the next request") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1, timeoutSeconds = 1)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
     try {
       val started = System.nanoTime()
-      val hung = pool.invoke("hang".getBytes(UTF_8), "c" * 40, "hang.c", "src/hang.c")
+      val hung = request(pool, "hang.c", "hang", "c" * 40, timeoutSeconds = 1)
       val elapsed = (System.nanoTime() - started).nanos
 
       hung shouldBe a[Killed]
       elapsed should be < 15.seconds
       val (nextExit, nextOut, nextErr) =
-        exited(pool.invoke("next".getBytes(UTF_8), "d" * 40, "next.c", "src/next.c"))
+        exited(request(pool, "next.c", "next", "d" * 40, timeoutSeconds = 1))
       nextExit shouldEqual 0
       nextOut shouldEqual "NEXT".getBytes(UTF_8)
       nextErr shouldBe empty
@@ -113,11 +131,11 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
 
   test("serves pool-sized requests in parallel") {
     implicit val ec: ExecutionContext = ExecutionContext.global
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 3, timeoutSeconds = 5)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 3)
     try {
       val started = System.nanoTime()
       val requests = (1 to 3).map { n =>
-        Future(exited(pool.invoke(s"body$n".getBytes(UTF_8), f"$n%040x", "slow.c", s"src/slow$n.c")))
+        Future(exited(request(pool, "slow.c", s"body$n", f"$n%040x", timeoutSeconds = 5)))
       }
       val results = Await.result(Future.sequence(requests), 10.seconds)
       val elapsed = (System.nanoTime() - started).nanos
@@ -129,24 +147,24 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   }
 
   test("maps worker timeout status and respawns after mid-request death") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1, timeoutSeconds = 2)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 1)
     try {
-      val timedOut = pool.invoke("slow".getBytes(UTF_8), "e" * 40, "timeout.c", "src/timeout.c")
+      val timedOut = request(pool, "timeout.c", "slow", "e" * 40)
       timedOut shouldBe a[Killed]
 
-      val died = exited(pool.invoke("die".getBytes(UTF_8), "f" * 40, "die.c", "src/die.c"))
+      val died = exited(request(pool, "die.c", "die", "f" * 40))
       died._1 should not equal 0
       died._2 shouldBe empty
       died._3 should include("worker died")
 
-      val recovered = exited(pool.invoke("ok".getBytes(UTF_8), "1" * 40, "ok.c", "src/ok.c"))
+      val recovered = exited(request(pool, "ok.c", "ok", "1" * 40))
       recovered._1 shouldEqual 0
       recovered._2 shouldEqual "OK".getBytes(UTF_8)
     } finally pool.close()
   }
 
   test("close terminates every worker process") {
-    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 2, timeoutSeconds = 2)
+    val pool = new TokenizerWorkerPool(Seq(worker.toString), Map.empty, size = 2)
     val pids = pool.currentWorkerPids
     pids should have size 2
 

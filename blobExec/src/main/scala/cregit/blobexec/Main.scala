@@ -300,7 +300,7 @@ object Main {
         val workerEnv = Seq("BFG_MEMO_DIR", "BFG_TOKENIZE_CMD").flatMap { key =>
           sys.env.get(key).map(key -> _)
         }.toMap
-        new TokenizerWorkerPool(Seq(path.toString), workerEnv, parallelism, blobTimeoutSeconds)
+        new TokenizerWorkerPool(Seq(path.toString), workerEnv, parallelism)
       }
       workerShutdownHook = workerPool.map { pool =>
         val hook = new Thread(() => pool.close(), "tokenizer-worker-pool-shutdown")
