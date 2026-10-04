@@ -40,7 +40,7 @@ sub fixture {
     my $dir = tempdir(CLEANUP => 1);
     my $tok = "$dir/tokenize";
     make_path($tok);
-    for my $f (qw(tokenize.pl CregitLanguages.pm tokenizerIdentity.pl tokenizeSrcMl.pl)) {
+    for my $f (qw(tokenize.pl CregitLanguages.pm tokenizerIdentity.pl tokenizeSrcMl.pl CregitSrcMl.pm)) {
         copy("$realTokenizeDir/$f", "$tok/$f") or die "copy $f: $!";
     }
     chmod 0755, "$tok/tokenizerIdentity.pl", "$tok/tokenize.pl", "$tok/tokenizeSrcMl.pl";
@@ -144,15 +144,15 @@ for my $component (qw(srcml2token libsrcml ctags)) {
     is($a{rs}, $b{rs}, "changing $component leaves .rs alone");
 }
 
-# tokenizeSrcMl.pl itself, for completeness.
-{
+# tokenizeSrcMl.pl itself, and CregitSrcMl.pm, its copy in the tokenizer worker.
+for my $script (qw(tokenizeSrcMl.pl CregitSrcMl.pm)) {
     my $d = fixture();
     my ($before) = identity($d);
-    write_file("$d/tokenize/tokenizeSrcMl.pl", "# v2\n");
+    write_file("$d/tokenize/$script", "# v2\n");
     my ($after) = identity($d);
     my %b = as_map($before);
     my %a = as_map($after);
-    isnt($a{c}, $b{c}, "editing tokenizeSrcMl.pl moves the .c identity");
+    isnt($a{c}, $b{c}, "editing $script moves the .c identity");
     is($a{rs}, $b{rs}, "and leaves .rs alone");
 }
 

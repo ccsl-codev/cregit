@@ -8,6 +8,14 @@ The worker reads `BFG_MEMO_DIR` and `BFG_TOKENIZE_CMD` from its environment,
 as `tokenBySha.pl` does. Its tokens, its memo files and its exit statuses are
 the same as those of `tokenBySha.pl`.
 
+For C, C++ and Java, the worker does the work of `tokenizeSrcMl.pl` in its own
+process (`tokenize/CregitSrcMl.pm`) if `BFG_TOKENIZE_CMD` is `tokenize.pl` with
+only the options `--srcml2token=`, `--ctags=` and `--position`. It keeps one
+`ctags --_interactive` for each language alive, and starts only `srcml2token`
+for each file. For all other languages and commands, it starts
+`BFG_TOKENIZE_CMD` for each blob. The worker does not start if `srcml2token`
+does not answer `--libsrcml-path`.
+
 ## Messages
 
 At start, the worker writes `READY\n` to stdout. Then, for each request:
@@ -26,8 +34,8 @@ worker -> JVM:  RES <exit> <outLength> <errLength>\n<out><err>
 
 ## Failures
 
-- The worker runs the tokenizer in its own process group. At the timeout it
-  kills the group and answers `124`.
+- The worker runs the tokenizer (or `srcml2token`) in its own process group. At the
+  timeout it kills the group and the helpers, and answers `124`.
 - If no answer comes in `timeoutSeconds + 5` seconds, blobExec kills the
   worker and its children, starts a new worker, and reports a timeout.
 - If the worker stops in a request, blobExec reports a tokenizer error for

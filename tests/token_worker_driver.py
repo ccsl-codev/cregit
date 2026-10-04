@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import shutil
 import subprocess
 import time
 
@@ -119,6 +120,49 @@ def check_timeout(args, marker):
     worker.close()
 
 
+def in_process_command(args, marker):
+    options = args.tokenize_command.split()
+    real = next(o.split("=", 1)[1] for o in options if o.startswith("--srcml2token="))
+    srcml2token = write_script(
+        args.temp_root / "srcml2token.sh",
+        'src="${@: -1}"\n'
+        f'grep -qs HANG_MARKER "$src" && exec perl -e "sleep 100" {marker}\n'
+        'grep -qs ABORT_MARKER "$src" && kill -ABRT $$\n'
+        f'exec {real} "$@"\n',
+    )
+    ctags = write_script(
+        args.temp_root / "ctags.sh", f'echo CTAGS_STDERR >&2\nexec {shutil.which("ctags")} "$@"\n'
+    )
+    options = [o for o in options if not o.startswith(("--srcml2token=", "--ctags="))]
+    return " ".join(options + [f"--srcml2token={srcml2token}", f"--ctags={ctags}"])
+
+
+def check_in_process_failures(args, marker):
+    memo = new_dir(args, "in-process-memo")
+    worker = Worker(args.worker, memo, in_process_command(args, marker))
+    (exit_code, _, _), elapsed = timed_request(worker, "hang.c", b"int HANG_MARKER;\n")
+    check(exit_code == TIMEOUT_EXIT and elapsed < 3, f"in process, a hung srcml2token exits {TIMEOUT_EXIT}")
+    check(no_process_left(marker), "and is killed")
+
+    exit_code, out, err = worker.request("abort.c", b"int ABORT_MARKER;\n")
+    check(exit_code == PARSER_CRASH_EXIT and out == b"", f"in process, a srcml2token signal death exits {PARSER_CRASH_EXIT}")
+    check(b"killed by signal 6" in err and b"CTAGS_STDERR" in err, "with the srcml2token and ctags stderr")
+    check(not any(memo.rglob("*")), "and nothing is memoized")
+
+    fixture = args.fixture[0]
+    expected = token_by_sha(args, new_dir(args, "in-process-reference"), fixture).stdout
+    check(worker.request(fixture.name, fixture.read_bytes())[1] == expected, "the worker recovers")
+    worker.close()
+
+
+def check_stale_srcml2token(args):
+    stale = write_script(args.temp_root / "srcml2token", "exit 0\n")
+    command = f"{args.tokenize_command} --srcml2token={stale}"
+    env = dict(os.environ, BFG_MEMO_DIR=str(new_dir(args, "stale-memo")), BFG_TOKENIZE_CMD=command)
+    started = subprocess.run([str(args.worker)], input=b"", capture_output=True, env=env)
+    check(started.returncode != 0 and b"READY" not in started.stdout, "a srcml2token without --libsrcml-path stops the start")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", required=True, type=pathlib.Path)
@@ -131,6 +175,8 @@ def main():
     marker = f"cregit-token-worker-{os.getpid()}"
     check_same_as_token_by_sha(args)
     check_timeout(args, marker)
+    check_in_process_failures(args, marker)
+    check_stale_srcml2token(args)
     print("ALL TOKEN WORKER TESTS PASSED")
 
 

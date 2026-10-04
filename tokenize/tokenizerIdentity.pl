@@ -32,10 +32,10 @@
 #   * its language's parser (CregitLanguages::LANG_PARSER_REL) — the tokenizer
 #     itself. For Rust that is the compiled cargo artifact, which is exactly the
 #     file that went stale.
-#   * srcml2token, the libsrcml it loads, and ctags, for the srcML-routed
-#     languages only. srcml2token parses with libsrcml, and tokenizeSrcMl.pl
-#     merges ctags output into its tokens. A change in any of them changes the
-#     tokens.
+#   * srcml2token, the libsrcml it loads, ctags and CregitSrcMl.pm, for the
+#     srcML-routed languages only. srcml2token parses with libsrcml, and
+#     tokenizeSrcMl.pl (or CregitSrcMl.pm in the tokenizer worker) merges ctags
+#     output into its tokens. A change in any of them changes the tokens.
 #   * tokenize.pl and CregitLanguages.pm, for every extension. tokenize.pl is
 #     the dispatcher that decides which parser runs and with which flags
 #     (--position among them, which the token format depends on), and
@@ -158,7 +158,7 @@ for my $ext (@extensions) {
             push @components, $path;
         }
         $libsrcml //= libsrcml_of($srcml2tokenPath);
-        push @components, $libsrcml;
+        push @components, $libsrcml, "$basedir/CregitSrcMl.pm";
     }
 
     # Digest of the component digests, not of the concatenated bytes: the list is

@@ -1,13 +1,13 @@
 #!/usr/bin/env perl
 
 # A persistent tokenBySha.pl with the same output and memo. The protocol is in
-# WORKER_PROTOCOL.md.
+# WORKER_PROTOCOL.md. C, C++ and Java go through CregitSrcMl in this process.
 
 use strict;
 use warnings;
 use bytes;
 use Digest::SHA qw(sha1_hex);
-use File::Basename qw(dirname);
+use File::Basename qw(basename dirname);
 use File::Copy qw(move);
 use File::Path qw(make_path);
 use File::Temp qw(tempfile);
@@ -15,6 +15,7 @@ use FindBin qw($RealBin);
 use POSIX qw(_exit);
 use lib "$RealBin/../tokenize";
 use CregitLanguages;
+use CregitSrcMl;
 
 binmode STDIN;
 binmode STDOUT;
@@ -27,6 +28,7 @@ my @tokenizeCommand = split ' ', $ENV{BFG_TOKENIZE_CMD} // "";
 die "Tokenize command not defined. Use BFG_TOKENIZE_CMD\n" if not @tokenizeCommand;
 my $buildDir = "$RealBin/build";
 make_path($buildDir);
+my $inProcess = in_process_tokenizer(@tokenizeCommand);
 
 print "READY\n";
 while (defined(my $header = <STDIN>)) {
@@ -69,11 +71,31 @@ sub tokenize_blob {
 
     my $workDir = File::Temp->newdir("tokdir-XXXXX", DIR => $buildDir);
     write_file("$workDir/input.$ext", $contents);
-    my ($exit, $out, $err) = run_tokenizer("$workDir", $timeoutSecs, @tokenizeCommand,
-                                           "--language=$language", "input.$ext");
+    my ($exit, $out, $err) = tokenize_file($language, "input.$ext", "$workDir", $timeoutSecs);
     return ($exit, "", $err) if $exit != 0;
     write_memo($memoFile, $out);
     return (0, $out, $err);
+}
+
+sub tokenize_file {
+    my ($language, $inputName, $workDir, $timeoutSecs) = @_;
+    return $inProcess->tokenize($language, $inputName, $workDir, $timeoutSecs)
+        if $inProcess and $CregitLanguages::LANG_PARSER_REL{$language} eq $CregitLanguages::SRCML_PARSER_REL;
+    return run_tokenizer($workDir, $timeoutSecs, @tokenizeCommand, "--language=$language", $inputName);
+}
+
+# Only a tokenize.pl command with the options that it gives to tokenizeSrcMl.pl
+# can run in this process. Any other command starts once per blob.
+sub in_process_tokenizer {
+    my ($program, @options) = @_;
+    return undef if basename($program) ne "tokenize.pl";
+    my %config = (srcml2token => dirname($program) . "/srcMLtoken/srcml2token");
+    for (@options) {
+        if (/\A--(srcml2token|ctags)=(.+)\z/) { $config{$1} = $2 }
+        elsif ($_ eq "--position")                { $config{position} = 1 }
+        else                                       { return undef }
+    }
+    return CregitSrcMl->new(%config);
 }
 
 sub run_tokenizer {
