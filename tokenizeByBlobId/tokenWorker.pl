@@ -118,54 +118,57 @@ sub protocol_error {
 sub process_request {
     my ($origSha, $filename, $fullPath, $contents, $timeoutSecs) = @_;
 
-    my ($fileExt, $language);
-    if ($filename =~ /\.([^.]+)\z/) {
-        $fileExt = lc($1);
-        $language = CregitLanguages::language_for_ext($1);
-    }
-    if (not defined($language)) {
-        my $shownExt = defined($fileExt) ? $fileExt : "";
-        return (255, "", "unknown file extension [$shownExt]\n");
-    }
+    my ($ext) = $filename =~ /\.([^.]+)\z/;
+    my $language = defined($ext) ? CregitLanguages::language_for_ext($ext) : undef;
+    return (255, "", "unknown file extension [" . lc($ext // "") . "]\n") if not defined($language);
 
     my $sha1 = sha1_hex($contents);
-    my $dir = "$memoDir/" . substr($sha1, 0, 2) . "/" . substr($sha1, 2, 2);
-    my $memoFile = "$dir/$sha1";
-
-    if (-f $memoFile) {
-        open(my $memo, '<:raw', $memoFile)
-            or die "unable to open memoized file [$memoFile]: $!\n";
-        local $/;
-        my $output = <$memo>;
-        close($memo) or die "unable to close memoized file [$memoFile]: $!\n";
-        return (0, $output, "");
-    }
+    my $memoFile = "$memoDir/" . substr($sha1, 0, 2) . "/" . substr($sha1, 2, 2) . "/$sha1";
+    return (0, read_memo($memoFile), "") if -f $memoFile;
 
     my $tempDir = File::Temp->newdir(
         "tokdir-XXXXX",
         DIR => $buildDir,
         CLEANUP => 1,
     );
-    my $inputName = "input.$fileExt";
-    my $inputFile = "$tempDir/$inputName";
+    my $inputName = "input." . lc($ext);
+    write_input("$tempDir/$inputName", $contents);
+
+    my ($exitCode, $output, $error) = tokenize_input($language, $inputName, "$tempDir", $timeoutSecs);
+    return ($exitCode, "", $error) if $exitCode != 0;
+
+    write_memo($memoFile, $output);
+    return (0, $output, $error);
+}
+
+sub tokenize_input {
+    my ($language, $inputName, $workDir, $timeoutSecs) = @_;
+    return $inProcess->tokenize($language, $inputName, $workDir, $timeoutSecs)
+        if $inProcess and srcml_language($language);
+    return run_command($workDir, $timeoutSecs, @tokenizeCommand, "--language=$language", $inputName);
+}
+
+sub read_memo {
+    my ($memoFile) = @_;
+    open(my $memo, '<:raw', $memoFile)
+        or die "unable to open memoized file [$memoFile]: $!\n";
+    local $/;
+    my $output = <$memo>;
+    close($memo) or die "unable to close memoized file [$memoFile]: $!\n";
+    return $output;
+}
+
+sub write_input {
+    my ($inputFile, $contents) = @_;
     open(my $input, '>:raw', $inputFile)
         or die "unable to write temp input [$inputFile]: $!\n";
     print {$input} $contents;
     close($input) or die "unable to close temp input [$inputFile]: $!\n";
+}
 
-    my ($exitCode, $output, $error);
-    if ($inProcess and srcml_language($language)) {
-        ($exitCode, $output, $error) = $inProcess->tokenize(
-            $language, $inputName, "$tempDir", $timeoutSecs
-        );
-    } else {
-        my @command = (@tokenizeCommand, "--language=$language", $inputName);
-        ($exitCode, $output, $error) = run_command(
-            "$tempDir", $timeoutSecs, @command
-        );
-    }
-    return ($exitCode, "", $error) if $exitCode != 0;
-
+sub write_memo {
+    my ($memoFile, $output) = @_;
+    my $dir = dirname($memoFile);
     make_path($dir) if not -d $dir;
     my ($memoOut, $tempOutput) = tempfile(
         "tmpfile-out-XXXXX",
@@ -177,8 +180,6 @@ sub process_request {
     close($memoOut) or die "unable to close tokenizer output [$tempOutput]: $!\n";
     move($tempOutput, $memoFile)
         or die "unable to move tokenizer output to [$memoFile]: $!\n";
-
-    return (0, $output, $error);
 }
 
 sub run_command {
@@ -192,29 +193,11 @@ sub run_command {
     if ($pid == 0) {
         close($stdoutRead);
         close($stderrRead);
-        open(STDOUT, '>&', $stdoutWrite) or _exit(255);
-        open(STDERR, '>&', $stderrWrite) or _exit(255);
-        binmode STDOUT;
-        binmode STDERR;
-        close($stdoutWrite);
-        close($stderrWrite);
-        setpgrp(0, 0) or do {
-            print STDERR "unable to create tokenizer process group: $!\n";
-            _exit(255);
-        };
-        chdir($workingDir) or do {
-            print STDERR "unable to enter tokenizer directory [$workingDir]: $!\n";
-            _exit(255);
-        };
-        { no warnings 'exec'; exec {$command[0]} @command; }
-        print STDERR "unable to execute tokenizer [$command[0]]: $!\n";
-        _exit(255);
+        exec_in_group($workingDir, $stdoutWrite, $stderrWrite, @command);
     }
 
     close($stdoutWrite);
     close($stderrWrite);
-    binmode $stdoutRead;
-    binmode $stderrRead;
 
     my $timedOut = 0;
     local $SIG{ALRM} = sub {
@@ -224,37 +207,11 @@ sub run_command {
         kill 'KILL', -$pid;
     };
     alarm($timeoutSecs);
-
-    my $stdoutFd = fileno($stdoutRead);
-    my $stderrFd = fileno($stderrRead);
-    my $selector = IO::Select->new($stdoutRead, $stderrRead);
-    my %stream = (
-        $stdoutFd => "",
-        $stderrFd => "",
-    );
-    while ($selector->count()) {
-        for my $handle ($selector->can_read()) {
-            my $chunk = "";
-            my $read = sysread($handle, $chunk, 65536);
-            if (not defined($read)) {
-                next if $! == EINTR;
-                die "unable to read tokenizer output: $!\n";
-            }
-            if ($read == 0) {
-                $selector->remove($handle);
-                close($handle);
-                next;
-            }
-            $stream{fileno($handle)} .= $chunk;
-        }
-    }
-
+    my ($stdout, $stderr) = read_streams($stdoutRead, $stderrRead);
     waitpid($pid, 0);
     my $status = $?;
     alarm(0);
 
-    my $stdout = $stream{$stdoutFd};
-    my $stderr = $stream{$stderrFd};
     if ($timedOut) {
         $stderr .= "tokenize command timed out after [$timeoutSecs] seconds\n";
         return (124, "", $stderr);
@@ -269,4 +226,50 @@ sub run_command {
     }
 
     return ($status >> 8, $stdout, $stderr);
+}
+
+sub exec_in_group {
+    my ($workingDir, $stdoutWrite, $stderrWrite, @command) = @_;
+    open(STDOUT, '>&', $stdoutWrite) or _exit(255);
+    open(STDERR, '>&', $stderrWrite) or _exit(255);
+    binmode STDOUT;
+    binmode STDERR;
+    close($stdoutWrite);
+    close($stderrWrite);
+    setpgrp(0, 0) or do {
+        print STDERR "unable to create tokenizer process group: $!\n";
+        _exit(255);
+    };
+    chdir($workingDir) or do {
+        print STDERR "unable to enter tokenizer directory [$workingDir]: $!\n";
+        _exit(255);
+    };
+    { no warnings 'exec'; exec {$command[0]} @command; }
+    print STDERR "unable to execute tokenizer [$command[0]]: $!\n";
+    _exit(255);
+}
+
+sub read_streams {
+    my ($stdoutRead, $stderrRead) = @_;
+    binmode $stdoutRead;
+    binmode $stderrRead;
+    my %stream = (fileno($stdoutRead) => "", fileno($stderrRead) => "");
+    my @order = (fileno($stdoutRead), fileno($stderrRead));
+    my $selector = IO::Select->new($stdoutRead, $stderrRead);
+    while ($selector->count()) {
+        for my $handle ($selector->can_read()) {
+            my $read = sysread($handle, my $chunk, 65536);
+            if (not defined($read)) {
+                next if $! == EINTR;
+                die "unable to read tokenizer output: $!\n";
+            }
+            if ($read == 0) {
+                $selector->remove($handle);
+                close($handle);
+                next;
+            }
+            $stream{fileno($handle)} .= $chunk;
+        }
+    }
+    return @stream{@order};
 }

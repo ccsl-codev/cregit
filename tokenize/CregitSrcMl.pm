@@ -178,24 +178,30 @@ sub read_declarations {
             $self->drop_ctags($language);
             die "ctags rejected the request: $line";
         }
-        next unless $line =~ /"_type": "tag"/;
-
-        my ($n) = $line =~ /"line": ([0-9]+)/;
-        my $name = json_field($line, "name");
-        my $kind = json_field($line, "kind");
-        my $sig  = json_field($line, "signature");
-        next unless defined $n and defined $name and defined $kind;
-        $sig = "-" unless defined $sig;
-        for ($name, $kind, $sig) { s/\\/\\\\/g }
-
-        my $xref = "$n $name @@@ $kind @@@ $sig";
-        die "unable to parse output [$xref]" unless $xref =~ /^([0-9]+) (.+) @@@ (.*) @@@ (.*)$/;
-        my %decl = (line => $1, name => $2, type => $3, sig => $4);
-        $decl{name} .= " " . $decl{sig} if $decl{sig} ne "-";
-        $declarations{$decl{line}}{$decl{name}} = \%decl;
-        push @{ $listDeclarations{$decl{line}} }, $decl{name};
+        my $decl = declaration_from_tag($line) or next;
+        $declarations{$decl->{line}}{$decl->{name}} = $decl;
+        push @{ $listDeclarations{$decl->{line}} }, $decl->{name};
     }
     return (\%declarations, \%listDeclarations);
+}
+
+sub declaration_from_tag {
+    my ($line) = @_;
+    return undef unless $line =~ /"_type": "tag"/;
+
+    my ($n) = $line =~ /"line": ([0-9]+)/;
+    my $name = json_field($line, "name");
+    my $kind = json_field($line, "kind");
+    my $sig  = json_field($line, "signature");
+    return undef unless defined $n and defined $name and defined $kind;
+    $sig = "-" unless defined $sig;
+    for ($name, $kind, $sig) { s/\\/\\\\/g }
+
+    my $xref = "$n $name @@@ $kind @@@ $sig";
+    die "unable to parse output [$xref]" unless $xref =~ /^([0-9]+) (.+) @@@ (.*) @@@ (.*)$/;
+    my %decl = (line => $1, name => $2, type => $3, sig => $4);
+    $decl{name} .= " " . $decl{sig} if $decl{sig} ne "-";
+    return \%decl;
 }
 
 sub drop_ctags {
@@ -203,13 +209,14 @@ sub drop_ctags {
     $self->retire(delete $self->{ctagsProc}{$language});
 }
 
+my %JSON_ESCAPE = (
+    '"' => '"', '\\' => '\\', '/' => '/',
+    b => "\b", f => "\f", n => "\n", r => "\r", t => "\t",
+);
+
 sub json_str {
     my ($s) = @_;
-    $s =~ s/\\(["\\\/bfnrt]|u[0-9a-fA-F]{4})/
-        my $e = $1;
-        $e eq '"' ? '"' : $e eq '\\' ? '\\' : $e eq '\/' ? '\/' :
-        $e eq 'b' ? "\b" : $e eq 'f' ? "\f" : $e eq 'n' ? "\n" :
-        $e eq 'r' ? "\r" : $e eq 't' ? "\t" : chr(hex(substr($e, 1)))/ge;
+    $s =~ s{\\(["\\/bfnrt]|u[0-9a-fA-F]{4})}{$JSON_ESCAPE{$1} // chr(hex(substr($1, 1)))}ge;
     return $s;
 }
 
