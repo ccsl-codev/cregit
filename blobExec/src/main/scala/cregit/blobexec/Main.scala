@@ -92,7 +92,7 @@ object Main {
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--tokenizer-worker=<path>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
@@ -188,6 +188,11 @@ object Main {
       |  --memo-dir=<dir>  the memo directory ($$BFG_MEMO_DIR) whose entries
       |                    --retokenize must purge. Only read with --retokenize;
       |                    passing it alone is an error rather than a no-op.
+      |  --tokenizer-worker=<path>
+      |                    send each blob to one of a pool of persistent
+      |                    tokenizer processes (tokenizeByBlobId/tokenWorker.pl)
+      |                    instead of running <command> once per blob. Its
+      |                    output is the same. Needs --pipeline or --pipeline-trees.
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
@@ -265,6 +270,7 @@ object Main {
     var tokenizerIdentity = TokenizerIdentity.empty
     var retokenizeExtensions: Set[String] = Set.empty
     var memoDir: Option[java.nio.file.Path] = None
+    var tokenizerWorker: Option[java.nio.file.Path] = None
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
       case "--pipeline"       => pipeline = true
@@ -316,6 +322,8 @@ object Main {
           sys.exit(1)
         }
         warmPath = Some(p)
+      case t if t.startsWith("--tokenizer-worker=") =>
+        tokenizerWorker = Some(Paths.get(t.stripPrefix("--tokenizer-worker=")))
       case t if t.startsWith("--blob-timeout=") =>
         val spec = t.stripPrefix("--blob-timeout=")
         parsePositiveSeconds(spec) match {
@@ -426,6 +434,17 @@ object Main {
       sys.exit(1)
     }
 
+    tokenizerWorker.foreach { path =>
+      if (!Files.isRegularFile(path) || !Files.isExecutable(path)) {
+        System.err.println(s"Error: --tokenizer-worker [$path] is not an executable file")
+        sys.exit(1)
+      }
+      if (!(pipeline || pipelineTrees)) {
+        System.err.println("Error: --tokenizer-worker needs --pipeline or --pipeline-trees")
+        sys.exit(1)
+      }
+    }
+
     if (positional.length != 5) {
       System.err.println(Usage)
       sys.exit(1)
@@ -476,7 +495,8 @@ object Main {
         s"maskWidened=$maskWidened denylistEntries=${denylist.size} " +
         s"tokenizerIdentity=${if (tokenizerIdentity.isEmpty) "none" else tokenizerIdentity.render} " +
         s"retokenize=${if (retokenizeExtensions.isEmpty) "none" else retokenizeExtensions.toVector.sorted.mkString(",")} " +
-        s"memoDir=${memoDir.map(_.toString).getOrElse("none")}"
+        s"memoDir=${memoDir.map(_.toString).getOrElse("none")} " +
+        s"tokenizerWorker=${tokenizerWorker.map(_.toString).getOrElse("none")}"
     )
 
     val src: FileRepository = openSrc(srcPath)
@@ -565,15 +585,18 @@ object Main {
 
     val stats = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
+      val workerPool = tokenizerWorker.map(path => new TokenizerWorkerPool(path.toString, parallelism))
       val walker = new Walker(
         src, dst, mapping, mask.r, command, abortOnError, parallelism,
         pipeline, pipelineTrees, shard,
         destinationMayContainObjects = incremental,
         blobTimeoutSeconds = blobTimeoutSeconds,
         stallTimeoutSeconds = stallTimeoutSeconds,
+        workerPool = workerPool,
         denylist = denylist
       )
-      walker.run()
+      try walker.run()
+      finally workerPool.foreach(_.close())
     } finally {
       mapping.close()
       dst.close()

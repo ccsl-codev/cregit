@@ -229,6 +229,16 @@ OUT=$(STUB_RC=0 run_step2 "$W" --retokenize rs --mask-widened --mask '\.c$' 2); 
 rm -rf "$W"
 
 # ---------------------------------------------------------------------------
+echo "case 10: --tokenizer-worker reaches blobExec, and only in the pipelined modes"
+W=$(fixture); ARGV="$W/argv.log"
+OUT=$(STUB_RC=0 STUB_ARGV="$ARGV" run_step2 "$W" --tokenizer-worker 2); RC=$?
+grep -q -- "--tokenizer-worker=$REPO/tokenizeByBlobId/tokenWorker.pl" "$ARGV"
+check "blobExec was given the worker path" $?
+OUT=$(STUB_RC=0 run_step2 "$W" --tokenizer-worker --mode serial 2); RC=$?
+[ "$RC" -ne 0 ] && grep -q 'needs --mode pipeline' <<<"$OUT"; check "--mode serial is refused (exit $RC)" $?
+rm -rf "$W"
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -223,6 +223,11 @@ Tokenizer:
                                   for repos too large to tokenize in one process;
                                   delegates to blobExec/shard_build.sh
   --shards N    shard count for --mode sharded (default: 4)
+  --tokenizer-worker
+                send each blob to a pool of persistent tokenizer processes
+                (tokenizeByBlobId/tokenWorker.pl) instead of starting the
+                tokenizer once per blob. Same output. Needs --mode pipeline or
+                pipeline-trees (default: off)
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck: measured on Linux the serial step managed 8 files
@@ -349,6 +354,7 @@ RETOKENIZE=""
 # does hand its environment to this script.
 BLOB_TIMEOUT="${CREGIT_BLOB_TIMEOUT:-}"
 STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
+TOKENIZER_WORKER=0
 
 # Markers meaning "the work in $WORK is incomplete but recoverable, and a
 # FROM_STEP=1 wipe would throw away days of tokenizing to redo it". Written by
@@ -557,6 +563,7 @@ while [ $# -gt 0 ]; do
         --mask-widened) MASK_WIDENED=1; shift ;;
         --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
+        --tokenizer-worker) TOKENIZER_WORKER=1; shift ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
@@ -804,6 +811,9 @@ case "$MODE" in
     serial|pipeline|pipeline-trees|sharded) ;;
     *) echo "invalid --mode: $MODE (serial|pipeline|pipeline-trees|sharded)" >&2; exit 2 ;;
 esac
+if [ "$TOKENIZER_WORKER" = 1 ] && [ "$MODE" != pipeline ] && [ "$MODE" != pipeline-trees ]; then
+    echo "--tokenizer-worker needs --mode pipeline or pipeline-trees" >&2; exit 2
+fi
 if [ "$MODE" = "sharded" ]; then
     [ "$SHARDS" -ge 1 ] 2>/dev/null || { echo "--shards must be a positive integer" >&2; exit 2; }
 fi
@@ -1252,6 +1262,8 @@ else
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
   WIDENED_FLAG=""
   [ "$MASK_WIDENED" = 1 ] && WIDENED_FLAG="--mask-widened"
+  WORKER_FLAG=""
+  [ "$TOKENIZER_WORKER" = 1 ] && WORKER_FLAG="--tokenizer-worker=${CREGIT}/tokenizeByBlobId/tokenWorker.pl"
   # --retokenize carries --memo-dir with it, always, and blobExec refuses one
   # without the other: the blob map and the memo are two caches of the same
   # answer, and invalidating either alone invalidates nothing.
@@ -1259,7 +1271,7 @@ else
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
   fi
-  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG \
+  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
     ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
