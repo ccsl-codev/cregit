@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 from generate_dataset import firm_sql, sql_literal  # noqa: E402
 
 
-def main():
+def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--cregit-db", required=True)
     ap.add_argument("--persons-db", required=True)
@@ -23,12 +23,19 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--dataset")
     ap.add_argument("--memory", default="4GB")
-    args = ap.parse_args()
+    return ap.parse_args()
+
+
+def connect(args):
     con = duckdb.connect()
     con.execute(f"SET memory_limit='{args.memory}'")
     con.execute("INSTALL sqlite_scanner; LOAD sqlite_scanner;")
     con.execute(f"CALL sqlite_attach({sql_literal(args.cregit_db)})")
     con.execute(f"CALL sqlite_attach({sql_literal(args.persons_db)})")
+    return con
+
+
+def write_commits(con, args):
     firm_select, firm_join = firm_sql(args.firm_map, args.firm_canonical)
     con.execute(f"""
         COPY (
@@ -52,23 +59,33 @@ def main():
             LEFT JOIN persons p           ON e.personid = p.personid
 {firm_join}            ORDER BY c.cid
         ) TO {sql_literal(args.out)} (FORMAT parquet, COMPRESSION zstd)""")
+
+
+def compare_with_dataset(con, commits, dataset):
+    return dict(zip(["dataset_commits", "same_person", "same_firm",
+                     "same_original"], con.execute(f"""
+        WITH d AS (
+            SELECT DISTINCT cregit_commit_sha, original_commit_sha,
+                   personid, firm
+            FROM read_parquet({sql_literal(dataset)}))
+        SELECT count(*),
+               count(*) FILTER (WHERE a.personid IS NOT DISTINCT FROM d.personid),
+               count(*) FILTER (WHERE a.firm IS NOT DISTINCT FROM d.firm),
+               count(*) FILTER (WHERE a.original_commit_sha
+                                = d.original_commit_sha)
+        FROM d LEFT JOIN read_parquet({sql_literal(commits)}) a
+          USING (cregit_commit_sha)""").fetchone()))
+
+
+def main():
+    args = parse_args()
+    con = connect(args)
+    write_commits(con, args)
     out = dict(commits=con.execute(
         f"SELECT count(*), count(DISTINCT cregit_commit_sha) "
         f"FROM read_parquet({sql_literal(args.out)})").fetchone())
     if args.dataset:
-        out.update(zip(["dataset_commits", "same_person", "same_firm",
-                        "same_original"], con.execute(f"""
-            WITH d AS (
-                SELECT DISTINCT cregit_commit_sha, original_commit_sha,
-                       personid, firm
-                FROM read_parquet({sql_literal(args.dataset)}))
-            SELECT count(*),
-                   count(*) FILTER (WHERE a.personid IS NOT DISTINCT FROM d.personid),
-                   count(*) FILTER (WHERE a.firm IS NOT DISTINCT FROM d.firm),
-                   count(*) FILTER (WHERE a.original_commit_sha
-                                    = d.original_commit_sha)
-            FROM d LEFT JOIN read_parquet({sql_literal(args.out)}) a
-              USING (cregit_commit_sha)""").fetchone()))
+        out.update(compare_with_dataset(con, args.out, args.dataset))
     print(json.dumps(out, indent=1))
 
 
