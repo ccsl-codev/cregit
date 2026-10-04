@@ -944,19 +944,14 @@ final class Walker(
     inFlightBlobs.put(label, System.nanoTime())
     try {
       blobCommandExecutions.increment()
-      // Set by either callback below: both mean "this blob's tokenization is
-      // unusable, so nothing about it may be persisted".
       val (outcome, failed) = tokenize(bytes, task, workerInserter)
-      val unusable = new AtomicBoolean(failed.isDefined)
-      val failure  = new AtomicReference[BlobExec.Failure](failed.orNull)
       val res = outcome match {
-        case BlobExec.Outcome.Skip if unusable.get() && !strictTokenize =>
-          // Dropped, exactly as a denylisted blob is: no id, so no tree entry, no
-          // blob_map row and no dataset row. The original bytes are NOT put into
-          // dst, because nothing refers to them.
-          dropFailedBlob(task, failure.get())
+        case BlobExec.Outcome.Skip if failed.isDefined && !strictTokenize =>
+          // As a denylisted blob: no id, so no tree entry and no blob_map row. The
+          // original bytes are not put into dst, because nothing refers to them.
+          dropFailedBlob(task, failed.get)
           BlobResult.Oversized(task.origId)
-        case BlobExec.Outcome.Skip if unusable.get() =>
+        case BlobExec.Outcome.Skip if failed.isDefined =>
           // The tree must still reference something, so keep the original bytes
           // available — but report it as TimedOut so nothing gets persisted. A
           // parser crash takes this same branch: the name is now narrower than the
@@ -1101,12 +1096,8 @@ final class Walker(
           inFlightBlobs.put(label, System.nanoTime())
           try {
             blobCommandExecutions.increment()
-            // Set by either callback below: both mean "this blob's tokenization is
-            // unusable, so nothing about it may be persisted".
             val (outcome, failed) = tokenize(bytes, task, workerInserter)
-            val unusable = new AtomicBoolean(failed.isDefined)
-            val failure  = new AtomicReference[BlobExec.Failure](failed.orNull)
-            val dropped = unusable.get() && !strictTokenize
+            val dropped = failed.isDefined && !strictTokenize
             // For Skip outcomes (identical output, a non-zero exit with
             // abortOnError=false, or a timeout) we keep the original blob id, so
             // the dst tree will reference it — meaning the bytes must exist in
@@ -1114,16 +1105,16 @@ final class Walker(
             // blob. For Abort we do nothing (caller short-circuits).
             // A dropped blob (see executeBlobTask) gets no bytes in dst and no id.
             outcome match {
-              case _ if dropped => dropFailedBlob(task, failure.get())
+              case _ if dropped => dropFailedBlob(task, failed.get)
               case BlobExec.Outcome.Skip =>
                 ensureOriginalBlobAvailable(task.origId, insertHeldBytes(bytes), workerInserter)
-                if (!unusable.get()) noteTokenized(task)
+                if (failed.isEmpty) noteTokenized(task)
               case BlobExec.Outcome.Replace(_) => noteTokenized(task)
               case _                     => ()
             }
             workerInserter.flush()
             progress(s"blob $label")
-            if (dropped) None else Some((task, outcome, unusable.get()))
+            if (dropped) None else Some((task, outcome, failed.isDefined))
           } finally {
             inFlightBlobs.remove(label)
             workerInserter.close()
@@ -1190,7 +1181,7 @@ final class Walker(
     // A blob that this run already dropped after a tokenizer failure is not given
     // to the tokenizer again: a second timeout costs a second budget, and a crash
     // is deterministic. It is dropped from every tree that holds it.
-    if (skippedKeys.containsKey((task.origId.name, task.fullPath))) return None
+    if (skippedKeys.contains((task.origId.name, task.fullPath))) return None
 
     val r = src.newObjectReader()
     try {
@@ -1221,10 +1212,9 @@ final class Walker(
   private val denylistedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
   /** `(origSha, fullPath)` of every blob this run dropped after a tokenizer
-    * failure, with the failure. Read by [[readBlob]] (do not run the tokenizer
-    * again) and by [[resolveEntry]] (omit the path). Empty under
-    * `strictTokenize`. */
-  private val skippedKeys = new ConcurrentHashMap[(String, String), BlobExec.Failure]()
+    * failure. Read by [[readBlob]] (do not run the tokenizer again) and by
+    * [[resolveEntry]] (omit the path). Empty under `strictTokenize`. */
+  private val skippedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
   /** Timed-out blobs that an earlier run dropped and that the retry at the start
     * of this run could not recover. If the walk tokenizes one of them (a re-fold
@@ -1239,11 +1229,10 @@ final class Walker(
     * commit only after it has this result, so the retry row is always durable
     * first. Without it a resume never visits the commit again, and the drop of a
     * blob that was only slow would be permanent. */
-  private def dropFailedBlob(task: BlobMissTask, f0: BlobExec.Failure): Unit = {
-    val f = Option(f0).getOrElse(BlobExec.Failure(BlobExec.Failure.ParserCrash, "unknown"))
+  private def dropFailedBlob(task: BlobMissTask, f: BlobExec.Failure): Unit = {
     val sha = task.origId.name
     val key = (sha, task.fullPath)
-    if (skippedKeys.putIfAbsent(key, f) == null) {
+    if (skippedKeys.add(key)) {
       blobsSkipped.increment()
       if (f.reason == BlobExec.Failure.Timeout) {
         dbLock.synchronized(mapping.putRetry(sha, task.fullPath))
@@ -1273,8 +1262,7 @@ final class Walker(
     * now wrong: remove it from the skip file and from retry_blob. */
   private def noteTokenized(task: BlobMissTask): Unit = {
     val sha = task.origId.name
-    if (skipLog.contains(sha, task.fullPath, SkipLog.TokenizerFailures))
-      skipLog.forget(sha, task.fullPath, SkipLog.TokenizerFailures)
+    skipLog.forget(sha, task.fullPath, SkipLog.TokenizerFailures)
     if (pendingRetry.remove((sha, task.fullPath)))
       dbLock.synchronized(mapping.deleteRetry(sha, task.fullPath))
   }
@@ -1356,7 +1344,7 @@ final class Walker(
     val pending = mapping.retryBlobs
     if (pending.isEmpty) return
     pending.foreach { key =>
-      skippedKeys.put(key, BlobExec.Failure(BlobExec.Failure.Timeout, "retry pass off"))
+      skippedKeys.add(key)
       pendingRetry.add(key)
     }
     System.err.println(
@@ -1409,13 +1397,9 @@ final class Walker(
           case Some(b) =>
             blobCommandExecutions.increment()
             val (outcome, failed) = tokenize(b, task, inserter)
-            val unusable = new AtomicBoolean(failed.isDefined)
-            val failure  = new AtomicReference[BlobExec.Failure](failed.orNull)
-            outcome match {
-              case BlobExec.Outcome.Skip if unusable.get() =>
-                val f = Option(failure.get()).getOrElse(
-                  BlobExec.Failure(BlobExec.Failure.ParserCrash, "unknown"))
-                skippedKeys.put(key, f)
+            (outcome, failed) match {
+              case (BlobExec.Outcome.Skip, Some(f)) =>
+                skippedKeys.add(key)
                 if (f.reason == BlobExec.Failure.Timeout) {
                   pendingRetry.add(key)
                   System.err.println(
@@ -1430,13 +1414,13 @@ final class Walker(
                     s"blobExec: retry: $sha ($blobPath) did not time out, but ${f.reason} " +
                       s"(${f.detail}). It stays dropped, and it is not tried again.")
                 }
-              case BlobExec.Outcome.Abort(_, code) =>
+              case (BlobExec.Outcome.Abort(_, code), _) =>
                 pendingRetry.add(key)
-                skippedKeys.put(key, BlobExec.Failure(BlobExec.Failure.Timeout, s"retry exit=$code"))
+                skippedKeys.add(key)
                 System.err.println(
                   s"blobExec: retry: $sha ($blobPath) exited $code. It stays dropped, and the " +
                     "next run tries it again.")
-              case other =>
+              case (other, _) =>
                 val newId = other match {
                   case BlobExec.Outcome.Replace(id) => id
                   case _ =>
@@ -1604,7 +1588,7 @@ final class Walker(
         // so the file is absent from the rewritten tree rather than present as raw
         // source.
         case None if oversizedKeys.contains(key) || denylistedKeys.contains(key) ||
-                     skippedKeys.containsKey(key) => None
+                     skippedKeys.contains(key) => None
         // Anything else missing is a bug, and used to surface as a bare
         // NoSuchElementException. Keep it fatal and say which blob it was.
         case None =>
