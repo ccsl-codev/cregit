@@ -5,38 +5,9 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, StandardCopyOption, StandardOpenOption}
 import scala.jdk.CollectionConverters._
 
-/** The per-project record of every blob that the tokenized repository does not
-  * contain.
-  *
-  * One row for each (sha, path, reason). The file is tab-separated, with this
-  * header:
-  *
-  * {{{
-  * sha	path	reason	detail	tokenizer
-  * }}}
-  *
-  *   - `sha`       the original git blob id (40 hex).
-  *   - `path`      the path of the blob from the repository root.
-  *   - `reason`    one of [[SkipLog.Reasons]]: `denylisted`, `oversized`,
-  *                 `parser-crash`, `empty-output`, `timeout`.
-  *   - `detail`    one line: the denylist reason and citation, the size, the
-  *                 signal, or the budget in seconds.
-  *   - `tokenizer` `<ext>=<identity>` from `--tokenizer-identity`, or `unknown`
-  *                 when the run did not get an identity for that extension.
-  *
-  * The file is append-safe across a resumed run. [[SkipLog.open]] reads the rows
-  * that are already in the file, and [[record]] does not write a row a second
-  * time. Each row is written and flushed when the skip occurs, not at the end of
-  * the run. Thus a run that the stall watchdog stops keeps its rows. This is
-  * necessary: the commits of that run are durable in `commit_map`, and a resume
-  * does not visit them again, so it cannot write their rows again.
-  *
-  * [[forget]] removes rows. The walker calls it when a blob that was skipped
-  * before now tokenizes (a timeout that a retry clears, or a crash that a new
-  * tokenizer fixes). The file is then written again to a temporary file and
-  * renamed, so a reader never sees half a file.
-  *
-  * Thread-safe: the tokenizer workers call it concurrently. */
+/** Every blob that the tokenized repository does not contain, one row per (sha,
+  * path, reason). A row is flushed when the skip occurs: a resume does not visit
+  * the durable commits again, so it could not write their rows. Thread-safe. */
 final class SkipLog private (val path: Option[Path], initial: Vector[SkipLog.Row]) {
   import SkipLog._
 
@@ -54,10 +25,6 @@ final class SkipLog private (val path: Option[Path], initial: Vector[SkipLog.Row
 
   /** All rows, in file order. */
   def all: Vector[Row] = lock.synchronized(rows.values.toVector)
-
-  /** True if the file has a row for this blob with one of `reasons`. */
-  def contains(sha: String, blobPath: String, reasons: Set[String]): Boolean =
-    lock.synchronized(reasons.exists(r => rows.contains((sha, blobPath, r))))
 
   /** Add a row, unless a row with the same sha, path and reason is there. Returns
     * true if the row is new. */

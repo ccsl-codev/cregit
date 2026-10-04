@@ -15,22 +15,9 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
 import scala.jdk.CollectionConverters._
 
-/**
- * The default behaviour for a blob whose tokenizer fails: the blob is dropped
- * from the rewritten trees, exactly as a denylisted blob is, the walk continues,
- * and the blob is recorded in the skip file.
- *
- * The fixture has two commits. The first adds `a.c` and `deep/b.c`. The second
- * changes `a.c` only. `b.c` is the blob that fails. "The run continues" is then
- * checkable: the second commit is folded, and `a.c` is tokenized in both.
- *
- * The tokenizer is a shell script. For `b.c` it does what the test asks for
- * (exit 33 with the stderr of tokenizeSrcMl.pl, exit 0 with no output, or sleep
- * past the budget) while a marker file exists. Otherwise it upper-cases stdin.
- * Every call is logged, so the test can count the calls for `b.c`.
- *
- * TimeoutRetrySpec pins the strict behaviour (`strictTokenize = true`).
- */
+/** The default for a failed blob. Commit 1 adds a.c and deep/b.c, commit 2 changes
+  * a.c only. While the marker file exists the tokenizer fails on b.c as the test
+  * asks, and it logs every call. TimeoutRetrySpec pins strict mode. */
 class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   private val workRoot: Path = Files.createTempDirectory("skip-failed-")
@@ -271,11 +258,8 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
   test("a crash is recorded once across a resumed run") {
     val fx = fixture("crash")
     run(fx, "serial")
-    // A third commit puts the same b.c under a new path, next to a new file, so
-    // the resume reaches a new tree and has to decide on the blob again. (Without
-    // the new file, other/ would be the same tree as deep/, and a tree_map hit
-    // would reuse the rewritten deep/ with no decision at all. The skip file then
-    // names only the first path. The sha is the key that is always complete.)
+    // The new file makes other/ a new tree. Without it a tree_map hit would reuse
+    // the rewritten deep/, and the skip file would name only the first path.
     val git = Git.open(fx.src.getDirectory.getParentFile)
     try {
       val srcDir = fx.src.getDirectory.getParentFile.toPath
@@ -294,7 +278,6 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
       s"${fx.bSha} deep/b.c parser-crash",
       s"${fx.bSha} other/b.c parser-crash"
     )
-    // A third run over the same memo adds nothing.
     run(fx, "serial").commitsProcessed shouldEqual 0
     tsvLines(fx) shouldEqual rows
   }
@@ -348,7 +331,6 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
       dstContent(fx, fx.secondCommit, "deep/b.c") shouldEqual Some("BETA\n")
       withMapping(fx)(_.retryBlobs) shouldBe empty
       Files.exists(fx.tsv) shouldBe false   // nothing to record
-      // A recovered blob does not make the strict exit status 4.
       Main.exitStatus(stats, strictTokenize = true) shouldEqual 0
     }
   }
@@ -428,7 +410,6 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
     tsvLines(fx) shouldEqual before
     dstContent(fx, fx.secondCommit, "deep/b.c") shouldEqual None
 
-    // A later run with the pass on retries it, as before.
     val retried = run(fx, "serial")
     retried.blobsRecovered shouldEqual 1L
     retried.refolded shouldBe true
@@ -505,17 +486,13 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
   }
 
   test("the stall window with retries: a defaulted one is raised, an explicit one too small is refused") {
-    // Defaulted: raised to the longest time plus one --blob-timeout.
     Main.resolveStallWindow(600, 3, 3, 600, 1800, stallExplicit = false) shouldEqual Right(8420)
-    // Explicit and large enough: kept.
     Main.resolveStallWindow(600, 3, 3, 600, 9000, stallExplicit = true) shouldEqual Right(9000)
-    // Explicit and too small: refused, naming the settings that make it too small.
     val bad = Main.resolveStallWindow(600, 3, 3, 600, 7000, stallExplicit = true)
     bad.isLeft shouldBe true
     Seq("--max-retries 3", "--timeout-retry-factor 3", "--load-wait-max", "7820s").foreach { part =>
       bad.left.getOrElse("") should include(part)
     }
-    // Without retries the old rule holds, unchanged.
     Main.resolveStallWindow(600, 0, 3, 600, 1800, stallExplicit = false) shouldEqual Right(1800)
     Main.resolveStallWindow(600, 0, 3, 600, 601, stallExplicit = true) shouldEqual Right(601)
   }

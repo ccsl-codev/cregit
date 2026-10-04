@@ -3,10 +3,8 @@
 # (4 = a blob timed out, 5 = the stall watchdog fired), for both the serial and
 # the sharded branch, plus the marker clearing and the timeout passthrough.
 #
-# Since the default changed, blobExec exits 4 or 6 only with --strict-tokenize
-# (and always in --mode sharded). By default it skips a failed blob, records it in
-# <work>/tokenize-skipped.tsv and exits 0; cases 10-14 pin that path. The strict
-# cases below pass --strict-tokenize so that they show a real combination.
+# By default blobExec skips a failed blob and exits 0 (cases 10-14). It exits 4 or
+# 6 only with --strict-tokenize or in --mode sharded, so the strict cases pass it.
 #
 # Why these matter:
 #   - the marker is what stops a later FROM_STEP=1 run from deleting the work, so

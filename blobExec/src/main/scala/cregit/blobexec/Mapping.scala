@@ -105,10 +105,8 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
   private val insRetry = conn.prepareStatement("INSERT OR IGNORE INTO retry_blob(orig_blob, path) VALUES (?, ?)")
   private val delRetry = conn.prepareStatement("DELETE FROM retry_blob WHERE orig_blob = ? AND path = ?")
 
-  /** Record that the tokenizer of this blob was killed on its budget, and that
-    * the blob was dropped from the rewritten trees. A timeout depends on the load
-    * of the machine, so the drop must not be permanent: the next run reads this
-    * table and tries the blob again. See `Walker.retryTimedOutBlobs`. */
+  /** A timeout depends on the load of the machine, so its drop must not be
+    * permanent: a later run tries the blob again (`Walker.retryTimedOutBlobs`). */
   def putRetry(origBlob: String, path: String): Unit = Mapping.execute(insRetry, origBlob, path)
 
   def deleteRetry(origBlob: String, path: String): Unit = Mapping.execute(delRetry, origBlob, path)
@@ -122,11 +120,9 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     } finally rs.close()
   }
 
-  /** Empty commit_map, ref_map and tree_map, and keep blob_map. The next walk
-    * then folds all of the history again from the blob rows. This is necessary
-    * when a blob that the trees omit now has a tokenization: every tree above it
-    * changes, and so does every commit. The same three tables go in
-    * [[applyRetokenize]], for the same reason. */
+  /** Keep blob_map, so that the next walk folds all of history again from the blob
+    * rows: when a blob that the trees omit now tokenizes, every tree above it
+    * changes. [[applyRetokenize]] empties the same three tables. */
   def clearFold(): Unit = inTx {
     val st = conn.createStatement()
     try {
@@ -622,10 +618,8 @@ object Mapping {
       |  key   TEXT PRIMARY KEY,
       |  value TEXT NOT NULL
       |)""".stripMargin,
-    // Timed-out blobs that were dropped and that the next run must try again.
-    // Crashes are not here: a crash is deterministic for a given tokenizer, and
-    // a changed tokenizer is refused or re-tokenized through the tokenizer
-    // identity, which empties tree_map and so reaches the blob again.
+    // No crashes here: a crash is deterministic, and a changed tokenizer reaches
+    // the blob again through the tokenizer identity, which empties tree_map.
     """CREATE TABLE IF NOT EXISTS retry_blob (
       |  orig_blob    TEXT    NOT NULL,
       |  path         TEXT    NOT NULL,

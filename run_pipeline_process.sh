@@ -401,7 +401,7 @@ STRICT_TOKENIZE="${CREGIT_STRICT_TOKENIZE:-0}"
 # output exists (a recovered blob means a full re-blame). 0: only while no blame
 # output exists. See blame_output_exists.
 RETRY_SKIPPED="${CREGIT_RETRY_SKIPPED:-0}"
-# Empty means blobExec's defaults: factor 3, load limit = processor count.
+# Empty means blobExec's defaults.
 TIMEOUT_RETRY_FACTOR="${CREGIT_TIMEOUT_RETRY_FACTOR:-}"
 MAX_RETRIES="${CREGIT_MAX_RETRIES:-}"
 LOAD_LIMIT="${CREGIT_LOAD_LIMIT:-}"
@@ -615,10 +615,8 @@ report_skipped_blobs() {
     log "  --retry-skipped. To require a clean run, use --strict-tokenize (or CREGIT_STRICT_TOKENIZE=1)."
 }
 
-# blame_file_count <max>: the number of .blame files in the blame output, stopping
-# at <max> (0 = no limit). Step 7 writes <work>/blame/<path>.blame. A re-blame made
-# on another machine arrives in <work>/blame-c100-incoming (see the pipeline
-# repository's receive-gcj-result.sh), and it counts too.
+# blame_file_count <max>: .blame files in blame/ and in blame-c100-incoming/ (a
+# re-blame from another machine, see receive-gcj-result.sh), at most <max> (0 = all).
 blame_file_count() {
     local max="${1:-0}" dirs=() d
     for d in "$WORK/blame" "$WORK/blame-c100-incoming"; do
@@ -1155,15 +1153,12 @@ DB_PATH_BLOBMAP="${WORK}/${REPO_NAME}-blobmap.db"
 DB_PATH_PERSONS="${WORK}/${REPO_NAME}-persons.db"
 XLS_PATH_PERSONS="${WORK}/${REPO_NAME}-persons.xls"
 DATASET_PATH="${WORK}/${REPO_NAME}-dataset.parquet"
-# Every blob that the dataset does not contain, one row each: skipped after a
-# tokenizer failure, denylisted, or oversized. Next to the dataset on purpose. The
-# work directory IS the project's output folder (ctp.py: <output_dir>/<name>/), and
-# nothing copies outputs out of it. retain.py prunes only memo/ and html/, and
-# drop_refold_derived_artifacts does not touch this file, so it stays with the
-# parquet. Only a FROM_STEP=1 wipe removes it, and that run writes it again.
+# Next to the dataset on purpose: the work directory is the project's output folder
+# (ctp.py), retain.py prunes only memo/ and html/, and drop_refold_derived_artifacts
+# keeps it. Only a FROM_STEP=1 wipe removes it, and that run writes it again.
 SKIPPED_TSV="${WORK}/tokenize-skipped.tsv"
-# Created by blobExec when a retry recovered a timed-out blob and it folded all of
-# history again. See the end of step 2.
+# blobExec creates it when a retry recovers a timed-out blob, before it folds all
+# of history again. See the end of step 2.
 REFOLD_MARKER="${WORK}/TOKENIZE-REFOLDED"
 
 PYTHON=$(command -v python3 || true)  # only needed by step 10 (dataset)

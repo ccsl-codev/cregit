@@ -93,12 +93,8 @@ object BlobExec {
     found
   }
 
-  /** Why a blob's tokenization is unusable, in the words the skip record uses.
-    *
-    * `reason` is one of [[Failure.Timeout]], [[Failure.ParserCrash]] or
-    * [[Failure.EmptyOutput]]. `detail` is one short line with no tab and no line
-    * break: the budget in seconds, the signal, or the byte counts. The walker
-    * writes both to the skip file, so they must be stable and machine-readable. */
+  /** The walker writes both fields to the skip file, so they must be stable, and
+    * `detail` is one short line with no tab and no line break. */
   final case class Failure(reason: String, detail: String)
 
   object Failure {
@@ -108,10 +104,7 @@ object BlobExec {
 
     private val SignalRe = """killed by signal ([0-9]+)""".r.unanchored
 
-    /** The detail of a parser crash. The tokenizer names the signal on stderr
-      * (tokenize/tokenizeSrcMl.pl, Parser_Crash). If it does not, the first
-      * `FAILED:` line is used. If there is no such line, only the exit code is
-      * given. */
+    /** The signal line comes from tokenize/tokenizeSrcMl.pl (Parser_Crash). */
     private[blobexec] def crashDetail(exitCode: Int, stderr: String): String =
       stderr match {
         case SignalRe(sig) => s"exit=$exitCode signal=$sig"
@@ -152,9 +145,7 @@ object BlobExec {
       timeoutSeconds: Int = DefaultTimeoutSeconds,
       onTimeout: () => Unit = () => (),
       onParserCrash: () => Unit = () => (),
-      // Called once, before the Skip is returned, for each of the three unusable
-      // cases. It gives the reason and a detail line for the skip record. The two
-      // callbacks above stay, because the counters use them.
+      // Called once for each unusable result, with the fields of the skip record.
       onFailure: Failure => Unit = _ => ()
   ): Outcome = {
     val (exitCode, stdout, stderr) = invoke(bytes, origSha, filename, fullPath, command, timeoutSeconds)

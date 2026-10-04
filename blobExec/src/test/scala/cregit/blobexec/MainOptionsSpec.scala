@@ -114,14 +114,10 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     originalBlobDestinationLookups = 0, originalBlobBytesCopied = 0,
     originalBlobBytesAvoided = 0)
 
-  /** The exit status under --strict-tokenize: the rules of all earlier versions. */
   private def strictStatus(s: WalkStats): Int = Main.exitStatus(s, strictTokenize = true)
 
-  /** The exit status without it (the default). */
   private def defaultStatus(s: WalkStats): Int = Main.exitStatus(s, strictTokenize = false)
 
-  // Without --strict-tokenize, a failed blob is dropped and recorded, as a
-  // denylisted blob is, and the walk is complete. Only an abort fails the run.
   test("default mode: a timeout, a parser crash or both do not change the exit status") {
     defaultStatus(stats(blobsTimedOut = 1)) shouldEqual 0
     defaultStatus(stats(blobsParserCrashed = 36)) shouldEqual 0

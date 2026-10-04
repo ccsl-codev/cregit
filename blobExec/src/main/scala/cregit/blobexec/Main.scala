@@ -63,16 +63,8 @@ object Main {
 
   /** The process exit status for a finished walk.
     *
-    * Without `--strict-tokenize` (the default) only an abort gates it. A blob
-    * whose tokenizer timed out, crashed or gave empty output is dropped from the
-    * rewritten trees, as a denylisted blob is, and it is recorded in the skip
-    * file (`--skipped-tsv`). The file, not the status, is the signal: the walk is
-    * complete, and the dataset has no raw source and no empty tokenization in it.
-    * Thus the status is 0, and the run continues.
-    *
-    * With `--strict-tokenize` the rules below apply. They are the rules of all
-    * the earlier versions, and a user who must have a clean run can still get
-    * them.
+    * Without `--strict-tokenize` only an abort gates it: a failed blob is dropped
+    * and recorded in the skip file instead. The rules below are strict mode.
     *
     * A function, and taking the whole [[WalkStats]], so that "which counters gate
     * publication" is a property something can be asserted about rather than a
@@ -131,8 +123,6 @@ object Main {
     * for it, matching the ratio of the two defaults (600 and 1800). */
   private[blobexec] val StallTimeoutMultiple = 3
 
-  /** Default of `--timeout-retry-factor`: each retry of a timed-out blob has
-    * three times the budget of the first attempt. */
   private[blobexec] val DefaultTimeoutRetryFactor = 3
 
   /** No retry, so the stall window stays at 3 x `--blob-timeout`. */
@@ -143,19 +133,9 @@ object Main {
     * to the processor count, every wait would last until its cap. */
   private[blobexec] def defaultLoadLimit(processors: Int): Double = 2.0 * processors
 
-  /** The stall window for a run with retries.
-    *
-    * With `maxRetries = 0` this is [[resolveStallTimeout]] unchanged: the window
-    * must be larger than `--blob-timeout`, and a defaulted one is raised to
-    * [[StallTimeoutMultiple]] times it.
-    *
-    * With retries, no progress is stamped for one blob from its first attempt to
-    * its last, so the window must be larger than [[Walker.longestBlobSeconds]]:
-    * the first attempt, plus each retry with its longest load wait. An explicit
-    * window that is not larger is refused, and the message names both settings. A
-    * defaulted one is raised to that longest time plus one `--blob-timeout`. It is
-    * not raised to three times the longest time: that would be 6.5 hours with
-    * --max-retries=3, and a real stall would then go unseen for that long. */
+  /** With retries no progress is stamped for one blob from its first attempt to
+    * its last. A defaulted window is raised to that time plus one --blob-timeout,
+    * not 3 x it: a real stall would then go unseen for hours. */
   private[blobexec] def resolveStallWindow(
       blobTimeoutSeconds: Int,
       maxRetries: Int,
@@ -572,9 +552,6 @@ object Main {
         sys.exit(1)
     }
 
-    // A timed-out blob and its retries can run much longer than --blob-timeout,
-    // with no progress stamped. So the stall window is checked against the whole
-    // sequence, not the first attempt.
     resolveStallWindow(blobTimeoutSeconds, maxRetries, timeoutRetryFactor, loadWaitMax,
         stallTimeoutSeconds, stallExplicit) match {
       case Right(secs) =>
@@ -817,7 +794,6 @@ object Main {
     // (stats, timeouts this memo has ever seen). The cumulative figure is kept
     // for forensics only — it must NOT gate the exit status, or a blob that
     // times out once could never be retried to a clean run.
-    // Rows of retry_blob after the walk: timed-out blobs that stay dropped.
     var retryPending = 0
     val (stats, timedOutEver) = try {
       val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
@@ -911,7 +887,6 @@ object Main {
     }
 
     if (!strictTokenize && (stats.blobsSkipped > 0 || stats.blobsTimedOut > 0 || stats.blobsParserCrashed > 0)) {
-      // Reported, not fatal. Each blob is named on a 'SKIPPED blob' line above.
       System.err.println(
         s"blobExec: WARNING: ${stats.blobsSkipped} blob(s) were skipped this run because their " +
           s"tokenizer failed (timed out: ${stats.blobsTimedOut}, parser crash or empty output: " +

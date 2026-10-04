@@ -35,17 +35,9 @@ final case class WalkStats(
       * [[blobsOversized]] and unlike [[blobsTimedOut]] this is reported but does
       * not block publication. */
     blobsDenylisted: Long,
-    /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]]: srcML died
-      * on a signal, or the token stream came back empty. Under `strictTokenize`,
-      * like [[blobsTimedOut]] and unlike [[blobsOversized]]/[[blobsDenylisted]],
-      * this blocks publication (exit 6). Without it the blob is dropped and
-      * recorded, and the exit status does not change. Strict mode exists
-      * because an unexplained parser death is exactly the defect that
-      * used to be written out as a silent 0-byte tokenization. It is a separate
-      * counter rather than more timeouts because the two need different fixes: a
-      * timeout wants --blob-timeout, a crash wants the blob denylisting or srcML
-      * fixing. Defaulted so that adding it did not have to touch callers that
-      * construct [[WalkStats]] for other reasons. */
+    /** Blobs whose tokenizer reported [[BlobExec.ParserCrashExitCode]] or empty
+      * output. Separate from timeouts because the fix differs: a timeout wants
+      * --blob-timeout, a crash a denylist entry or a srcML fix. */
     blobsParserCrashed: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
@@ -55,20 +47,13 @@ final case class WalkStats(
     originalBlobDestinationLookups: Long,
     originalBlobBytesCopied: Long,
     originalBlobBytesAvoided: Long,
-    /** Distinct (sha, path) pairs whose tokenizer failed (a timeout, a parser
-      * crash or empty output) and which this run dropped from the rewritten trees,
-      * as it drops a denylisted blob. Zero under `strictTokenize`, where such a
-      * blob stops the walk instead. Each one is a row in the skip file. */
+    /** Distinct (sha, path) pairs dropped this run after a tokenizer failure. */
     blobsSkipped: Long = 0L,
-    /** Blobs that timed out in an earlier run and that tokenized on the retry at
-      * the start of this run. Each one changes the trees above it. */
     blobsRecovered: Long = 0L,
     /** True if a recovered blob emptied commit_map, tree_map and ref_map: every
       * rewritten commit then gets a new sha. */
     refolded: Boolean = false,
-    /** Retry attempts at timed-out blobs in the same run (see `maxRetries`), and
-      * the number of blobs that a retry recovered. A recovered blob is not counted
-      * in [[blobsTimedOut]], and it is not dropped. */
+    /** A blob recovered in the same run is not counted in [[blobsTimedOut]]. */
     blobsTimeoutRetriedInRun: Long = 0L,
     blobsTimeoutRecoveredInRun: Long = 0L
 )
@@ -94,27 +79,17 @@ final class Walker(
     // non-terminating blob to srcml. A parameter only so a test can supply its
     // own fixture; nothing at run time chooses a different list.
     denylist: BlobDenylist = BlobDenylist.shipped,
-    // false (the default): a blob whose tokenizer times out, crashes or gives
-    // empty output is dropped from the rewritten trees, as a denylisted blob is,
-    // and the walk continues. true: the old behaviour, where such a blob stops
-    // the walk at its commit and nothing is recorded for that commit.
+    // true: a tokenizer failure stops the walk at its commit instead of dropping
+    // the blob.
     strictTokenize: Boolean = false,
-    // Where each dropped blob is recorded. Disabled (memory only) by default.
     skipLog: SkipLog = SkipLog.disabled,
     // Only for the `tokenizer` column of the skip record.
     tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
-    // A timed-out blob gets up to `maxRetries` more attempts in the same run, each
-    // after `loadGate` lets it start, and each with a budget of
-    // `blobTimeoutSeconds * max(1, timeoutRetryFactor)`. 0 by default here, so a
-    // library caller and the older specs keep one attempt; Main's defaults are
-    // 3 retries and factor 3.
     maxRetries: Int = 0,
     timeoutRetryFactor: Int = 3,
     loadGate: LoadGate = LoadGate.disabled,
-    // true: before the walk, try again each blob that timed out in an earlier run
-    // (retry_blob). false: keep those blobs dropped, and keep their rows. The
-    // runner sets false when blame output exists, because a recovered blob folds
-    // all of history again and so deletes the blame.
+    // false keeps earlier timeouts dropped. The runner sets it while blame output
+    // exists, because a recovered blob folds all of history again.
     retryTimedOutPass: Boolean = true,
     onRefold: () => Unit = () => ()
 ) {
@@ -1214,19 +1189,12 @@ final class Walker(
     * `strictTokenize` only the retry pass and the hold fill it. */
   private val skippedKeys = ConcurrentHashMap.newKeySet[(String, String)]()
 
-  /** Timed-out blobs that an earlier run dropped and that the retry at the start
-    * of this run could not recover. If the walk tokenizes one of them (a re-fold
-    * reaches it again), its retry_blob row goes. */
+  /** Timed-out blobs with a retry_blob row. If the walk tokenizes one, the row goes. */
   private val pendingRetry = ConcurrentHashMap.newKeySet[(String, String)]()
 
-  /** Drop one blob whose tokenizer failed, and record it. Called on a tokenizer
-    * worker. Counted, logged and recorded once per `(sha, path)`.
-    *
-    * A timeout also gets a retry_blob row, written under `dbLock` BEFORE the
-    * worker returns. The consumer writes the commit_map row of the containing
-    * commit only after it has this result, so the retry row is always durable
-    * first. Without it a resume never visits the commit again, and the drop of a
-    * blob that was only slow would be permanent. */
+  /** The retry_blob row of a timeout is written before the worker returns, so it
+    * is durable before the commit_map row of the containing commit. Otherwise a
+    * resume never visits that commit again, and the drop would be permanent. */
   private def dropFailedBlob(task: BlobMissTask, f: BlobExec.Failure): Unit = {
     val sha = task.origId.name
     val key = (sha, task.fullPath)
@@ -1248,8 +1216,7 @@ final class Walker(
     }
   }
 
-  /** A blob tokenized. If an earlier run recorded it as a failure, that record is
-    * now wrong: remove it from the skip file and from retry_blob. */
+  /** An earlier record of this blob as a failure is now wrong. */
   private def noteTokenized(task: BlobMissTask): Unit = {
     val sha = task.origId.name
     skipLog.forget(sha, task.fullPath, SkipLog.TokenizerFailures)
@@ -1257,33 +1224,14 @@ final class Walker(
       dbLock.synchronized(mapping.deleteRetry(sha, task.fullPath))
   }
 
-  /** The budget of each retry of a timed-out blob. */
   private val retryTimeoutSeconds: Int =
     Walker.retryBudget(blobTimeoutSeconds, timeoutRetryFactor)
 
   private val TimeoutOnly = Set(BlobExec.Failure.Timeout)
 
-  /** Run the tokenizer on one blob, and retry a timed-out blob up to `maxRetries`
-    * times.
-    *
-    * Only a timeout gets retries. A parser crash and empty output are
-    * deterministic for a given tokenizer, so a retry gives the same result. Before
-    * each retry, [[LoadGate.await]] waits while the machine is loaded, and each
-    * retry has the budget `blobTimeoutSeconds * timeoutRetryFactor`. The first
-    * retry that tokenizes ends the sequence. The blob is a timeout only if all
-    * `1 + maxRetries` attempts time out; the detail then lists the attempts, as in
-    * `timeout=600s retries=3x1800s`.
-    *
-    * No progress is stamped between the attempts or during the waits. The stall
-    * watchdog therefore sees the whole sequence as one unit of work, and Main
-    * makes the stall window larger than the longest sequence
-    * ([[Walker.longestBlobSeconds]]).
-    *
-    * The counters are set from the final result only: a blob that tokenizes on a
-    * retry is not a timeout, and in strict mode it does not change the exit
-    * status. `blobsTimeoutRetriedInRun` counts retry attempts, and
-    * `blobsTimeoutRecoveredInRun` counts blobs that a retry recovered. Returns
-    * the outcome and the failure, if there is one. */
+  /** Only a timeout is retried: a crash or empty output is deterministic. No
+    * progress is stamped during the retries and load waits, so Main sizes the
+    * stall window for the whole sequence ([[Walker.longestBlobSeconds]]). */
   private def tokenize(
       bytes: Array[Byte],
       task: BlobMissTask,
@@ -1874,17 +1822,13 @@ final class Walker(
 
 object Walker {
 
-  /** The budget of one retry of a timed-out blob: `factor` times the first
-    * budget. A factor below 1 means the same budget as the first attempt. */
   private[blobexec] def retryBudget(blobTimeoutSeconds: Int, factor: Int): Int =
     math.min(blobTimeoutSeconds.toLong * math.max(1, factor), Int.MaxValue.toLong).toInt
 
   /** GNU `timeout -k` grace per attempt; see BlobExec. */
   private val KillGraceSecondsPerAttempt = 5L
 
-  /** The longest time one blob can take with no progress stamped: the first
-    * attempt, and `maxRetries` times (the longest load wait plus one retry), plus
-    * the kill grace of each attempt. The stall window must be larger. */
+  /** No progress is stamped for this long, so the stall window must be larger. */
   private[blobexec] def longestBlobSeconds(
       blobTimeoutSeconds: Int,
       maxRetries: Int,
