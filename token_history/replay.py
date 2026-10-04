@@ -4,6 +4,7 @@ of the first parent that has it unchanged, as `git blame` does."""
 import functools
 import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass, field
 
 HEADER = "\x01"
@@ -45,27 +46,27 @@ def path_log(repo, path):
 
 def parse_log(text):
     """Commits in topological order; a merge holds one diff per parent."""
-    commits, by_sha, cur, diff = [], {}, None, None
+    by_sha, cur, diff = {}, None, None
     for line in text.split("\n"):
         if line.startswith(HEADER):
             head, ct = line[1:].split("\t")
             sha, *parents = head.split()
-            cur = by_sha.get(sha)
-            if cur is None:
-                cur = by_sha[sha] = Commit(sha, parents, int(ct))
-                commits.append(cur)
+            cur = by_sha.setdefault(sha, Commit(sha, parents, int(ct)))
             diff = Diff()
             cur.diffs.append(diff)
-        elif cur is None:
-            continue
-        elif (m := RAW.match(line)):
-            diff.old_blob, cur.blob = m.group(1), m.group(2)
-        elif (m := HUNK.match(line)):
-            old_len = 1 if m.group(2) is None else int(m.group(2))
-            diff.hunks.append(Hunk(int(m.group(1)), old_len))
-        elif diff.hunks and line.startswith("+") and not line.startswith("+++"):
-            diff.hunks[-1].added.append(line[1:])
-    return commits
+        elif cur is not None:
+            parse_diff_line(line, cur, diff)
+    return list(by_sha.values())
+
+
+def parse_diff_line(line, commit, diff):
+    if (m := RAW.match(line)):
+        diff.old_blob, commit.blob = m.group(1), m.group(2)
+    elif (m := HUNK.match(line)):
+        old_len = 1 if m.group(2) is None else int(m.group(2))
+        diff.hunks.append(Hunk(int(m.group(1)), old_len))
+    elif diff.hunks and line.startswith("+") and not line.startswith("+++"):
+        diff.hunks[-1].added.append(line[1:])
 
 
 class GitError(RuntimeError):
@@ -121,6 +122,28 @@ def alnum(texts):
 
 def unique(items):
     return list(dict.fromkeys(items))
+
+
+def adjacent_runs(positioned):
+    """Split [(position, token)] into runs of consecutive positions."""
+    run, last = [], None
+    for pos, t in positioned:
+        if run and pos != last + 1:
+            yield run
+            run = []
+        run.append(t)
+        last = pos
+    if run:
+        yield run
+
+
+def kept_id(i, line, sources):
+    """The id that child line i keeps: from the base parent, else from the
+    first other parent that has the line unchanged; None for a new line."""
+    if not isinstance(line, tuple):
+        return sources[0][0][line]
+    return next((ids[m[i]] for ids, m in sources[1:]
+                 if i < len(m) and not isinstance(m[i], tuple)), None)
 
 
 class PathReplay:
@@ -180,39 +203,41 @@ class PathReplay:
                 return self.parent_ids(p)
         return self.state_of_blob(blob, c.ct)
 
+    def first_parent_source(self, c):
+        ids = self.parent_ids(c.parents[0]) if c.parents else []
+        return [(ids, align(len(ids), c.diffs[0].hunks))]
+
     def sources(self, c):
         """(parent ids, alignment) per parent, in the order blame tries them."""
         real = self.parents_of(c)
         if len(real) <= 1 or not c.parents:
-            ids = self.parent_ids(c.parents[0]) if c.parents else []
-            return [(ids, align(len(ids), c.diffs[0].hunks))]
+            return self.first_parent_source(c)
         blobs = self.merge_blobs(c, real)
-        if c.blob in blobs:
-            ids = self.ids_of(c.blob, c)
-            if ids is not None:
-                return [(ids, align(len(ids), []))]
+        ids = self.ids_of(c.blob, c) if c.blob in blobs else None
+        if ids is not None:
+            return [(ids, align(len(ids), []))]
+        return self.merge_sources(c, blobs) or self.first_parent_source(c)
+
+    def merge_sources(self, c, blobs):
         by_blob = {d.old_blob: d.hunks for d in c.diffs}
-        out = []
-        for blob in blobs:
-            if blob == NULL_BLOB:
-                continue
-            ids = self.ids_of(blob, c)
-            if blob in by_blob:
-                hunks = by_blob[blob]
-            elif blob == c.blob:
-                hunks = []
-            elif self.diff_blobs and ids is not None:
-                hunks = self.diff_blobs(blob, c.blob)
-            else:
-                ids = None
-            if ids is None:
-                self.unaligned_merges += 1
-                continue
-            out.append((ids, align(len(ids), hunks)))
-        if not out:
-            ids = self.parent_ids(c.parents[0])
-            out = [(ids, align(len(ids), c.diffs[0].hunks))]
-        return out
+        out = [self.merge_source(c, blob, by_blob)
+               for blob in blobs if blob != NULL_BLOB]
+        return [s for s in out if s]
+
+    def merge_source(self, c, blob, by_blob):
+        ids = self.ids_of(blob, c)
+        hunks = None if ids is None else self.hunks_to_child(c, blob, by_blob)
+        if hunks is None:
+            self.unaligned_merges += 1
+            return None
+        return ids, align(len(ids), hunks)
+
+    def hunks_to_child(self, c, blob, by_blob):
+        if blob in by_blob:
+            return by_blob[blob]
+        if blob == c.blob:
+            return []
+        return self.diff_blobs(blob, c.blob) if self.diff_blobs else None
 
     def step(self, c):
         sources = self.sources(c)
@@ -220,12 +245,7 @@ class PathReplay:
         base_ids, base = sources[0]
         ids, used = [], set()
         for i, line in enumerate(base):
-            if not isinstance(line, tuple):
-                kept = base_ids[line]
-            else:
-                kept = next((s_ids[m[i]] for s_ids, m in sources[1:]
-                             if i < len(m) and not isinstance(m[i], tuple)),
-                            None)
+            kept = kept_id(i, line, sources)
             if kept is None:
                 kept = self.born(line[1], c, in_merge)
             elif kept in used:
@@ -233,15 +253,17 @@ class PathReplay:
             used.add(kept)
             ids.append(kept)
         if not in_merge:
-            alive = set(ids)
-            for t in base_ids:
-                if t not in alive and self.tokens[t].died is None:
-                    self.tokens[t].died = c.sha
-            self.add_runs(c, "died", [(j, t) for j, t in enumerate(base_ids)
-                                      if t not in alive])
+            self.mark_died(c, base_ids, set(ids))
         self.add_runs(c, "born", [(i, t) for i, t in enumerate(ids)
                                   if self.tokens[t].born == c.sha])
         self.state[c.sha] = ids
+
+    def mark_died(self, c, base_ids, alive):
+        gone = [(j, t) for j, t in enumerate(base_ids) if t not in alive]
+        for _, t in gone:
+            if self.tokens[t].died is None:
+                self.tokens[t].died = c.sha
+        self.add_runs(c, "died", gone)
 
     def resolve_blobs(self):
         for c in self.commits:
@@ -259,46 +281,44 @@ class PathReplay:
         positioned: [(position in the file, token id)], in file order."""
         if self.run_min_alnum is None:
             return
+        whole = self.is_whole_file(c, kind)
+        for run in adjacent_runs(positioned):
+            if alnum(self.tokens[t].text for t in run) >= self.run_min_alnum:
+                self.runs.append((c.sha, kind, whole, run))
+
+    def is_whole_file(self, c, kind):
         if kind == "died":
-            whole = c.blob == NULL_BLOB
-        else:
-            whole = all(self.blob_of(p) == NULL_BLOB for p in c.parents)
-        run, last = [], None
-        for pos, t in positioned + [(None, None)]:
-            if run and (pos is None or pos != last + 1):
-                if alnum(self.tokens[i].text for i in run) >= self.run_min_alnum:
-                    self.runs.append((c.sha, kind, whole, run))
-                run = []
-            if t is not None:
-                run.append(t)
-            last = pos
+            return c.blob == NULL_BLOB
+        return all(self.blob_of(p) == NULL_BLOB for p in c.parents)
 
     def run(self, mainline=None):
         """Replay every commit. With mainline changes, free unneeded states."""
         self.resolve_blobs()
         for c in self.commits:
             self.blob_nodes.setdefault(c.blob, []).append(c.sha)
-        if mainline is None:
-            for c in self.commits:
-                self.step(c)
-            return self
+        keep = None if mainline is None else self.states_to_keep(mainline)
+        pending = Counter(p for c in self.commits for p in c.parents)
+        for c in self.commits:
+            self.step(c)
+            if keep is not None:
+                self.free_parents(c, pending, keep)
+        return self
+
+    def free_parents(self, c, pending, keep):
+        for p in c.parents:
+            pending[p] -= 1
+            if not pending[p] and p not in keep:
+                self.state.pop(p, None)
+
+    def states_to_keep(self, mainline):
+        """The states that a mainline change or a real-parent lookup reads."""
         keep = {self.latest_node(b, ct) for _, ct, b in mainline}
         for c in self.commits:
             real = self.parents_of(c)
             if len(real) > 1 and real != c.parents:
                 keep |= {self.latest_node(self.blob_at(p), c.ct)
                          for p in real}
-        pending = {}
-        for c in self.commits:
-            for p in c.parents:
-                pending[p] = pending.get(p, 0) + 1
-        for c in self.commits:
-            self.step(c)
-            for p in c.parents:
-                pending[p] -= 1
-                if not pending[p] and p not in keep:
-                    self.state.pop(p, None)
-        return self
+        return keep
 
     def state_of_blob(self, blob, before_ct):
         """The latest node with this blob, committed at or before a time."""
