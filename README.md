@@ -260,9 +260,8 @@ always in the file.
 **A timeout can get retries in the same run.** By default it does not:
 `--max-retries` is 0, so a timeout skips and records the blob at once. A timeout is
 often the load of the machine, not the blob. To retry, set `--max-retries 3` (or
-`CREGIT_MAX_RETRIES=3`). Then the stall watchdog window grows from 30 min to about
-2 h 20 min (see the worst case below). blobExec retries a timed-out blob up to
-`--max-retries` times. Before each retry it waits while the 1-minute load
+`CREGIT_MAX_RETRIES=3`), at the cost of a longer stall window (see the worst case
+below). blobExec retries a timed-out blob up to `--max-retries` times. Before each retry it waits while the 1-minute load
 average (`/proc/loadavg`) is above the limit (`--load-limit`, default 2 x the number of
 processors; `CREGIT_LOAD_LIMIT` in the runner), for 10 minutes at most
 (`--load-wait-max`). Each retry has `--timeout-retry-factor` times the budget (default
@@ -329,7 +328,7 @@ because the shard merge does not carry the retry records over.
 
 | blobExec exit status | before this change | now, default | now, `--strict-tokenize` |
 | -------------------- | ------------------ | ------------ | ------------------------ |
-| a blob timed out (on all attempts) | 4, step 2 stops | 0, blob skipped and recorded; a later run retries it while no blame exists, or with `--retry-skipped` | 4, step 2 stops |
+| a blob timed out (on all attempts) | 4, step 2 stops | 0, blob skipped and recorded | 4, step 2 stops |
 | a blob timed out, then tokenized on a retry | 4, step 2 stops | 0, not skipped | 0, not skipped |
 | a parser crash or empty output | 6, step 2 stops | 0, blob skipped and recorded | 6, step 2 stops |
 | a denylisted or oversized blob | 0 | 0, and recorded | 0, and recorded |

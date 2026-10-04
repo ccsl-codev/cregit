@@ -168,12 +168,9 @@ Target repository:
                     A crash gets no retry. Also CREGIT_MAX_RETRIES.
   --timeout-retry-factor N
                     the budget of each retry, as N x --blob-timeout (blobExec
-                    default: 3). Also CREGIT_TIMEOUT_RETRY_FACTOR.
-                    Worst case for one blob with --max-retries 3: 600 s, then
-                    3 x (600 s wait + 1800 s retry), about 2 h 10 min. blobExec
-                    then raises a defaulted --stall-timeout above that (8420 s,
-                    about 2 h 20 min). With the default of 0 retries the window
-                    stays at 30 min.
+                    default: 3). Also CREGIT_TIMEOUT_RETRY_FACTOR. blobExec
+                    raises a defaulted --stall-timeout above the worst case for
+                    one blob (see README).
   --retry-skipped   let step 2 try again the blobs that timed out in an earlier
                     run even when blame output exists. Also CREGIT_RETRY_SKIPPED=1.
                     A recovered blob changes every rewritten commit, so the

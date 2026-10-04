@@ -135,9 +135,7 @@ object Main {
     * three times the budget of the first attempt. */
   private[blobexec] val DefaultTimeoutRetryFactor = 3
 
-  /** Default of `--max-retries`: no retry. A timed-out blob is skipped and
-    * recorded at once, and the stall window stays at 3 x `--blob-timeout`
-    * (30 min). With `--max-retries=3` the window grows to about 2 h 20 min. */
+  /** No retry, so the stall window stays at 3 x `--blob-timeout`. */
   private[blobexec] val DefaultMaxRetries = 0
 
   /** Default of `--load-limit`: twice the processor count. The machine this runs
@@ -267,13 +265,9 @@ object Main {
       |                    the longest wait for the load before one retry (default
       |                    ${LoadGate.DefaultMaxWaitSeconds}). After it, the retry starts at any load.
       |
-      |                    Worst case for one blob with --max-retries=3 and the other
-      |                    defaults: 600s, then 3 x (600s wait + 1800s retry) = 7800s,
-      |                    about 2 h 10 min, plus 5s kill grace per attempt. The stall
-      |                    window must be larger than this, so with retries a
-      |                    defaulted --stall-timeout is raised to that time plus one
-      |                    --blob-timeout (8420s, about 2 h 20 min). With the default
-      |                    of 0 retries it stays at 3 x --blob-timeout (30 min).
+      |                    With retries, a defaulted --stall-timeout is raised above
+      |                    the longest time for one blob, and an explicit one below it
+      |                    is refused.
       |  --no-retry-timed-out
       |                    do not try again, before the walk, the blobs that timed
       |                    out in an earlier run (the retry_blob table). They stay
