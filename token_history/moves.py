@@ -46,26 +46,42 @@ def link(runs, text_of, mode, min_alnum):
     if mode == "off":
         return {}
     eligible = [r for r in runs if mode == "moves" or r[1]]
-    died_text, died_key = [], []
-    for kind, _, path, ids in eligible:
+    died = died_sequence(eligible, text_of)
+    if not died[0]:
+        return {}
+    return longest_first([
+        block for kind, _, path, ids in eligible if kind == "born"
+        for block in born_blocks(path, ids, died, text_of, mode, min_alnum)])
+
+
+def born_blocks(path, ids, died, text_of, mode, min_alnum):
+    """(size, died keys, born keys) of each move into one born run."""
+    died_text, died_key = died
+    born_text = [text_of((path, t)) for t in ids]
+    return [(n, died_key[i:i + n], [(path, t) for t in ids[j:j + n]])
+            for i, j, n in matching_blocks(died_text, born_text)
+            if is_move(mode, min_alnum, died_key[i][0], path,
+                       died_text[i:i + n])]
+
+
+def died_sequence(runs, text_of):
+    """The texts and keys of every died run, a SEPARATOR between two runs."""
+    texts, keys = [], []
+    for kind, _, path, ids in runs:
         if kind == "died":
-            for t in ids:
-                died_text.append(text_of((path, t)))
-                died_key.append((path, t))
-            died_text.append(SEPARATOR)
-            died_key.append(None)
-    blocks = []
-    for kind, _, b_path, b_ids in eligible:
-        if kind != "born" or not died_text:
-            continue
-        b_text = [text_of((b_path, t)) for t in b_ids]
-        for i, j, n in matching_blocks(died_text, b_text):
-            if mode == "renames" and died_key[i][0] == b_path:
-                continue
-            if mode == "moves" and alnum(died_text[i:i + n]) < min_alnum:
-                continue
-            blocks.append((n, died_key[i:i + n],
-                           [(b_path, t) for t in b_ids[j:j + n]]))
+            texts += [text_of((path, t)) for t in ids] + [SEPARATOR]
+            keys += [(path, t) for t in ids] + [None]
+    return texts, keys
+
+
+def is_move(mode, min_alnum, died_path, born_path, texts):
+    if mode == "renames" and died_path == born_path:
+        return False
+    return mode != "moves" or alnum(texts) >= min_alnum
+
+
+def longest_first(blocks):
+    """Link the longest blocks first, each died and born token once."""
     links, used = {}, set()
     for _, died, born in sorted(blocks, key=lambda x: -x[0]):
         for d, b in zip(died, born):
