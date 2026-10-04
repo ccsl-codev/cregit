@@ -229,29 +229,6 @@ OUT=$(STUB_RC=0 run_step2 "$W" --retokenize rs --mask-widened --mask '\.c$' 2); 
 rm -rf "$W"
 
 # ---------------------------------------------------------------------------
-echo "case 10: --no-memo-but-tokenized-repo is passed through with --retokenize"
-W=$(fixture); ARGV="$W/argv.log"
-OUT=$(STUB_RC=0 STUB_ARGV="$ARGV" run_step2 "$W" --retokenize rs --no-memo-but-tokenized-repo 2); RC=$?
-grep -q 'Step 3' <<<"$OUT"; check "step 2 completed and the pipeline moved on" $?
-grep -q -- '--no-memo-but-tokenized-repo' "$ARGV"; check "--no-memo-but-tokenized-repo reached blobExec" $?
-grep -q -- "--memo-dir=$W/memo" "$ARGV"; check "and --memo-dir still named this project's memo" $?
-rm -rf "$W"
-W=$(fixture); ARGV="$W/argv.log"
-OUT=$(STUB_RC=0 STUB_ARGV="$ARGV" run_step2 "$W" --retokenize rs 2); RC=$?
-grep -q -- '--no-memo-but-tokenized-repo' "$ARGV"; [ $? -ne 0 ]
-check "and it is not passed unless asked for" $?
-rm -rf "$W"
-
-# ---------------------------------------------------------------------------
-echo "case 11: --no-memo-but-tokenized-repo without --retokenize is refused"
-W=$(fixture); ARGV="$W/argv.log"
-OUT=$(STUB_RC=0 STUB_ARGV="$ARGV" run_step2 "$W" --no-memo-but-tokenized-repo 2); RC=$?
-[ "$RC" -ne 0 ]; check "refused (exit $RC)" $?
-grep -q 'needs --retokenize' <<<"$OUT"; check "and says why" $?
-[ ! -s "$ARGV" ]; check "before blobExec ran" $?
-rm -rf "$W"
-
-# ---------------------------------------------------------------------------
 echo ""
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

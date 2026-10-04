@@ -138,7 +138,7 @@ object Main {
   // `raw` (not `s`): the mask example below contains a regex backslash, which a
   // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
   private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--no-memo-but-tokenized-repo] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
       |  --abort-on-error  exit immediately (status 2) on the first non-zero
       |                    exit from <command>, instead of skipping that blob
@@ -228,21 +228,12 @@ object Main {
       |                    changing anything, when: another extension's tokenizer
       |                    also changed and was not named; no tokenized row
       |                    carries any named extension (status ${RetokenizeIneffectiveExitStatus}); the memo held
-      |                    none of the affected blobs (status ${RetokenizeIneffectiveExitStatus}, and that
-      |                    means the --memo-dir is not this project's, unless
-      |                    --no-memo-but-tokenized-repo says otherwise); or a
-      |                    RETAINED new_blob id does not resolve in <dst.git>.
+      |                    none of the affected blobs and --memo-dir is not
+      |                    $$BFG_MEMO_DIR, the memo tokenBySha.pl reads (status ${RetokenizeIneffectiveExitStatus});
+      |                    or a RETAINED new_blob id does not resolve in <dst.git>.
       |  --memo-dir=<dir>  the memo directory ($$BFG_MEMO_DIR) whose entries
       |                    --retokenize must purge. Only read with --retokenize;
       |                    passing it alone is an error rather than a no-op.
-      |  --no-memo-but-tokenized-repo
-      |                    the memo was deleted on purpose, and the tokenizations
-      |                    live only in blob_map and <dst.git>. A memo that holds
-      |                    none of the affected blobs is then expected, not a
-      |                    wrong --memo-dir. Accepted only when --memo-dir is the
-      |                    same directory as $$BFG_MEMO_DIR, the memo
-      |                    tokenBySha.pl reads. Otherwise the refusal stands
-      |                    (status ${RetokenizeIneffectiveExitStatus}). Only read with --retokenize.
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
@@ -327,10 +318,8 @@ object Main {
     var tokenizerIdentity = TokenizerIdentity.empty
     var retokenizeExtensions: Set[String] = Set.empty
     var memoDir: Option[java.nio.file.Path] = None
-    var noMemoButTokenizedRepo = false
     flags.foreach {
       case "--abort-on-error" => abortOnError = true
-      case "--no-memo-but-tokenized-repo" => noMemoButTokenizedRepo = true
       case "--pipeline"       => pipeline = true
       case "--pipeline-trees" => pipelineTrees = true
       case "--mask-widened"   => maskWidened = true
@@ -483,12 +472,6 @@ object Main {
           "memo — tokenizeByBlobId/tokenBySha.pl takes it from $BFG_MEMO_DIR in the environment.")
       sys.exit(1)
     }
-    if (noMemoButTokenizedRepo && retokenizeExtensions.isEmpty) {
-      System.err.println(
-        "Error: --no-memo-but-tokenized-repo has no effect without --retokenize. It only answers the " +
-          "refusal --retokenize raises when the memo held none of the affected blobs.")
-      sys.exit(1)
-    }
 
     if (shard.isDefined && (pipeline || pipelineTrees)) {
       System.err.println("Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
@@ -589,7 +572,6 @@ object Main {
           finally reader.close()
         }),
         report = msg => println(s"blobExec: $msg"),
-        noMemoButTokenizedRepo = noMemoButTokenizedRepo,
         memoDirIsTokenizerMemo =
           memoDir.exists(d => TokenizerMemo.isTokenizerMemo(d, sys.env.get("BFG_MEMO_DIR")))
       ))

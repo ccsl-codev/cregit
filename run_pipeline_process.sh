@@ -108,12 +108,6 @@ Target repository:
                     extension, if the memo held none of the affected blobs, if
                     another extension's tokenizer also changed and was not named,
                     or if a retained new_blob id is missing from cregit.git.
-  --no-memo-but-tokenized-repo
-                    with --retokenize: the memo was deleted on purpose, and the
-                    tokenizations live only in the blob map and cregit.git. A
-                    memo that holds none of the affected blobs is then expected.
-                    blobExec accepts it only when --memo-dir is the memo the
-                    tokenizer reads; otherwise it still refuses (exit 7).
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
@@ -349,7 +343,6 @@ MASK_WIDENED=0
 # must stay that way: 186 projects are published against the caches this would
 # delete.
 RETOKENIZE=""
-NO_MEMO_BUT_TOKENIZED_REPO=0
 # Empty means "do not pass the flag", so blobExec keeps its own defaults (600s
 # per blob, 1800s stall window). The CREGIT_* environment fallbacks exist so the
 # values are reachable through ctp.py, which has no passthrough of its own but
@@ -537,8 +530,7 @@ $resume_lines"
      Check the extension spelling (lowercase, no dot, as in
      tokenize/CregitLanguages.pm), that --memo-dir names THIS project's memo
      ($MEMO_DIR), and that this work directory is the one holding the poisoned
-     entries. If this project's memo was deleted on purpose, resume with
-     --no-memo-but-tokenized-repo. Nothing in $WORK has been modified."
+     entries. Nothing in $WORK has been modified."
     else
         die "$what failed (exit $rc)"
     fi
@@ -564,7 +556,6 @@ while [ $# -gt 0 ]; do
         --force-clean) FORCE_CLEAN=1; shift ;;
         --mask-widened) MASK_WIDENED=1; shift ;;
         --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
-        --no-memo-but-tokenized-repo) NO_MEMO_BUT_TOKENIZED_REPO=1; shift ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
@@ -619,12 +610,6 @@ if [ "$MASK_WIDENED" = 1 ] && [ "$MODE" = "sharded" ]; then
     echo "--mask-widened is not available with --mode sharded: every shard builds a fresh
      blob map, so no recorded mask exists to widen. Reuse a prior run's
      tokenizations with shard_build.sh --warm-db instead." >&2
-    exit 2
-fi
-
-if [ "$NO_MEMO_BUT_TOKENIZED_REPO" = 1 ] && [ -z "$RETOKENIZE" ]; then
-    echo "--no-memo-but-tokenized-repo needs --retokenize. It only answers the refusal
-     --retokenize raises when the memo held none of the affected blobs." >&2
     exit 2
 fi
 
@@ -1273,9 +1258,6 @@ else
   RETOKENIZE_FLAGS=()
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
-      if [ "$NO_MEMO_BUT_TOKENIZED_REPO" = 1 ]; then
-          RETOKENIZE_FLAGS+=("--no-memo-but-tokenized-repo")
-      fi
   fi
   java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
