@@ -48,7 +48,7 @@ def mainline_changes(repo, pathspec):
         ["git", "-C", repo, "log", "--first-parent", "--reverse", "-m",
          "--raw", "--no-abbrev", "--no-renames", f"--format={HEADER}%H %ct",
          "HEAD", "--", *pathspec],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         errors="replace")
     changes, sha, ct = {}, None, 0
     for line in proc.stdout:
@@ -62,7 +62,8 @@ def mainline_changes(repo, pathspec):
     # a failed git log would leave every path with no mainline interval,
     # and the run would still end with 0 errors
     if proc.wait():
-        raise GitError(f"git log --first-parent exited {proc.returncode}")
+        raise GitError(f"git log --first-parent exited {proc.returncode}: "
+                       f"{proc.stderr.read().strip()[:300]}")
     return changes
 
 
@@ -80,9 +81,15 @@ class GitSource:
         return self.merges.get(sha) or self.rewritten[sha]
 
     def blob_at(self, sha):
-        self.cat.stdin.write(f"{sha}:{self.path}\n")
-        self.cat.stdin.flush()
-        out = self.cat.stdout.readline().split()[0]
+        try:
+            self.cat.stdin.write(f"{sha}:{self.path}\n")
+            self.cat.stdin.flush()
+            line = self.cat.stdout.readline()
+        except BrokenPipeError:
+            line = ""
+        if not line:  # cat-file died: every later path would fail too
+            raise GitError(f"git cat-file exited {self.cat.wait()}")
+        out = line.split()[0]
         return out if len(out) == 40 else NULL_BLOB
 
     def diff_blobs(self, a, b):
@@ -127,6 +134,8 @@ def clean(value):
 def work(path):
     try:
         return replay_path(path)
+    except GitError:
+        raise  # git failed, not the path: stop the run
     except Exception:
         return dict(path=path, error=traceback.format_exc())
 

@@ -19,7 +19,7 @@ def test_git_failures_stop_the_run(not_a_repo):
     # no mainline intervals, no merges or no paths, and 0 errors.
     with pytest.raises(GitError):
         merge_parents(not_a_repo)
-    with pytest.raises(GitError):
+    with pytest.raises(GitError, match="not a git repository"):
         mainline_changes(not_a_repo, [])
     with pytest.raises(GitError):
         list_paths(argparse.Namespace(paths=None, repo=not_a_repo,
@@ -65,3 +65,12 @@ def test_an_error_in_one_path_is_a_record_not_a_stop(monkeypatch):
     monkeypatch.setattr(token_history, "replay_path", broken)
     r = token_history.work("a.c")
     assert r["path"] == "a.c" and "ValueError" in r["error"]
+
+
+def test_a_dead_cat_file_stops_the_run(not_a_repo, monkeypatch):
+    import token_history
+    src = token_history.GitSource(not_a_repo, {})
+    monkeypatch.setattr(token_history, "replay_path",
+                        lambda path: src.blob_at("HEAD"))
+    with pytest.raises(GitError):  # not one errors.txt record per path
+        token_history.work("a.c")
