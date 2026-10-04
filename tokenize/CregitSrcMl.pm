@@ -136,8 +136,6 @@ sub parser_crash {
     return ($PARSER_CRASH_EXIT, "", $stderr);
 }
 
-# --- ctags -------------------------------------------------------------------
-
 sub ctags_for {
     my ($self, $language) = @_;
     my $proc = $self->{ctagsProc}{$language};
@@ -221,8 +219,6 @@ sub json_field {
     return json_str($1);
 }
 
-# --- srcml -------------------------------------------------------------------
-
 sub run_srcml {
     my ($self, $language, $inputName, $workDir, $xmlPath) = @_;
     pipe(my $errRead, my $errWrite) or die "unable to create stderr pipe: $!\n";
@@ -260,8 +256,6 @@ sub run_srcml {
     return ($status, $stderr);
 }
 
-# --- srcml2token -------------------------------------------------------------
-
 sub s2t {
     my ($self) = @_;
     return $self->{s2t} if $self->{s2t};
@@ -297,8 +291,6 @@ sub parse_xml {
     }
     return ($status, \@tokens, $stderr);
 }
-
-# --- process plumbing --------------------------------------------------------
 
 sub spawn_pipe {
     my ($command) = @_;

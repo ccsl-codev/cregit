@@ -67,7 +67,6 @@ while (defined(my $header = <STDIN>)) {
 $inProcess->shutdown() if $inProcess;
 exit 0;
 
-# In-process srcML only for the stock dispatcher/parser with options the worker honors.
 sub in_process_tokenizer {
     my ($program, @options) = @_;
     return undef if ($ENV{BFG_WORKER_INPROC} // "1") eq "0";

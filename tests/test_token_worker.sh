@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Byte-identity and lifecycle tests for tokenizeByBlobId/tokenWorker.pl.
 # Run inside `devenv shell` (needs perl, python3, srcml, ctags on PATH).
 set -euo pipefail
 
