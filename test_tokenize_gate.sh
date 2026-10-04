@@ -373,20 +373,14 @@ echo "case 19: --max-retries, --timeout-retry-factor and CREGIT_LOAD_LIMIT reach
 W=$(fixture)
 export STUB_ARGV="$W/java-argv"
 OUT=$(STUB_RC=0 CREGIT_LOAD_LIMIT=8 run_step2 "$W" --timeout-retry-factor 0)
-grep -q -- "--timeout-retry-factor=0" "$STUB_ARGV"; check "the factor is passed through (0 disables the retry)" $?
+grep -q -- "--timeout-retry-factor=0" "$STUB_ARGV"; check "the factor is passed through (0 = the first budget)" $?
 grep -q -- "--load-limit=8" "$STUB_ARGV"; check "the load limit is passed through" $?
 rm -f "$STUB_ARGV"
 OUT=$(STUB_RC=0 CREGIT_TIMEOUT_RETRY_FACTOR=5 run_step2 "$W")
 grep -q -- "--timeout-retry-factor=5" "$STUB_ARGV"; check "CREGIT_TIMEOUT_RETRY_FACTOR is honoured" $?
 rm -f "$STUB_ARGV"
-OUT=$(STUB_RC=0 run_step2 "$W" --max-retries 0)
-grep -q -- "--max-retries=0" "$STUB_ARGV"; check "--max-retries is passed through" $?
-rm -f "$STUB_ARGV"
 OUT=$(STUB_RC=0 run_step2 "$W" --max-retries 3)
 grep -q -- "--max-retries=3" "$STUB_ARGV"; check "an explicit --max-retries 3 is passed through" $?
-rm -f "$STUB_ARGV"
-OUT=$(STUB_RC=0 CREGIT_MAX_RETRIES=3 run_step2 "$W")
-grep -q -- "--max-retries=3" "$STUB_ARGV"; check "CREGIT_MAX_RETRIES=3 is passed through" $?
 rm -f "$STUB_ARGV"
 OUT=$(STUB_RC=0 CREGIT_MAX_RETRIES=5 run_step2 "$W")
 grep -q -- "--max-retries=5" "$STUB_ARGV"; check "CREGIT_MAX_RETRIES is honoured" $?

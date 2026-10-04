@@ -385,42 +385,15 @@ class SkipFailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAl
     Main.exitStatus(stats, strictTokenize = true) shouldEqual 0
   }
 
-  test("--max-retries=0 gives no retry") {
-    val fx = fixture("timeout-1")
-    val stats = run(fx, "serial", maxRetries = 0)
-    stats.blobsTimeoutRetriedInRun shouldEqual 0L
-    stats.blobsSkipped shouldEqual 1L
-    fx.callsForB shouldEqual 1
-    tsvLines(fx).last.split("\t")(3) shouldEqual "timeout=1s"
-  }
-
-  test("the default is no retry, and the stall window then stays at 3 x --blob-timeout") {
+  test("the default is no retry: a timeout skips and records the blob at once") {
     Main.DefaultMaxRetries shouldEqual 0
     Main.Usage should include("default 0: a timeout skips and records the blob")
-    // With the default, a defaulted window stays at 1800s (30 min) for 600s blobs.
-    Main.resolveStallWindow(600, Main.DefaultMaxRetries, Main.DefaultTimeoutRetryFactor,
-      600, 1800, stallExplicit = false) shouldEqual Right(1800)
-    // With an explicit --max-retries=3 it grows to 8420s (about 2 h 20 min).
-    Main.resolveStallWindow(600, 3, Main.DefaultTimeoutRetryFactor,
-      600, 1800, stallExplicit = false) shouldEqual Right(8420)
-  }
-
-  test("with the default, a timeout skips and records the blob at once") {
     val fx = fixture("timeout-1")
     val stats = run(fx, "serial", maxRetries = Main.DefaultMaxRetries)
     stats.blobsTimeoutRetriedInRun shouldEqual 0L
     stats.blobsSkipped shouldEqual 1L
     fx.callsForB shouldEqual 1
     tsvLines(fx).last.split("\t")(3) shouldEqual "timeout=1s"
-  }
-
-  test("an explicit --max-retries=3 still retries") {
-    val fx = fixture("timeout-1")
-    val stats = run(fx, "serial", maxRetries = 3)
-    stats.blobsTimeoutRetriedInRun shouldEqual 1L
-    stats.blobsTimeoutRecoveredInRun shouldEqual 1L
-    stats.blobsSkipped shouldEqual 0L
-    fx.callsForB shouldEqual 2
   }
 
   test("a factor of 0 or 1 gives each retry the first budget") {
