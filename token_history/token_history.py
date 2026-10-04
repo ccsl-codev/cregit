@@ -198,7 +198,7 @@ def list_paths(args):
     return sorted({p for p in out.splitlines() if MASK.search(p)})
 
 
-def main():
+def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
@@ -208,33 +208,44 @@ def main():
     ap.add_argument("--run-min-alnum", type=int, default=100,
                     help="shortest run that the move pass may link")
     ap.add_argument("pathspec", nargs="*")
-    args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
-    progress_file = os.path.join(args.out, "history-progress.json")
-    done_file = os.path.join(args.out, "paths-done.txt")
-    done = set(open(done_file).read().split("\n")) if os.path.exists(
-        done_file) else set()
+    return ap.parse_args()
 
+
+def read_done(done_file):
+    if not os.path.exists(done_file):
+        return set()
+    return set(open(done_file).read().split("\n"))
+
+
+def record(r, out_dir, done_out):
+    if "error" in r:
+        with open(os.path.join(out_dir, "errors.txt"), "a") as err:
+            err.write(f"== {r['path']}\n{r['error']}\n")
+        return
+    done_out.write(r["path"] + "\n")
+    done_out.flush()
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.out, exist_ok=True)
+    done_file = os.path.join(args.out, "paths-done.txt")
+    done = read_done(done_file)
     paths = [p for p in list_paths(args) if p not in done]
     log(f"token_history: {len(paths)} paths to replay ({len(done)} done)")
     merges = merge_parents(args.repo)
     changes = mainline_changes(args.repo, args.pathspec)
     log(f"token_history: {len(merges):,} merges, mainline changes for "
         f"{len(changes):,} paths")
-
-    progress = Progress(progress_file, len(paths), args.ping)
+    progress = Progress(os.path.join(args.out, "history-progress.json"),
+                        len(paths), args.ping)
     progress.write("starting")
     with open(done_file, "a") as done_out, mp.Pool(
             args.jobs, init_worker,
             (args.repo, merges, changes, args.out,
              args.run_min_alnum)) as pool:
         for r in pool.imap_unordered(work, paths):
-            if "error" in r:
-                with open(os.path.join(args.out, "errors.txt"), "a") as err:
-                    err.write(f"== {r['path']}\n{r['error']}\n")
-            else:
-                done_out.write(r["path"] + "\n")
-                done_out.flush()
+            record(r, args.out, done_out)
             progress.add(r)
     progress.write("done")
 
