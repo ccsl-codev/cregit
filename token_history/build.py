@@ -5,6 +5,8 @@ import glob
 import os
 import shutil
 import time
+from itertools import groupby
+from operator import itemgetter
 
 import duckdb
 
@@ -76,6 +78,22 @@ def write_history(con, target, mode, chunks):
     """Tokens with their resolved origin, in chunks of paths: on a whole kernel
     one join of every token with every link does not fit in memory. The chunk
     parquets are then copied into one (no row order is kept)."""
+    fill_origins(con, chunks)
+    parts = os.path.join(os.path.dirname(target),
+                         f".{os.path.basename(target)}.parts")
+    shutil.rmtree(parts, ignore_errors=True)
+    os.makedirs(parts)
+    for k in range(chunks):
+        copy_chunk(con, os.path.join(parts, f"{k:03d}.parquet"), mode, k,
+                   chunks)
+        log(f"build: write chunk {k + 1}/{chunks}")
+    con.execute(f"COPY (SELECT * FROM read_parquet('{parts}/*.parquet')) "
+                f"TO '{target}' (FORMAT parquet, COMPRESSION zstd)")
+    shutil.rmtree(parts)
+    con.execute("DROP TABLE origins")
+
+
+def fill_origins(con, chunks):
     con.execute("CREATE OR REPLACE TABLE origins (file_path VARCHAR, "
                 "token_id BIGINT, origin_path VARCHAR, origin_token_id BIGINT, "
                 "origin_born_sha VARCHAR)")
@@ -93,32 +111,22 @@ def write_history(con, target, mode, chunks):
               ON o.file_path = l.origin_path
              AND o.token_id = l.origin_token_id""")
         log(f"build: origins chunk {k + 1}/{chunks}")
-    parts = os.path.join(os.path.dirname(target),
-                         f".{os.path.basename(target)}.parts")
-    shutil.rmtree(parts, ignore_errors=True)
-    os.makedirs(parts)
-    for k in range(chunks):
-        con.execute(f"""
-            COPY (
-                SELECT t.*,
-                       coalesce(o.origin_path, t.file_path) AS origin_path,
-                       coalesce(o.origin_token_id, t.token_id)
-                         AS origin_token_id,
-                       coalesce(o.origin_born_sha, t.born_sha)
-                         AS origin_born_sha,
-                       '{mode}' AS move_mode
-                FROM (SELECT * FROM tokens
-                      WHERE {in_chunk('file_path', k, chunks)}) t
-                LEFT JOIN (SELECT * FROM origins
-                           WHERE {in_chunk('file_path', k, chunks)}) o
-                  USING (file_path, token_id)
-            ) TO '{os.path.join(parts, f"{k:03d}.parquet")}'
-              (FORMAT parquet, COMPRESSION zstd)""")
-        log(f"build: write chunk {k + 1}/{chunks}")
-    con.execute(f"COPY (SELECT * FROM read_parquet('{parts}/*.parquet')) "
-                f"TO '{target}' (FORMAT parquet, COMPRESSION zstd)")
-    shutil.rmtree(parts)
-    con.execute("DROP TABLE origins")
+
+
+def copy_chunk(con, part, mode, k, chunks):
+    con.execute(f"""
+        COPY (
+            SELECT t.*,
+                   coalesce(o.origin_path, t.file_path) AS origin_path,
+                   coalesce(o.origin_token_id, t.token_id) AS origin_token_id,
+                   coalesce(o.origin_born_sha, t.born_sha) AS origin_born_sha,
+                   '{mode}' AS move_mode
+            FROM (SELECT * FROM tokens
+                  WHERE {in_chunk('file_path', k, chunks)}) t
+            LEFT JOIN (SELECT * FROM origins
+                       WHERE {in_chunk('file_path', k, chunks)}) o
+              USING (file_path, token_id)
+        ) TO '{part}' (FORMAT parquet, COMPRESSION zstd)""")
 
 
 def commit_runs(con):
@@ -146,23 +154,21 @@ def commit_runs(con):
         ORDER BY t.sha, t.run_no, t.pos""")
     # tokens has a row per mainline interval: keep the first row of each
     # place (the sort puts them together), a DISTINCT that needs no memory
-    sha, runs, texts, cur_run, last = None, [], {}, None, None
-    while batch := cur.fetchmany(100_000):
-        for s, run_no, kind, whole, path, tid, token, pos in batch:
-            if (s, run_no, pos) == last:
-                continue
-            last = (s, run_no, pos)
-            if s != sha:
-                if sha is not None:
-                    yield sha, runs, texts
-                sha, runs, texts, cur_run = s, [], {}, None
-            if run_no != cur_run:
-                runs.append((kind, bool(whole), path, []))
-                cur_run = run_no
-            runs[-1][3].append(tid)
-            texts[(path, tid)] = token
-    if sha is not None:
+    places = (next(rows) for _, rows in
+              groupby(fetch_rows(cur), key=itemgetter(0, 1, 7)))
+    for sha, rows in groupby(places, key=itemgetter(0)):
+        runs, texts = [], {}
+        for _, run in groupby(rows, key=itemgetter(1)):
+            run = list(run)
+            _, _, kind, whole, path = run[0][:5]
+            runs.append((kind, bool(whole), path, [r[5] for r in run]))
+            texts.update(((path, r[5]), r[6]) for r in run)
         yield sha, runs, texts
+
+
+def fetch_rows(cur):
+    while batch := cur.fetchmany(100_000):
+        yield from batch
 
 
 def load(con, out):
@@ -195,7 +201,7 @@ def write_links(con, links_file, mode, min_alnum):
     log(f"build: mode {mode}, {linked:,} tokens linked in {commits:,} commits")
 
 
-def main():
+def parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", required=True)
     ap.add_argument("--mode", choices=MODES, default="moves")
@@ -206,24 +212,34 @@ def main():
                     help="path chunks for the final write")
     ap.add_argument("--reuse", action="store_true",
                     help="keep the loaded tables and a finished links file")
-    args = ap.parse_args()
-    t0 = time.time()
+    return ap.parse_args()
+
+
+def connect(args):
     con = duckdb.connect(os.path.join(args.out, "build.duckdb"))
     con.execute(f"SET memory_limit='{args.memory}'")
     con.execute(f"SET temp_directory='{os.path.join(args.out, 'tmp')}'")
     con.execute(f"SET threads={args.threads}")
     con.execute("SET preserve_insertion_order=false")
+    return con
+
+
+def load_tables(con, out, reuse):
+    """Load tokens and runs unless reuse finds both; True when it did."""
     tables = {n for n, in con.execute("SELECT table_name FROM "
                                       "duckdb_tables()").fetchall()}
-    reuse = args.reuse and {"tokens", "runs"} <= tables
+    reuse = reuse and {"tokens", "runs"} <= tables
     for name in ("links",) if reuse else ("tokens", "runs", "links"):
         con.execute(f"DROP TABLE IF EXISTS {name}")
     if not reuse:
-        load(con, args.out)
+        load(con, out)
     log(f"build: {con.execute('SELECT count(*) FROM tokens').fetchone()[0]:,}"
         f" token rows, {con.execute('SELECT count(*) FROM runs').fetchone()[0]:,}"
         " runs")
+    return reuse
 
+
+def load_links(con, args, reuse):
     links_file = os.path.join(args.out, f"links-{args.mode}.tsv")
     if reuse and os.path.exists(links_file):
         log(f"build: reuse {links_file}")
@@ -232,8 +248,14 @@ def main():
     read_tsv(con, "links", links_file,
              ["file_path", "token_id", "origin_path", "origin_token_id"])
     con.execute("DELETE FROM links WHERE file_path IS NULL")
-    log(f"build: move chains resolved in {resolve_origins(con)} rounds")
 
+
+def main():
+    args = parse_args()
+    t0 = time.time()
+    con = connect(args)
+    load_links(con, args, load_tables(con, args.out, args.reuse))
+    log(f"build: move chains resolved in {resolve_origins(con)} rounds")
     target = os.path.join(args.out, f"history-{args.mode}.parquet")
     write_history(con, target, args.mode, args.chunks)
     log(f"build: wrote {target} in {time.time() - t0:.0f} s")
