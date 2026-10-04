@@ -1,11 +1,6 @@
-"""Replay the history of one path of a cregit repository, token by token.
-
-Each line of a cregit file is one token. A token is born in the commit whose
-diff adds its line, and it keeps its identity while later diffs leave the line
-unchanged. At a merge, a line takes its identity from the first parent that
-has it unchanged, as `git blame` does; a line that no parent has is born in
-the merge.
-"""
+"""Replay one path of a cregit repository, one token per line. A line keeps
+its identity while diffs leave it unchanged; at a merge it takes the identity
+of the first parent that has it unchanged, as `git blame` does."""
 import functools
 import re
 import subprocess
@@ -129,12 +124,9 @@ def unique(items):
 
 
 class PathReplay:
-    """Token identities along the history of one path.
-
-    real_parents, blob_at and diff_blobs let a merge try its real parents in
-    their real order, as `git blame` does, when the simplified history dropped
-    one of them.
-    """
+    """Token identities along the history of one path. real_parents, blob_at
+    and diff_blobs let a merge try its real parents in their real order, as
+    `git blame` does, when the simplified history dropped one of them."""
 
     def __init__(self, commits, real_parents=None, blob_at=None,
                  diff_blobs=None, run_min_alnum=None):
@@ -264,9 +256,7 @@ class PathReplay:
 
     def add_runs(self, c, kind, positioned):
         """Record runs of adjacent tokens that are long enough to move.
-
-        positioned: [(position in the file, token id)], in file order.
-        """
+        positioned: [(position in the file, token id)], in file order."""
         if self.run_min_alnum is None:
             return
         if kind == "died":
@@ -326,11 +316,9 @@ class PathReplay:
         return {t: i for i, t in enumerate(ids)}
 
     def mainline_intervals(self, changes):
-        """Intervals on the mainline: {token: [(in_sha, in_ct, out_sha, out_ct)]}.
-
+        """{token: [(in_sha, in_ct, out_sha, out_ct)]} on the mainline.
         changes: [(sha, ct, blob)] of the first-parent commits that changed
-        this path, oldest first.
-        """
+        this path, oldest first."""
         intervals, alive, unmapped = {}, set(), 0
         for sha, ct, blob in changes:
             ids = self.state_of_blob(blob, ct)

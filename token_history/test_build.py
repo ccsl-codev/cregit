@@ -6,8 +6,6 @@ from token_history import SEP
 
 
 def test_a_token_with_two_mainline_intervals_is_one_place_in_its_run():
-    # tokens has one row per mainline interval; token 1 left the mainline
-    # and came back, so it has two rows
     con = duckdb.connect()
     con.execute("CREATE TABLE tokens (file_path VARCHAR, token_id BIGINT, "
                 "token VARCHAR, mainline_in_sha VARCHAR)")
@@ -25,8 +23,7 @@ def test_a_token_with_two_mainline_intervals_is_one_place_in_its_run():
 
 
 def test_a_path_written_again_by_a_resume_is_loaded_once(tmp_path):
-    # part-1 has a.c from a run that stopped before paths-done.txt; the
-    # resume wrote a.c again in part-2, here after a change of the replay
+    # the resume wrote a.c again in part-2, after a change of the replay
     def row(path, born):
         return SEP.join([path, "0", "x", born, "0", "", "", "", "m", "1", "",
                          ""]) + "\n"

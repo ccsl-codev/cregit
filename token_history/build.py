@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Build history-<mode>.parquet from the parts that token_history.py wrote.
-
-Usage: build.py --out DIR [--mode moves] [--min-alnum 100] [--reuse]
-"""
+"""Build history-<mode>.parquet from the parts that token_history.py wrote."""
 import argparse
 import glob
 import os
@@ -46,12 +43,9 @@ def read_tsv(con, name, pattern, columns):
 
 
 def resolve_origins(con):
-    """links(file_path, token_id -> origin) to the first identity of each chain.
-
-    Pointer jumping: each round replaces an origin by that origin's own
-    origin, so a chain of n moves needs about log2(n) rounds. A move always
-    points to an older token, so chains end.
-    """
+    """Point each link to the first identity of its chain by pointer jumping:
+    about log2(n) rounds for a chain of n moves. A move always points to an
+    older token, so chains end."""
     rounds = 0
     while True:
         con.execute("""
@@ -79,12 +73,9 @@ def in_chunk(column, k, chunks):
 
 
 def write_history(con, target, mode, chunks):
-    """Tokens with their resolved origin, written in chunks of paths.
-
-    On a whole kernel, one join of every token with every link does not fit
-    in memory. Each chunk joins only the paths whose hash falls in it; the
-    parts are then copied into one parquet (no row order is kept).
-    """
+    """Tokens with their resolved origin, in chunks of paths: on a whole kernel
+    one join of every token with every link does not fit in memory. The chunk
+    parquets are then copied into one (no row order is kept)."""
     con.execute("CREATE OR REPLACE TABLE origins (file_path VARCHAR, "
                 "token_id BIGINT, origin_path VARCHAR, origin_token_id BIGINT, "
                 "origin_born_sha VARCHAR)")
@@ -186,7 +177,8 @@ def load(con, out):
 
 
 def write_links(con, links_file, mode, min_alnum):
-    """The link pass, to a .part file that is renamed only at the end."""
+    """Links go to disk commit by commit: on a whole kernel they do not fit
+    in memory. A born token has one birth commit, so it has one link."""
     linked = commits = 0
     with open(links_file + ".part", "w", encoding="utf-8") as f:
         f.write(f"{SEP}{SEP}{SEP}\n")
@@ -204,7 +196,7 @@ def write_links(con, links_file, mode, min_alnum):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", required=True)
     ap.add_argument("--mode", choices=MODES, default="moves")
     ap.add_argument("--min-alnum", type=int, default=100)
@@ -232,8 +224,6 @@ def main():
         f" token rows, {con.execute('SELECT count(*) FROM runs').fetchone()[0]:,}"
         " runs")
 
-    # Links go to disk commit by commit: on a whole kernel they do not fit
-    # in memory. A born token has one birth commit, so it has one link.
     links_file = os.path.join(args.out, f"links-{args.mode}.tsv")
     if reuse and os.path.exists(links_file):
         log(f"build: reuse {links_file}")

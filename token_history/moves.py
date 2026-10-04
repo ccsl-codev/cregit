@@ -1,13 +1,6 @@
-"""Link tokens that moved between files, so they keep their first identity.
-
-Within one commit, a run of born tokens that equals a run of died tokens is a
-move. Modes:
-    off      no links: every path keeps its own history
-    renames  only from a file the commit deleted to a file it created, as
-             plain `git blame` follows a renamed file
-    moves    any run of at least --min-alnum alphanumeric characters, as
-             `git blame -C` does for code moved between files
-"""
+"""Link tokens that moved between files, so they keep their first identity:
+within one commit, a run of born tokens that equals a run of died tokens is a
+move. The README describes the modes."""
 from collections import defaultdict
 
 from replay import alnum
@@ -18,12 +11,9 @@ MAX_CANDIDATES = 64
 
 
 def matching_blocks(a, b):
-    """Maximal equal blocks (i, j, size) of b in a, found from k-token anchors.
-
-    Each anchor of b is looked up in an index of a, preferring the candidate
-    that continues the previous block, and grown forward while equal. Linear
-    in practice, where difflib is quadratic on runs full of repeated tokens.
-    """
+    """Maximal equal blocks (i, j, size) of b in a, grown from k-token anchors
+    that prefer to continue the previous block. Linear in practice, where
+    difflib is quadratic on runs full of repeated tokens."""
     k = min(ANCHOR, len(a), len(b))
     if not k:
         return []
@@ -52,9 +42,7 @@ SEPARATOR = object()
 
 def link(runs, text_of, mode, min_alnum):
     """{(path, born id): (path, died id)} for one commit's runs.
-
-    runs: [(kind, whole_file, path, ids)]; text_of((path, id)) -> token text.
-    """
+    runs: [(kind, whole_file, path, ids)]; text_of((path, id)): its text."""
     if mode == "off":
         return {}
     eligible = [r for r in runs if mode == "moves" or r[1]]

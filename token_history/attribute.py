@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
 """Author, person and firm of every cregit commit, as the tip dataset has them.
-
-A history parquet names commits only. This writes one row per cregit commit
-with the same columns and the same joins as generate_dataset phase 2, so a
-history token joins its born_sha (or origin_born_sha) to the author and firm
-that the tip dataset gives a surviving token of the same commit.
-
-Usage: attribute.py --cregit-db X-cregit.db --persons-db X-persons.db
-                    --firm-map affiliation.merged.csv
-                    [--firm-canonical firm_canonical.csv]
-                    --out commits.parquet [--dataset X-dataset.parquet]
-
-With --dataset, every commit that the dataset also has is compared on its
-person and firm, and the counts are printed.
-"""
+Same columns and joins as generate_dataset phase 2, so a history token joins
+its born_sha to them; --dataset prints how many commits agree with it."""
 import argparse
 import json
 import os
@@ -27,7 +15,7 @@ from generate_dataset import firm_sql, sql_literal  # noqa: E402
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--cregit-db", required=True)
     ap.add_argument("--persons-db", required=True)
     ap.add_argument("--firm-map", required=True)

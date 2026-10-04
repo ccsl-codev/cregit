@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """Compare the tip of a history parquet with the tip dataset parquet.
-
-Every token alive at the tip must be a row of the dataset at the same file and
-token_index, with the same text; the share whose origin commit equals the
-dataset's cregit_commit_sha is the agreement with its blame.
-
-Usage: validate.py --history history-moves.parquet --dataset X-dataset.parquet
-"""
+Every tip token must be a dataset row at the same file, token_index and text;
+the share whose origin commit is its cregit_commit_sha is the agreement."""
 import argparse
 import json
 
@@ -14,7 +9,7 @@ import duckdb
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--history", required=True)
     ap.add_argument("--dataset", required=True)
     args = ap.parse_args()

@@ -15,8 +15,6 @@ def not_a_repo(tmp_path):
 
 
 def test_git_failures_stop_the_run(not_a_repo):
-    # Before, each of these returned empty data and the run went on with
-    # no mainline intervals, no merges or no paths, and 0 errors.
     with pytest.raises(GitError):
         merge_parents(not_a_repo)
     with pytest.raises(GitError, match="not a git repository"):
@@ -69,5 +67,5 @@ def test_a_dead_cat_file_stops_the_run(not_a_repo, monkeypatch):
     src = token_history.GitSource(not_a_repo, {})
     monkeypatch.setattr(token_history, "replay_path",
                         lambda path: src.blob_at("HEAD"))
-    with pytest.raises(GitError):  # not one errors.txt record per path
+    with pytest.raises(GitError):
         token_history.work("a.c")

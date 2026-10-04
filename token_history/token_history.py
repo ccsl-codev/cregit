@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """Extract every token that ever existed in a cregit repository.
 
-For each path, replay its history (replay.py), then write one row per token
-and mainline interval: when the token was born, when a commit first removed
-it, and when it entered and left the mainline (the first-parent history of
-HEAD). Progress goes to a JSON file and to a log line every --ping seconds.
-
-Usage:
-  token_history.py --repo X-cregit.git --out DIR [--paths FILE | -- PATHSPEC]
-                   [--jobs 8] [--ping 60]
-"""
+One row per token and mainline interval; the README describes the columns."""
 import argparse
 import json
 import multiprocessing as mp
@@ -207,7 +199,7 @@ def list_paths(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--paths")
