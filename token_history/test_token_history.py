@@ -2,7 +2,7 @@ import argparse
 
 import pytest
 
-from replay import NULL_BLOB, GitError, diff_hunks, git_out
+from replay import NULL_BLOB, GitError, diff_hunks
 from test_replay import commit, git, write
 from token_history import list_paths, mainline_changes, merge_parents
 
@@ -24,11 +24,6 @@ def test_git_failures_stop_the_run(not_a_repo):
     with pytest.raises(GitError):
         list_paths(argparse.Namespace(paths=None, repo=not_a_repo,
                                       pathspec=[]))
-
-
-def test_an_expected_non_zero_exit_is_accepted(not_a_repo):
-    assert git_out(not_a_repo, "rev-parse", "-q", "--verify", "x:y",
-                   check=False) == ""
 
 
 def test_the_null_blob_diffs_to_no_hunks(tmp_path):

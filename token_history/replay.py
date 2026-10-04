@@ -77,12 +77,11 @@ class GitError(RuntimeError):
     """git exited with an error: the caller must not go on with no data."""
 
 
-def git_out(repo, *args, check=True):
-    """The output of one git command. check=False accepts a non-zero exit
-    (for example rev-parse --verify of a missing object)."""
+def git_out(repo, *args):
+    """The output of one git command; GitError on a non-zero exit."""
     proc = subprocess.run(["git", "-C", repo, *args], capture_output=True,
                           text=True, errors="replace")
-    if check and proc.returncode:
+    if proc.returncode:
         raise GitError(f"git {' '.join(args[:3])} exited {proc.returncode}: "
                        f"{proc.stderr.strip()[:300]}")
     return proc.stdout
