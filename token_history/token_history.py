@@ -57,8 +57,6 @@ def mainline_changes(repo, pathspec):
             meta, path = line.rstrip("\n").split("\t", 1)
             if MASK.search(path):
                 changes.setdefault(path, []).append((sha, ct, meta.split()[3]))
-    # a failed git log would leave every path with no mainline interval,
-    # and the run would still end with 0 errors
     if proc.wait():
         raise GitError(f"git log --first-parent exited {proc.returncode}: "
                        f"{proc.stderr.read().strip()[:300]}")

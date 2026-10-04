@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """Build history-<mode>.parquet from the parts that token_history.py wrote.
 
-The move mode is chosen here, not in the replay, so a run can switch between
-off, renames and moves without replaying the history again.
-
 Usage: build.py --out DIR [--mode moves] [--min-alnum 100] [--reuse]
-
---reuse keeps the tokens and runs tables of DIR/build.duckdb and a finished
-links-<mode>.tsv, so a build that failed after the link pass restarts at the
-chain resolution.
 """
 import argparse
 import glob
@@ -160,11 +153,8 @@ def commit_runs(con):
         FROM t JOIN tokens tok
           ON tok.file_path = t.file_path AND tok.token_id = t.tid
         ORDER BY t.sha, t.run_no, t.pos""")
-    # tokens has one row per mainline interval, so a token with two
-    # intervals comes twice at one place of its run. The rows of one place
-    # are next to each other (the sort), and a token id has one text, so
-    # keeping the first row of each place is a DISTINCT that costs no
-    # memory (a DISTINCT over the 408 M kernel token rows does not fit).
+    # tokens has a row per mainline interval: keep the first row of each
+    # place (the sort puts them together), a DISTINCT that needs no memory
     sha, runs, texts, cur_run, last = None, [], {}, None, None
     while batch := cur.fetchmany(100_000):
         for s, run_no, kind, whole, path, tid, token, pos in batch:
