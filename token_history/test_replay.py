@@ -8,12 +8,12 @@ from replay import NULL_BLOB, PathReplay, align, Hunk, parse_log, path_log
 from token_history import GitSource, mainline_changes, merge_parents
 
 
-def git(repo, *args, date=None):
+def git(repo, *args, date=None, check=True):
     env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x",
                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x")
     if date:
         env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = f"{date} +0000"
-    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+    return subprocess.run(["git", "-C", str(repo), *args], check=check,
                           capture_output=True, text=True, env=env).stdout
 
 
@@ -218,8 +218,8 @@ def test_a_line_kept_from_two_parents_becomes_a_copy(tmp_path):
     git(r, "checkout", "-q", "main")
     write(r, "d.c", ["A", "P"])
     commit(r, "main adds P after A", "2021-01-03T00:00:00")
-    subprocess.run(["git", "-C", str(r), "merge", "-q", "--no-ff",
-                    "--no-commit", "keep"], capture_output=True)
+    git(r, "merge", "-q", "--no-ff", "--no-commit", "keep", check=False)
+    assert (r / ".git" / "MERGE_HEAD").exists()
     write(r, "d.c", ["A", "P", "Q", "A"])
     commit(r, "merge keeps both", "2021-01-04T00:00:00")
     rp = real_replay(r, "d.c")
