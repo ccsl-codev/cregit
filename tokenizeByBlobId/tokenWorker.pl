@@ -11,7 +11,6 @@ use File::Temp qw(tempfile);
 use FindBin qw($RealBin);
 use IO::Select;
 use POSIX qw(_exit);
-use Time::HiRes ();
 use File::Basename qw(basename dirname);
 use lib "$RealBin/../tokenize";
 use CregitLanguages;
@@ -36,12 +35,6 @@ make_path($buildDir) if not -d $buildDir;
 
 my $inProcess = in_process_tokenizer(@tokenizeCommand);
 
-my $trace;
-if (my $tracePath = $ENV{BFG_WORKER_TRACE}) {
-    open($trace, '>>', "$tracePath.$$") or die "unable to open trace [$tracePath.$$]: $!\n";
-    $trace->autoflush(1);
-}
-
 print STDOUT "READY\n";
 
 while (defined(my $header = <STDIN>)) {
@@ -55,7 +48,6 @@ while (defined(my $header = <STDIN>)) {
     my $contents = read_exact($bodyLen, "body");
 
     my ($exitCode, $stdout, $stderr);
-    my $t0 = $trace ? Time::HiRes::time() : 0;
     my $ok = eval {
         ($exitCode, $stdout, $stderr) = process_request(
             $origSha, $filename, $fullPath, $contents, $timeoutSecs
@@ -68,11 +60,6 @@ while (defined(my $header = <STDIN>)) {
         $stderr = $@ || "tokenizer request failed\n";
     }
 
-    if ($trace) {
-        my $ext = $filename =~ /\.([^.]+)\z/ ? lc($1) : "";
-        printf {$trace} "%s %d %s %.3f %d %d\n",
-            $origSha, $bodyLen, $ext, (Time::HiRes::time() - $t0) * 1000, $exitCode, length($stdout);
-    }
     print STDOUT "RES $exitCode " . length($stdout) . " " . length($stderr) . "\n";
     print STDOUT $stdout, $stderr;
 }
