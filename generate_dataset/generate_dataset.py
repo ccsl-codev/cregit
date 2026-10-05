@@ -25,12 +25,14 @@ Usage:
 """
 
 import argparse
+import io
 import logging
 import os
 import re
 import sqlite3
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -289,14 +291,93 @@ def parse_blame_line(line: str) -> tuple[str, str] | None:
     return commit_sha, token_content
 
 
+# The Rust tokenizer puts its position and a TAB before every token line:
+# `5:7<TAB>identifier|x`, `N:-` on a DECL line, `-:-` on a unit marker. The
+# pipeline never asks for positions, and classify_and_skip splits on the first
+# pipe, so the prefix went into token_type and the walk skipped its length as
+# well. Nothing else writes a line that starts with digits, a colon and a TAB.
+_POSITION_PREFIX = re.compile(r"^(?:\d+|-):(?:\d+|-)\t")
+
+# The prebuilt srcML 1.1.0 binary reads UTF-8 source as Latin-1: `ö` (C3 B6)
+# comes out as the two characters `Ã¶`. A UTF-8 lead byte read as Latin-1 lies
+# in U+00C2..U+00F4, and a continuation byte in U+0080..U+00BF. Text the build
+# wrote correctly almost never holds that pair, and undo_mojibake also needs
+# the whole token to decode as UTF-8 before it changes anything.
+_MOJIBAKE = re.compile("[Â-ô][\u0080-¿]")
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def undo_mojibake(text: str) -> str:
+    """Return the UTF-8 text that srcML misread as Latin-1, or `text` as is."""
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
+def read_source(source_path: Path) -> tuple[str, bool, bool]:
+    """Read a source file for the walk. Return its text, whether it started
+    with a byte-order mark, and whether the mojibake repair can apply to its
+    tokens.
+
+    The text loses a leading byte-order mark. The tokenizers drop it, so a
+    BOM kept as a character puts the walk one character ahead to the end of
+    the file.
+
+    The repair applies only when the file is strict UTF-8, has no BOM and is
+    not Rust. srcML decodes a BOM file correctly, and the Rust tokenizer does
+    not use srcML. In those files, and in a file that is not UTF-8, a token
+    that matches _MOJIBAKE is the true text.
+    """
+    raw = source_path.read_bytes()
+    has_bom = raw.startswith(_UTF8_BOM)
+    try:
+        raw.decode("utf-8")
+        strict = True
+    except UnicodeDecodeError:
+        strict = False
+    # TextIOWrapper, not raw.decode: it keeps the newline translation of the
+    # text-mode open() that this replaces, so all other files read the same.
+    with io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8-sig",
+                          errors="replace") as f:
+        text = f.read()
+    repairable = strict and not has_bom and not str(source_path).endswith(".rs")
+    return text, has_bom, repairable
+
+
+def repair_token_line(token_content: str, repairable: bool,
+                      stats: Counter) -> str:
+    """Return the token line with the Rust position prefix removed and, when
+    `repairable`, the srcML mojibake undone. Count each repair in `stats`.
+
+    This must run before classify_and_skip: the walk consumes one source
+    character per token character, so a wrong token text also moves every
+    later position in the file.
+    """
+    prefix = _POSITION_PREFIX.match(token_content)
+    if prefix:
+        stats["position_prefix"] += 1
+        token_content = token_content[prefix.end():]
+    if repairable and _MOJIBAKE.search(token_content):
+        fixed = undo_mojibake(token_content)
+        if fixed != token_content:
+            stats["mojibake_tokens"] += 1
+            token_content = fixed
+    return token_content
+
+
 def process_blame_file(
-    blame_path: Path, source_path: Path, rel_path: str, db_cursor
+    blame_path: Path, source_path: Path, rel_path: str, db_cursor,
+    stats: Counter | None = None,
 ) -> int:
     with open(blame_path, encoding="utf-8", errors="replace") as f:
         blame_lines = f.readlines()
 
-    with open(source_path, encoding="utf-8", errors="replace") as f:
-        source_text = f.read()
+    source_text, has_bom, repairable = read_source(source_path)
+    if stats is None:
+        stats = Counter()
+    stats["bom_files"] += has_bom
 
     reader = SourceReader(source_text)
     counted = [0]
@@ -310,6 +391,7 @@ def process_blame_file(
                 continue
             commit_sha, token_content = parsed
 
+            token_content = repair_token_line(token_content, repairable, stats)
             info = classify_and_skip(token_content, reader)
             counted[0] += 1
             yield (
@@ -400,6 +482,103 @@ def sql_literal(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+# The three firm columns, in dataset order. They sit immediately after
+# person_domain and before repo_tag, because firm is RESOLVED FROM person_domain:
+# the key and the three values it produces belong together, and a reader who
+# filters on person_domain finds the answer in the next three columns.
+#
+# Unlike the 29 metadata columns these are NOT per-project constants. They are
+# per row, so they come from a real join against an external, auditable map
+# (--firm-map, this repository's cregit-token-pipeline/data/affiliation.merged.csv)
+# rather than from a SQL literal. The map stays a file on disk on purpose: baking
+# 4,049 rows into a query would make the attribution unreviewable.
+#
+#   firm_raw     the map's `company` string, exactly as the map gives it
+#   firm         the canonical name after --firm-canonical is applied
+#   firm_source  the map's `source`: patch | gitdm | rich | builtin | correction |
+#                cncf-gitdm | cncf-gitdm-single | spinellis[-sec] | …
+#
+# An empty firm_source means "this person_domain is not in the map", so it is the
+# column to filter on for "attributed at all". A reader who distrusts
+# single-person inferences filters firm_source <> 'cncf-gitdm-single', which is
+# 2,771 of the map's 4,049 rows.
+FIRM_FIELDS = ("firm_raw", "firm", "firm_source")
+
+
+def read_csv_column(path, column):
+    """One column of a CSV, as a list. Used only for the duplicate checks below.
+
+    csv, not duckdb: these checks run before Phase 1 and must not depend on the
+    query engine being reachable.
+    """
+    import csv
+
+    with open(path, newline="") as fh:
+        return [(row.get(column) or "") for row in csv.DictReader(fh)]
+
+
+def check_key_is_unique(path, column, what) -> int:
+    """Refuse a lookup table with a repeated key. Returns the row count.
+
+    This is the one failure mode of the firm join that would be invisible. Both
+    tables are joined LEFT against token_map, so a domain appearing twice
+    DUPLICATES every token row of every person on that domain — the file still
+    validates, the schema still matches, and only the row count betrays it.
+    Failing here costs a second; finding it later costs the corpus.
+    """
+    keys = [k.strip().lower() for k in read_csv_column(path, column)]
+    if len(keys) != len(set(keys)):
+        seen, dupes = set(), []
+        for k in keys:
+            if k in seen and k not in dupes:
+                dupes.append(k)
+            seen.add(k)
+        raise SystemExit(
+            f"{path}: {what} repeats {len(dupes)} key(s) in `{column}`: "
+            f"{', '.join(dupes[:5])}{' …' if len(dupes) > 5 else ''}. "
+            "A repeated key multiplies token rows through the LEFT JOIN.")
+    return len(keys)
+
+
+def firm_sql(firm_map, firm_canonical) -> tuple[str, str]:
+    """(SELECT lines, JOIN lines) for the three firm columns.
+
+    With no --firm-map the columns are three empty strings and no join is added,
+    so a caller that predates the flag still writes a schema-valid file — the
+    same bargain --project-meta makes. An empty firm_source then reads as "no
+    attribution", which is exactly true.
+    """
+    if not firm_map:
+        return ("".join(f"                '' AS {f},\n" for f in FIRM_FIELDS), "")
+    # No canonical table means `firm` repeats `firm_raw`: the column still exists
+    # and still carries a name, it is just the unnormalised one.
+    firm_expr = ("coalesce(fc.firm, fm.company, '')" if firm_canonical
+                 else "coalesce(fm.company, '')")
+    select = (
+        "                coalesce(fm.company, '')          AS firm_raw,\n"
+        f"                {firm_expr} AS firm,\n"
+        "                coalesce(fm.source, '')           AS firm_source,\n"
+    )
+    # lower() on both sides: the map is written lower-cased by build_domain_map,
+    # but persons.db's domain column is whatever the commit's e-mail carried.
+    # all_varchar=true so a company spelled like a number ('1&1', '360') cannot
+    # be sniffed into another type and change the Parquet's schema.
+    join = (
+        "            LEFT JOIN (SELECT lower(domain) AS domain, company, source\n"
+        f"                       FROM read_csv_auto({sql_literal(firm_map)},\n"
+        "                                          header=true, all_varchar=true)) fm\n"
+        "                   ON fm.domain = lower(e.domain)\n"
+    )
+    if firm_canonical:
+        join += (
+            "            LEFT JOIN (SELECT firm_raw, firm\n"
+            f"                       FROM read_csv_auto({sql_literal(firm_canonical)},\n"
+            "                                          header=true, all_varchar=true)) fc\n"
+            "                   ON fc.firm_raw = fm.company\n"
+        )
+    return (select, join)
+
+
 def load_project_meta(meta_path, project_key) -> dict:
     """The project's constants, or empty strings when no sidecar was given.
 
@@ -472,6 +651,23 @@ def main():
         help="key into --project-meta (the manifest name). Defaults to --repo-name.",
     )
     parser.add_argument(
+        "--firm-map",
+        default="",
+        metavar="PATH",
+        help="CSV of domain,company,kind,source (cregit-token-pipeline/"
+        "data/affiliation.merged.csv). Joined per row against person_domain to "
+        "fill firm_raw and firm_source. Empty means emit the three firm columns "
+        "as empty strings, so an older caller still produces a schema-valid file.",
+    )
+    parser.add_argument(
+        "--firm-canonical",
+        default="",
+        metavar="PATH",
+        help="CSV of firm_raw,firm,... — the REVIEWED canonical-name table that "
+        "fills the `firm` column. Needs --firm-map. Without it `firm` repeats "
+        "`firm_raw`, so the split spellings stay split.",
+    )
+    parser.add_argument(
         "--memory-limit",
         default=DEFAULT_MEMORY_LIMIT,
         metavar="SIZE",
@@ -529,6 +725,27 @@ def main():
     project_meta = load_project_meta(
         args.project_meta, args.project_key or args.repo_name)
 
+    # Same rule for the firm map, and one extra reason: a repeated key in either
+    # lookup table multiplies token rows silently, so both are checked here
+    # rather than after the join has already written the Parquet.
+    if args.firm_canonical and not args.firm_map:
+        parser.error("--firm-canonical needs --firm-map: there is no firm_raw to "
+                     "canonicalise without a map to read it from")
+    if args.firm_map:
+        if not Path(args.firm_map).is_file():
+            print(f"ERROR: firm-map not found: {args.firm_map}", file=sys.stderr)
+            sys.exit(1)
+        n = check_key_is_unique(args.firm_map, "domain", "the firm map")
+        print(f"Firm map:  {args.firm_map} ({n} domains)")
+    if args.firm_canonical:
+        if not Path(args.firm_canonical).is_file():
+            print(f"ERROR: firm-canonical not found: {args.firm_canonical}",
+                  file=sys.stderr)
+            sys.exit(1)
+        n = check_key_is_unique(args.firm_canonical, "firm_raw",
+                                "the canonical-name table")
+        print(f"Firm canon: {args.firm_canonical} ({n} names)")
+
     blame_files = sorted(blame_root.rglob("*.blame"))
     if not blame_files:
         print("WARNING: no .blame files found", file=sys.stderr)
@@ -577,6 +794,7 @@ def main():
     cursor = sync_conn.cursor()
     total_tokens = 0
     files_processed = 0
+    repairs = Counter()
 
     for bf in blame_files:
         rel = bf.relative_to(blame_root)
@@ -591,7 +809,7 @@ def main():
 
         if args.verbose:
             print(f"  {bf.name} -> {rel_str}")
-        count = process_blame_file(bf, source_path, rel_str, cursor)
+        count = process_blame_file(bf, source_path, rel_str, cursor, repairs)
         total_tokens += count
         files_processed += 1
 
@@ -608,6 +826,9 @@ def main():
     sync_conn.close()
 
     print(f"Synced {files_processed} files, {total_tokens} tokens")
+    print(f"Repaired: {repairs['mojibake_tokens']} mojibake tokens, "
+          f"{repairs['position_prefix']} position prefixes, "
+          f"{repairs['bom_files']} files with a byte-order mark")
 
     if total_tokens == 0:
         print("ERROR: no tokens processed, nothing to output", file=sys.stderr)
@@ -646,6 +867,7 @@ def main():
     con.execute(f"CALL sqlite_attach('{args.persons_db}')")
 
     meta_sql = project_meta_sql(project_meta)
+    firm_select, firm_join = firm_sql(args.firm_map, args.firm_canonical)
 
     query = f"""
         COPY (
@@ -676,6 +898,7 @@ def main():
                 e.emailaddr                   AS person_email,
                 e.domain                      AS person_domain,
 
+{firm_select}
                 coalesce(m.repo, '')          AS repo_tag,
 
                 coalesce(ftr.footer_signed_off_by, [])        AS footer_signed_off_by,
@@ -700,7 +923,7 @@ def main():
             LEFT JOIN emails e            ON (c.autname = e.emailname
                                          AND c.autemail = e.emailaddr)
             LEFT JOIN persons p           ON e.personid = p.personid
-            LEFT JOIN (
+{firm_join}            LEFT JOIN (
                 SELECT
                     f.cid,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'signed-off-by')       AS footer_signed_off_by,

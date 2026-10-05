@@ -15,11 +15,18 @@
 
 use strict;
 use File::Basename;
-use File::Temp qw(tempfile);
 use FindBin;
 use lib $FindBin::Bin;
 use CregitLanguages;
 
+# Exit status meaning "this parse did not produce a usable tokenization":
+# srcml2token died on a signal or exited non-zero, or the token stream came back
+# empty (which a healthy srcML parse never is -- see Verify_Parse).
+#
+# Picked to be distinguishable from every other outcome in the chain: below 128,
+# so it can never be confused with a shell's 128+signal encoding; clear of GNU
+# timeout's 124 and 137, which blobExec already reads as "we killed it"; and clear
+# of blobExec's own 2 (abort), 3 (mask changed) and 4 (timed out).
 our $PARSER_CRASH_EXIT = 33;
 
 my %declarations;
@@ -43,7 +50,6 @@ Usage $0 [options] <sourcefilename> <outputfile>*
         
 Options:
    --srcml2token=<path to srcml2token>
-   --srcml=<path to srcml>
    --language=<C/C++/Java>
    --ctags=-<path to ctags-universal>
    --position
@@ -52,15 +58,13 @@ Options:
 my $basedir = dirname($0);
 $basedir = "." if ($basedir eq "");
 
-my $srcml   = "srcml";
 my $srcml2token = "$basedir/srcMLtoken/srcml2token";
 my $ctags = "ctags-universal";
 my $language = "";
 my $verbose;
 my $position = 0;
 
-GetOptions ("srcml=s" => \$srcml, 
-            "srcml2token=s"   => \$srcml2token,
+GetOptions ("srcml2token=s"   => \$srcml2token,
             "language=s"      => \$language,
             "ctags=s"         => \$ctags,
             "position"        => \$position,
@@ -84,8 +88,7 @@ if ($language eq "") {
     # autodetect
     Usage("File has no extension. You must provide one [$filename]") unless $filename =~ /(\.[a-z\+]+)$/i;
     my $ext = lc($1);
-    $language = CregitLanguages::language_for_ext( substr($1, 1) );
-    $language = undef unless defined $language and exists $extensions{ lc($1) };
+    $language = $extensions{$ext};
     Usage("Unknown extension [$ext] in file [$filename]. You must provide language using --language option") unless defined $language and $language ne "";
 }
 
@@ -106,27 +109,14 @@ exit;
 
 sub Tokenize
 {
-    my $saveDir = `pwd`;
-    chomp $saveDir;
     my ($filename) = @_;
-
-    my ($statusFh, $statusFile) =
-        tempfile("cregit-pipestatus-XXXXXX", TMPDIR => 1, UNLINK => 1);
-    close $statusFh;
-
-    my $pipeline = sprintf(
-        '%s -l %s --position %s | %s; printf %%s\\ %%s "${PIPESTATUS[0]}" "${PIPESTATUS[1]}" > %s',
-        Shell_Quote($srcml),   Shell_Quote($language),
-        Shell_Quote($filename), Shell_Quote($srcml2token),
-        Shell_Quote($statusFile));
-
-    open(parser, "-|", "bash", "-c", $pipeline)
-        or die "Unable to execute srcml pipeline on file [$filename]: $!";
+    open(my $parser, "-|", $srcml2token, "-l", $language, $filename)
+        or die "Unable to execute srcml2token on file [$filename]: $!";
 
     my $lastLine = -1;
     my $tokensRead = 0;
 
-    while (<parser>) {
+    while (<$parser>) {
         $tokensRead++;
         #        print STDERR;
         chomp;
@@ -159,68 +149,29 @@ sub Tokenize
         }
 
     }
-    my $closed      = close parser;
-    my $closeStatus = $?;
-    chdir($saveDir);
-
-    Verify_Parse($filename, $tokensRead, $statusFile, $closed, $closeStatus);
+    close $parser;
+    Verify_Parse($filename, $tokensRead, $?);
 }
 
-sub Shell_Quote
-{
-    my ($s) = @_;
-    $s = '' unless defined $s;
-    $s =~ s/'/'\\''/g;
-    return "'$s'";
-}
-
+# Fail closed. Anything other than "srcml2token exited 0 with a non-empty token
+# stream" is a defect, and must be reported with a status the caller can count
+# rather than silently becoming a 0-byte tokenization.
 sub Verify_Parse
 {
-    my ($filename, $tokensRead, $statusFile, $closed, $closeStatus) = @_;
+    my ($filename, $tokensRead, $status) = @_;
+    my $signal = $status & 127;
+    Parser_Crash($filename,
+        "srcml2token was killed by signal $signal. srcML 1.1.0, which it links, "
+        . "dies on a signal on some C/C++ inputs under --position.") if $signal;
+    Parser_Crash($filename, "srcml2token exited " . ($status >> 8) . ".") if $status != 0;
 
-    my ($srcmlStatus, $tokenStatus) = Read_Pipe_Status($statusFile);
-
-    if (defined $srcmlStatus and $srcmlStatus > 128) {
-        my $signal = $srcmlStatus - 128;
-        Parser_Crash($filename,
-            "srcml was killed by signal $signal (shell status $srcmlStatus).");
-    }
-    if (defined $srcmlStatus and $srcmlStatus != 0) {
-        Parser_Crash($filename, "srcml exited $srcmlStatus.");
-    }
-    if (defined $tokenStatus and $tokenStatus > 128) {
-        my $signal = $tokenStatus - 128;
-        Parser_Crash($filename,
-            "srcml2token was killed by signal $signal (shell status $tokenStatus).");
-    }
-    if (defined $tokenStatus and $tokenStatus != 0) {
-        Parser_Crash($filename, "srcml2token exited $tokenStatus.");
-    }
-
-    if (not defined $srcmlStatus or not defined $tokenStatus) {
-        if (not $closed or $closeStatus != 0) {
-            Parser_Crash_Unknown($filename, $closeStatus);
-        }
-    }
-
-    if ($tokensRead == 0) {
-        Parser_Crash($filename,
-            "the token stream was empty. A successful srcML parse always emits at "
-            . "least the begin_unit/end_unit wrapper, even for an empty file, so an "
-            . "empty stream is a failed parse and never a legitimately empty result.");
-    }
-}
-
-sub Read_Pipe_Status
-{
-    my ($statusFile) = @_;
-    open(my $fh, '<', $statusFile) or return (undef, undef);
-    my $line = <$fh>;
-    close $fh;
-    return (undef, undef) unless defined $line;
-    chomp $line;
-    return (undef, undef) unless $line =~ /^([0-9]+)\s+([0-9]+)$/;
-    return ($1, $2);
+    # Even a zero-byte source file yields the begin_unit/end_unit wrapper, so zero
+    # tokens always means the parse failed.
+    Parser_Crash($filename,
+        "the token stream was empty. A successful srcML parse always emits at "
+        . "least the begin_unit/end_unit wrapper, even for an empty file, so an "
+        . "empty stream is a failed parse and never a legitimately empty result.")
+        if $tokensRead == 0;
 }
 
 sub Parser_Crash
@@ -231,17 +182,6 @@ sub Parser_Crash
         . "exiting $PARSER_CRASH_EXIT so the caller can count this blob.\n";
     exit($PARSER_CRASH_EXIT);
 }
-
-sub Parser_Crash_Unknown
-{
-    my ($filename, $closeStatus) = @_;
-    print STDERR "cregit: tokenization of [$filename] FAILED: the srcml pipeline "
-        . "reported a non-zero close status ($closeStatus) and bash did not report "
-        . "PIPESTATUS, so the failing stage is unknown.\n";
-    exit($PARSER_CRASH_EXIT);
-}
-
-
 
 sub Declarations_Test
 {

@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter
 
 import pytest
 
-from generate_dataset import (DEFAULT_MEMORY_LIMIT, PROJECT_META_FIELDS,
-                              SourceReader, is_ws, load_project_meta,
-                              parse_memory_limit, project_meta_sql,
-                              skip_comment, skip_literal, skip_token,
-                              sql_literal)
+from generate_dataset import (DEFAULT_MEMORY_LIMIT, FIRM_FIELDS,
+                              PROJECT_META_FIELDS, SourceReader,
+                              check_key_is_unique, firm_sql, is_ws,
+                              load_project_meta, parse_memory_limit,
+                              process_blame_file, project_meta_sql,
+                              repair_token_line, skip_comment, skip_literal, skip_token,
+                              sql_literal, undo_mojibake)
 
 
 def reader(text: str) -> SourceReader:
@@ -301,11 +304,11 @@ def test_a_key_absent_from_the_sidecar_fails_loudly(tmp_path):
 
 # --------------------------------------------------------------------------- #
 # end to end, against DuckDB. The unit tests above prove the SQL text; only a
-# written Parquet proves the column set, and 67 columns is the contract
+# written Parquet proves the column set, and 70 columns is the contract
 # cregit-token-pipeline/validate_schema.py gates the corpus with.
 # --------------------------------------------------------------------------- #
 
-TOTAL_COLUMNS = 67                      # 38 token/commit columns + 29 metadata
+TOTAL_COLUMNS = 70                      # 38 token/commit + 29 metadata + 3 firm
 SHA = "a" * 40
 
 
@@ -450,45 +453,478 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
 
 # --------------------------------------------------------------------------- #
 # footer trailers resolve to personids
+# --------------------------------------------------------------------------- #
 
 
-def seed_trailer(value, *, email_rows=()):
-    """Give the tiny project one Reviewed-by trailer and the emails rows given."""
+def seed_footers(*trailers, people=()):
+    """Return a `seed` for generate(): trailers into footers, people into
+    emails/persons. `people` is (personid, emailaddr, personname)."""
     def seed(cregit_db, persons_db):
         con = sqlite3.connect(cregit_db)
-        con.execute("INSERT INTO footers VALUES (?,?,?,?)",
-                    (SHA, 0, "Reviewed-by", value))
+        for idx, (key, value) in enumerate(trailers):
+            con.execute("INSERT INTO footers VALUES (?,?,?,?)",
+                        (SHA, idx, key, value))
         con.commit()
         con.close()
-
         con = sqlite3.connect(persons_db)
-        for personid, emailaddr, emailname in email_rows:
-            con.execute(
-                "INSERT INTO emails (personid, fullemail, emailaddr, emailname, "
-                "lcemail, userid, domain) VALUES (?,?,?,?,?,?,?)",
-                (personid, f"{emailname} <{emailaddr}>", emailaddr, emailname,
-                 emailaddr.lower(), personid, emailaddr.partition("@")[2]))
-            con.execute("INSERT INTO persons VALUES (?,?)", (personid, emailname))
+        for i, (pid, addr, pname) in enumerate(people, start=1):
+            con.execute("INSERT INTO emails (recordid, personid, fullemail, "
+                        "emailaddr, emailname) VALUES (?,?,?,?,?)",
+                        (i, pid, f"{pname} <{addr}>", addr, pname))
+            con.execute("INSERT OR IGNORE INTO persons VALUES (?,?)", (pid, pname))
         con.commit()
         con.close()
     return seed
 
 
-def footer_personids(duckdb, out):
-    return duckdb.sql("select footer_personids from read_parquet(?)",
-                      params=[str(out)]).fetchall()[0][0]
+def footers_of(duckdb, path):
+    return duckdb.sql("select footer_personids, footer_person_names, "
+                      f"footer_reviewed_by from read_parquet('{path}')").fetchone()
 
 
-def test_a_trailer_carrying_a_bare_address_resolves_to_its_person(monkeypatch, tmp_path):
+@pytest.mark.parametrize("value", ["bob@example.com", "Bob bob@example.com"])
+def test_a_bare_address_trailer_resolves_to_a_personid(monkeypatch, tmp_path, value):
+    """`Reviewed-by: bob@example.com`, no angle brackets. The trailer text
+    reached footer_reviewed_by while footer_personids stayed empty, because the
+    coalesce never reached the bare-address pattern and that pattern had no
+    capture group anyway."""
     duckdb = pytest.importorskip("duckdb")
-    out = generate(monkeypatch, tmp_path, seed=seed_trailer(
-        "Bob bob@example.com", email_rows=[("p_bob", "bob@example.com", "Bob")]))
-    assert footer_personids(duckdb, out) == ["p_bob"]
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reviewed-by", value),
+        people=[("bob", "bob@example.com", "Bob B")]))
+
+    ids, names, reviewed = footers_of(duckdb, out)
+    assert list(reviewed) == [value]
+    assert list(ids) == ["bob"]
+    assert list(names) == ["Bob B"]
 
 
-def test_a_trailer_with_no_address_does_not_match_an_empty_emails_row(monkeypatch, tmp_path):
+def test_the_angle_bracket_form_still_wins_over_a_second_address(monkeypatch, tmp_path):
+    """Precedence, which the nullif must not disturb: a trailer holding both
+    forms resolves to the bracketed one."""
     duckdb = pytest.importorskip("duckdb")
-    out = generate(monkeypatch, tmp_path, seed=seed_trailer(
-        "Former-commit-id: 0123456789abcdef0123456789abcdef01234567",
-        email_rows=[("p_empty", "", "Nameless")]))
-    assert footer_personids(duckdb, out) == []
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reviewed-by", "noreply@example.com writing for Bob B <bob@example.com>"),
+        people=[("bob", "bob@example.com", "Bob B"),
+                ("noreply", "noreply@example.com", "No Reply")]))
+
+    ids, _names, _reviewed = footers_of(duckdb, out)
+    assert list(ids) == ["bob"]
+
+
+def test_a_trailer_with_no_address_attributes_nobody(monkeypatch, tmp_path):
+    """`Former-commit-id: <sha>` carries no address, so it must contribute no
+    person. It used to join on '', which matches an emails row for an author
+    committing as `Name <>` — 27 of 199 corpus persons DBs hold one, so this
+    published a wrong personid on every commit carrying such a trailer."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Former-commit-id", "6a32a91a877bc2341810ef674dfdc3be21c500bc"),
+        people=[("ghost", "", "A Ghost")]))
+
+    ids, names, _reviewed = footers_of(duckdb, out)
+    assert list(ids) == []
+    assert list(names) == []
+
+
+# --------------------------------------------------------------------------- #
+# firm attribution. The shape is different from everything above: the 29
+# metadata columns are per-project CONSTANTS injected as SQL literals, while
+# firm is PER ROW and comes from a real join against an external CSV. So the
+# failure modes are different too — a duplicate key in either lookup table
+# multiplies token rows through the LEFT JOIN, and nothing downstream notices.
+# --------------------------------------------------------------------------- #
+
+FIRM_MAP_HEADER = "domain,company,kind,source\n"
+
+
+def write_map(tmp_path, *lines, name="firm.csv"):
+    path = tmp_path / name
+    path.write_text(FIRM_MAP_HEADER + "".join(f"{l}\n" for l in lines))
+    return path
+
+
+def write_canonical(tmp_path, *lines, name="canon.csv"):
+    path = tmp_path / name
+    path.write_text("firm_raw,firm,decision,note\n"
+                    + "".join(f"{l}\n" for l in lines))
+    return path
+
+
+def generate_with_domain(monkeypatch, tmp_path, domain, argv_extra=()):
+    """The tiny project, plus one identified person on `domain`.
+
+    build_tiny_project leaves emails and persons empty, so person_domain is NULL
+    there and every firm column is blank whatever the map says. A positive test
+    needs a person the commit actually joins to.
+    """
+    import generate_dataset as gd
+
+    blame, src, cregit_db, persons_db = build_tiny_project(tmp_path)
+    con = sqlite3.connect(persons_db)
+    con.execute(
+        "INSERT INTO emails (personid, fullemail, emailaddr, emailname, "
+        "lcemail, userid, domain) VALUES (?,?,?,?,?,?,?)",
+        ("p1", "A Dev <a@example.com>", "a@example.com", "A Dev",
+         "a@example.com", "a", domain))
+    con.execute("INSERT INTO persons VALUES ('p1', 'A Dev')")
+    con.commit()
+    con.close()
+
+    out = tmp_path / "out" / "proj-dataset.parquet"
+    monkeypatch.setattr(gd.sys, "argv", [
+        "generate_dataset.py",
+        "--blame-dir", str(blame),
+        "--source-dir", str(src),
+        "--cregit-db", str(cregit_db),
+        "--persons-db", str(persons_db),
+        "--output", str(out),
+        "--repo-name", "proj",
+        *argv_extra,
+    ])
+    gd.main()
+    return out
+
+
+def firm_of(duckdb, path):
+    return duckdb.sql("select person_domain, firm_raw, firm, firm_source "
+                      f"from read_parquet('{path}')").fetchall()
+
+
+def test_the_firm_field_list_is_three_names_in_dataset_order():
+    assert FIRM_FIELDS == ("firm_raw", "firm", "firm_source")
+
+
+def test_no_firm_map_emits_no_join_and_three_empty_literals():
+    """An older caller must still produce a schema-valid file, the same bargain
+    --project-meta makes. So the columns exist and the join does not."""
+    select, join = firm_sql("", "")
+    assert join == ""
+    assert select.count("'' AS") == 3
+
+
+def test_a_map_without_a_canonical_table_makes_firm_repeat_firm_raw():
+    """Honest rather than clever: without a reviewed table the split spellings
+    stay split, and `firm` says the same thing `firm_raw` does."""
+    select, join = firm_sql("/m.csv", "")
+    assert "read_csv_auto('/m.csv'" in join
+    assert "fc" not in join
+    assert "coalesce(fm.company, '') AS firm," in select
+
+
+def test_the_map_path_is_escaped_like_every_other_literal():
+    """The query is one f-string and the path comes from the command line."""
+    _select, join = firm_sql("/o'brien/m.csv", "")
+    assert "'/o''brien/m.csv'" in join
+
+
+def test_the_three_firm_columns_sit_between_person_domain_and_repo_tag(
+        monkeypatch, tmp_path):
+    """Position is a claim, not a convenience: firm is resolved FROM
+    person_domain, so the key and its answers are adjacent."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path)
+    names = [n for n, _ in schema_of(duckdb, out)]
+    i = names.index("person_domain")
+    assert names[i:i + 5] == ["person_domain", "firm_raw", "firm",
+                              "firm_source", "repo_tag"]
+    assert len(names) == TOTAL_COLUMNS
+
+
+def test_a_call_with_no_firm_flags_writes_three_empty_strings(
+        monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path)
+    assert duckdb.sql("select firm_raw, firm, firm_source "
+                      f"from read_parquet('{out}')").fetchone() == ("", "", "")
+
+
+def test_a_domain_in_the_map_gets_its_firm_and_its_source(monkeypatch, tmp_path):
+    """The headline case, in miniature: the map says who, and firm_source says on
+    what evidence. `correction` is this repository's reviewed overlay."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "qti.qualcomm.com,Qualcomm,company,correction")
+    out = generate_with_domain(monkeypatch, tmp_path, "qti.qualcomm.com",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [
+        ("qti.qualcomm.com", "Qualcomm", "Qualcomm", "correction")]
+
+
+def test_the_canonical_table_fills_firm_and_never_touches_firm_raw(
+        monkeypatch, tmp_path):
+    """The partner's standing preference: carry more, cut at publication. The raw
+    string is evidence and must survive beside the canonical name."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(
+        tmp_path, "au1.ibm.com,International Business Machines,company,cncf-gitdm")
+    canon = write_canonical(
+        tmp_path, "International Business Machines,IBM,merge,one firm spelled two ways")
+    out = generate_with_domain(monkeypatch, tmp_path, "au1.ibm.com",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    assert firm_of(duckdb, out) == [
+        ("au1.ibm.com", "International Business Machines", "IBM", "cncf-gitdm")]
+
+
+def test_a_name_the_canonical_table_does_not_mention_passes_through(
+        monkeypatch, tmp_path):
+    """The table lists only the names that change. Everything else is already
+    canonical, and a missing row must not blank the column."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    canon = write_canonical(tmp_path, "NVidia,NVIDIA,merge,case only")
+    out = generate_with_domain(monkeypatch, tmp_path, "google.com",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    assert firm_of(duckdb, out) == [
+        ("google.com", "Google", "Google", "gitdm")]
+
+
+def test_a_domain_absent_from_the_map_gets_three_empty_strings(
+        monkeypatch, tmp_path):
+    """An empty firm_source is the filter for 'not attributed at all', so it must
+    mean exactly that rather than 'the map had no source column'."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    out = generate_with_domain(monkeypatch, tmp_path, "nowhere.example",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [("nowhere.example", "", "", "")]
+
+
+def test_the_domain_match_ignores_case(monkeypatch, tmp_path):
+    """build_domain_map writes lower-cased domains, but persons.db carries
+    whatever the commit's e-mail header held."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "redhat.com,Red Hat,company,gitdm")
+    out = generate_with_domain(monkeypatch, tmp_path, "RedHat.COM",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [("RedHat.COM", "Red Hat", "Red Hat", "gitdm")]
+
+
+def test_a_company_spelled_like_a_number_stays_a_string(monkeypatch, tmp_path):
+    """all_varchar=true on the read. Without it DuckDB sniffs `360` as a number,
+    the firm columns change type, and validate_schema.py fails the whole corpus
+    on one project's map hit."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "360.cn,360,company,gitdm")
+    out = generate_with_domain(monkeypatch, tmp_path, "360.cn",
+                               argv_extra=("--firm-map", str(firm_map)))
+    assert firm_of(duckdb, out) == [("360.cn", "360", "360", "gitdm")]
+    assert dict(schema_of(duckdb, out))["firm_raw"] == "VARCHAR"
+
+
+def test_one_token_stays_one_row_when_the_map_matches(monkeypatch, tmp_path):
+    """The join must not fan out. This is the assertion that would catch a future
+    map keyed on something less unique than a domain."""
+    duckdb = pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    canon = write_canonical(tmp_path, "Google,Google LLC,merge,irrelevant here")
+    out = generate_with_domain(monkeypatch, tmp_path, "google.com",
+                               argv_extra=("--firm-map", str(firm_map),
+                                           "--firm-canonical", str(canon)))
+    assert duckdb.sql(f"select count(*) from read_parquet('{out}')").fetchone() == (1,)
+
+
+def test_a_repeated_domain_in_the_map_stops_the_run_before_phase_1(
+        monkeypatch, tmp_path):
+    """The one failure mode of this join that would be invisible. Two rows for one
+    domain duplicate every token row of every person on it: the file still
+    validates, the schema still matches, and only the row count betrays it."""
+    pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm",
+                         "Google.com,Alphabet,company,gitdm")
+    with pytest.raises(SystemExit, match="multiplies token rows"):
+        generate_with_domain(monkeypatch, tmp_path, "google.com",
+                             argv_extra=("--firm-map", str(firm_map)))
+    assert not (tmp_path / "out" / "proj-dataset.parquet").exists()
+
+
+def test_a_repeated_name_in_the_canonical_table_stops_the_run(
+        monkeypatch, tmp_path):
+    """Two canonical names for one raw string is an unresolved review, not a
+    default to pick from."""
+    pytest.importorskip("duckdb")
+    firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
+    canon = write_canonical(tmp_path, "Google,Alphabet,merge,one reviewer",
+                            "Google,Google LLC,merge,another reviewer")
+    with pytest.raises(SystemExit, match="multiplies token rows"):
+        generate_with_domain(monkeypatch, tmp_path, "google.com",
+                             argv_extra=("--firm-map", str(firm_map),
+                                         "--firm-canonical", str(canon)))
+
+
+def test_check_key_is_unique_returns_the_row_count(tmp_path):
+    path = write_map(tmp_path, "a.example,A,company,gitdm",
+                     "b.example,B,company,gitdm")
+    assert check_key_is_unique(path, "domain", "the firm map") == 2
+
+
+def test_a_canonical_table_without_a_map_is_refused(monkeypatch, tmp_path):
+    """argparse exits 2. There is no firm_raw to canonicalise without a map, and
+    accepting the pair would write `firm` out of nothing."""
+    canon = write_canonical(tmp_path, "NVidia,NVIDIA,merge,case only")
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path,
+                 argv_extra=("--firm-canonical", str(canon)))
+
+
+def test_a_missing_firm_map_stops_the_run_before_phase_1(monkeypatch, tmp_path):
+    """A typo in the path must not produce a corpus of blank firm columns."""
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path,
+                 argv_extra=("--firm-map", str(tmp_path / "absent.csv")))
+
+
+def test_a_missing_canonical_table_stops_the_run_before_phase_1(
+        monkeypatch, tmp_path):
+    firm_map = write_map(tmp_path, "a.example,A,company,gitdm")
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path,
+                 argv_extra=("--firm-map", str(firm_map),
+                             "--firm-canonical", str(tmp_path / "absent.csv")))
+
+
+# --------------------------------------------------------------------------- #
+# Token-line repairs before the source walk: srcML mojibake, the Rust position
+# prefix, and the byte-order mark. Each one moved the walk, so each test checks
+# the text and the position of the token after the defect.
+# --------------------------------------------------------------------------- #
+
+def walk(tmp_path, name, source: bytes, *token_lines, stats=None):
+    """Run process_blame_file on one file and return its token_map rows."""
+    (tmp_path / name).write_bytes(source)
+    blame = tmp_path / f"{name}.blame"
+    blame.write_text("".join(f"{SHA};;\t{t}\n" for t in token_lines),
+                     encoding="utf-8")
+    con = sqlite3.connect(":memory:")
+    con.execute("""CREATE TABLE token_map (file_path TEXT, token_index INTEGER,
+        commit_sha CHAR(40), token_type TEXT, token_value TEXT,
+        source_text TEXT, source_line INTEGER, source_col INTEGER,
+        is_structural INTEGER, func_name TEXT)""")
+    process_blame_file(blame, tmp_path / name, name, con.cursor(), stats)
+    return con.execute("""SELECT token_type, token_value, source_text,
+        source_line, source_col, is_structural FROM token_map
+        ORDER BY token_index""").fetchall()
+
+
+C_SOURCE = "/* Högskolan */\nint x;\n".encode()
+C_MOJIBAKE = ("comment|/* HÃ¶gskolan */", "keyword|int", "name|x",
+              "operator|;")
+
+
+def test_undo_mojibake_restores_the_utf8_text():
+    assert undo_mojibake("HÃ¶gskolan") == "Högskolan"
+    assert undo_mojibake("â\x80\x94") == "\u2014"
+
+
+@pytest.mark.parametrize("text", [
+    "Högskolan",      # correct text: o-umlaut is above the lead-byte range
+    "é¿",             # a lead byte with too few continuation bytes
+    "ĀÃ¶",            # a character above U+00FF cannot be Latin-1
+    "plain ascii",
+])
+def test_undo_mojibake_leaves_other_text_alone(text):
+    assert undo_mojibake(text) == text
+
+
+def test_a_mojibake_token_gets_the_true_text_and_the_walk_stays_aligned(tmp_path):
+    rows = walk(tmp_path, "a.c", C_SOURCE, *C_MOJIBAKE)
+    assert rows[0][1] == "/* Högskolan */"
+    assert rows[0][2].startswith("/* Högskolan */")
+    # The next token is where the source has it: line 2, column 1.
+    assert rows[1][1:5] == ("int", "int ", 2, 1)
+    assert rows[2][3:5] == (2, 5)
+
+
+def test_a_correct_token_is_not_changed(tmp_path):
+    rows = walk(tmp_path, "a.c", C_SOURCE, "comment|/* Högskolan */",
+                *C_MOJIBAKE[1:])
+    assert rows[0][1] == "/* Högskolan */"
+    assert rows[1][3:5] == (2, 1)
+
+
+@pytest.mark.parametrize("name, source", [
+    # srcML decodes a BOM file correctly, so the pair is the true text.
+    ("a.c", b"\xef\xbb\xbf/* H\xc3\x83\xc2\xb6 */\nint x;\n"),
+    # Not UTF-8: nothing tells what the true text is.
+    ("a.c", b"/* H\xc3\xb6 \xff */\nint x;\n"),
+    # The Rust tokenizer does not use srcML.
+    ("a.rs", "/* HÃ¶ */\nint x;\n".encode()),
+])
+def test_the_gate_keeps_a_matching_token_as_it_is(tmp_path, name, source):
+    rows = walk(tmp_path, name, source, "comment|/* HÃ¶ */", "keyword|int")
+    assert rows[0][1] == "/* HÃ¶ */"
+
+
+def test_a_rust_line_loses_its_position_prefix(tmp_path):
+    rows = walk(tmp_path, "m.rs", b"fn main() {}\n",
+                "-:-\tbegin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1",
+                "1:1\tkeyword|fn", "1:4\tidentifier|main", "1:8\top|(",
+                "1:9\top|)", "1:11\top|{", "1:12\top|}", "-:-\tend_unit")
+    assert [r[0] for r in rows] == ["begin_unit", "keyword", "identifier",
+                                    "op", "op", "op", "op", "end_unit"]
+    assert rows[0][5] == 1 and rows[-1][5] == 1
+    # The walk now agrees with the position the tokenizer wrote.
+    assert [r[3:5] for r in rows[1:7]] == [(1, 1), (1, 4), (1, 8), (1, 9),
+                                           (1, 11), (1, 12)]
+    assert rows[2][2] == "main"
+
+
+def test_a_decl_line_prefix_is_removed_too(tmp_path):
+    rows = walk(tmp_path, "m.rs", b"fn f\n", "1:-\tDECL|fn|f",
+                "1:1\tkeyword|fn")
+    assert rows[0][0] == "DECL"
+    assert rows[1][3:5] == (1, 1)
+
+
+def test_a_c_line_that_starts_with_digits_is_kept(tmp_path):
+    rows = walk(tmp_path, "a.c", b"1\n", "literal|1")
+    assert rows[0][:2] == ("literal", "1")
+
+
+def test_a_byte_order_mark_does_not_move_the_walk(tmp_path):
+    rows = walk(tmp_path, "a.c", b"\xef\xbb\xbfint x;\n", "keyword|int",
+                "name|x", "operator|;")
+    assert rows[0][2:5] == ("int ", 1, 1)
+    assert rows[1][2:5] == ("x", 1, 5)
+
+
+def test_windows_line_ends_still_read_as_one_newline(tmp_path):
+    rows = walk(tmp_path, "a.c", b"int\r\nx;\r\n", "keyword|int", "name|x")
+    assert rows[1][3:5] == (2, 1)
+
+
+def test_the_repairs_are_counted(tmp_path):
+    stats = Counter()
+    walk(tmp_path, "a.c", C_SOURCE, *C_MOJIBAKE, stats=stats)
+    walk(tmp_path, "m.rs", b"fn\n", "1:1\tkeyword|fn", "-:-\tend_unit",
+         stats=stats)
+    walk(tmp_path, "b.c", b"\xef\xbb\xbfint\n", "keyword|int", stats=stats)
+    assert stats == Counter(mojibake_tokens=1, position_prefix=2, bom_files=1)
+
+
+def test_a_line_from_the_fixed_rust_tokenizer_is_kept(tmp_path):
+    # The tokenizer no longer writes the prefix without --position. Such a
+    # line must pass unchanged: the repair removes text, it never moves a
+    # position by a fixed amount.
+    stats = Counter()
+    rows = walk(tmp_path, "m.rs", b"fn main\n",
+                "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1",
+                "keyword|fn", "identifier|main", "end_unit", stats=stats)
+    assert [r[0] for r in rows] == ["begin_unit", "keyword", "identifier",
+                                    "end_unit"]
+    assert [r[3:5] for r in rows[1:3]] == [(1, 1), (1, 4)]
+    assert stats["position_prefix"] == 0
+
+
+@pytest.mark.parametrize("line, repairable, expected", [
+    ("12:5\tkeyword|fn", False, "keyword|fn"),
+    ("12:-\tDECL|fn|f", False, "DECL|fn|f"),
+    ("-:-\tend_unit", False, "end_unit"),
+    ("keyword|fn", False, "keyword|fn"),
+    ("comment|HÃ¶", True, "comment|Hö"),
+    ("comment|HÃ¶", False, "comment|HÃ¶"),
+    ("12:5|keyword|fn", False, "12:5|keyword|fn"),  # --position form: a pipe
+])
+def test_repair_token_line(line, repairable, expected):
+    assert repair_token_line(line, repairable, Counter()) == expected

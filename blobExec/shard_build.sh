@@ -80,9 +80,9 @@ if [ -z "$THREADS" ]; then
 fi
 
 # Default tokenizer dispatcher (srcML for .c/.h, rustTokenizer for .rs, …); the
-# --srcml/--ctags paths are forwarded only to the srcML parser.
+# --srcml2token/--ctags paths are forwarded only to the srcML parser.
 if [ -z "$TOK_CMD" ]; then
-  TOK_CMD="$CREGIT/tokenize/tokenize.pl --srcml2token=$CREGIT/tokenize/srcMLtoken/srcml2token --srcml=$(command -v srcml) --ctags=$(command -v ctags)"
+  TOK_CMD="$CREGIT/tokenize/tokenize.pl --srcml2token=$CREGIT/tokenize/srcMLtoken/srcml2token --ctags=$(command -v ctags)"
 fi
 export BFG_TOKENIZE_CMD="$TOK_CMD"
 JAVA="$(command -v java)"

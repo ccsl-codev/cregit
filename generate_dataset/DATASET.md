@@ -4,19 +4,19 @@
 
 `generate_dataset.py` produces a unified Parquet dataset containing every token from a
 tokenized git repository, annotated with commit metadata, authorship information,
-person identity, and the commit's git trailers.  It is the final
+person identity, firm attribution, and the commit's git trailers.  It is the final
 output of the CreGit pipeline (Step 10).
 
-**The schema is 67 columns**, in this order:
+**The schema is 70 columns**, in this order:
 
 | Block | Columns | # |
 |-------|---------|---|
 | [Token data](#token-data) | `repo_name`, then `file_path` … `is_structural` | 1 + 8 |
 | [Per-project provenance](#per-project-provenance) | `clone_url` … `file_mask` | 29 |
 | [Git commit metadata](#git-commit-metadata) | `cregit_commit_sha` … `commit_summary` | 9 |
-| [Person identity](#person-identity) | `personid` … `repo_tag` | 5 |
+| [Person identity](#person-identity) | `personid` … `repo_tag`, including the three [firm](#firm-attribution) columns | 8 |
 | [Commit trailers](#commit-trailers-footers) | `footer_*` | 15 |
-| | **total** | **67** |
+| | **total** | **70** |
 
 `repo_name` is column 1 and the 29 provenance columns are 2-30, so `file_path` is
 column 31.
@@ -114,7 +114,27 @@ numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
 | `person_name` | `TEXT` | persons | Canonical display name for this person. Derived via `coalesce(p.personname, e.personid)`. If neither is available, this is `NULL`. |
 | `person_email` | `TEXT` | emails | Email address that matched this commit's author name/email pair. |
 | `person_domain` | `TEXT` | emails | Domain part of the email address. |
+| `firm_raw` | `TEXT` | `--firm-map` | The map's `company` string for `person_domain`, exactly as the map gives it. `''` when the domain is not in the map. |
+| `firm` | `TEXT` | `--firm-canonical` | The canonical firm name. Equals `firm_raw` unless the reviewed canonical table renames it. Never overwrites `firm_raw`. |
+| `firm_source` | `TEXT` | `--firm-map` | The map's `source` for that domain: `patch`, `gitdm`, `rich`, `builtin`, `correction` (all hand-curated), `cncf-gitdm`, `cncf-gitdm-single` (a single-person inference, 2,771 of 4,049 rows), `spinellis[-sec]`. `''` means the domain is not in the map, so this is the column to filter on for "attributed at all". |
 | `repo_tag` | `TEXT` | commitmap | Repository tag indicating the origin repository. Values: `'p'` (pre-history), `'b'` (BitKeeper), `'l'` (Linux), or `''` (unknown/single repo). |
+
+### Firm attribution
+
+The 29 provenance columns are per-project constants. Firm is resolved **per row**
+from `person_domain` by a LEFT JOIN against `--firm-map`
+(`cregit-token-pipeline/data/affiliation.merged.csv`), and `firm` comes from the
+reviewed canonical-name table `--firm-canonical`. `firm_raw` is never overwritten.
+Both files must have a unique key: a repeated `domain` or `firm_raw` would
+multiply token rows, so the generator refuses such a file before Phase 1.
+
+```sql
+-- Firm-level token counts, excluding single-person inferences
+SELECT firm, COUNT(*) AS tokens
+FROM 'dataset.parquet'
+WHERE is_structural = 0 AND firm <> '' AND firm_source <> 'cncf-gitdm-single'
+GROUP BY firm ORDER BY tokens DESC;
+```
 
 ### Commit trailers (footers)
 
@@ -300,18 +320,15 @@ produces no blame and no dataset row rather than rows of unparsed text:
 
 | Mechanism | Recorded as | Effect here |
 |---|---|---|
-| the **blob denylist**, `blobExec/src/main/scala/cregit/blobexec/BlobDenylistEntries.scala` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list ships in the jar; nothing at run time can extend or override it |
+| the **blob denylist**, `blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list ships in the jar; nothing at run time can extend or override it |
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
-| a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
+| a blob the tokenizer **timed out** or **crashed** on | `blobsTimedOut` or `blobsParserCrashed`, plus one `EXCLUDED failed blob` line each with `reason=timeout` or `reason=parser-crash` | no rows for those blobs. The run still exits 0 |
 
-One example, so the shape is clear: [`2ee2673a`](https://github.com/tencent/tencentkona-21/blob/2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65/test/langtools/tools/javac/annotations/typeAnnotations/newlocations/TestNewCastArray.java)
-— srcML 1.1.0's Java parser does not terminate on type-annotated array types
-(upstream [`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361), closed by the
-revision `nix/srcml.nix` pins).
-The list is keyed by content, not path: this file moved in a repository
-reorganisation, so its four revisions at two paths are four entries. Failure is
-non-termination, not slowness — 0 bytes out, one core at 100%, at every budget
-from 5 s to 600 s.
+The denylist holds 209 blob ids, keyed by content, in three srcML 1.1.0 defects:
+8 Java blobs that do not terminate (upstream
+[`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361)), 4 C blobs that do
+not terminate (no upstream issue), and 197 C and C++ blobs on which srcML crashes
+under `--position`. The header of the file carries the reproducers and citations.
 
 Also outside the dataset, by mask rather than by exclusion: M4 (`.am`, `.ac`),
 whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,
@@ -355,9 +372,14 @@ persons.db ─────────────┤
 
 For each `.blame` file:
 1. Parse each line as `commit_sha;token_content`
-2. Walk through the original source file character-by-character to match tokens
-3. Classify each token (structural vs content, type, value)
-4. Insert into SQLite `token_map`
+2. Repair the token line: remove the Rust tokenizer's `line:col<TAB>` prefix, and,
+   in a strict UTF-8 file that is not `.rs` and has no byte-order mark, undo the
+   srcML 1.1.0 Latin-1 misreading (`Ã¶` becomes `ö`). The source is read as
+   `utf-8-sig`, so a byte-order mark does not shift the walk. `main` prints the
+   counts on a `Repaired:` line.
+3. Walk through the original source file character-by-character to match tokens
+4. Classify each token (structural vs content, type, value)
+5. Insert into SQLite `token_map`
 
 ### Phase 2: DuckDB JOIN → Parquet
 
@@ -365,6 +387,7 @@ Join `token_map` with the three SQLite databases:
 - `commits` — commit metadata (author, committer, dates, summary)
 - `commitmap` — cregit → original commit SHA mapping
 - `emails` / `persons` — person identity resolution
+- `--firm-map` / `--firm-canonical` — firm attribution, when given
 
 Output is written as ZSTD-compressed Parquet.
 
@@ -393,6 +416,8 @@ uv run python generate_dataset/generate_dataset.py \
 | `--repo-name` | no | Repository name. Default: inferred from output filename. |
 | `--project-meta` | no | JSON sidecar of per-project provenance, from `project_meta.py`. Omit and those columns are written empty. |
 | `--project-key` | no | Which key of the sidecar this project is. Default: `--repo-name`. A key the sidecar does not hold is an error, not a blank row. |
+| `--firm-map` | no | CSV of `domain,company,kind,source`, joined per row against `person_domain`. Omit and `firm_raw`, `firm` and `firm_source` are written empty. A repeated `domain` is an error. |
+| `--firm-canonical` | no | CSV of `firm_raw,firm,…`, the reviewed canonical-name table that fills `firm`. Needs `--firm-map`. Omit and `firm` repeats `firm_raw`, so split spellings stay split. |
 | `--verbose` | no | Enable info-level logging to stderr. |
 
 ## Cross-reference: Perl ↔ Python

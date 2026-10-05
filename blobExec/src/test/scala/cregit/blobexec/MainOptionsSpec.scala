@@ -39,50 +39,54 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.parsePositiveSeconds("10.5") shouldEqual None
   }
 
-  test("timeout and stall have distinct exit statuses, and neither collides") {
-    Main.TimedOutExitStatus shouldEqual 4
+  test("the stall status collides with no other exit status") {
     Walker.StalledExitStatus shouldEqual 5
-    Main.TimedOutExitStatus should not equal Walker.StalledExitStatus
-    Set(0, 1, 2, 3) should not contain Main.TimedOutExitStatus
     Set(0, 1, 2, 3) should not contain Walker.StalledExitStatus
   }
 
   // -- the two timeouts are coupled -------------------------------------------
+  //
+  // A pure-blob commit's only progress stamp is a blob finishing or being killed,
+  // so the watchdog window must exceed the per-blob budget. The defaults (600 and
+  // 1800) satisfy it; following the advice to raise --blob-timeout to 1800 without
+  // touching the window would not, and a legitimately slow blob would then race
+  // its own watchdog.
 
   test("a window at or above the floor is accepted unchanged") {
-    Walker.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
-    Walker.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
-    Walker.resolveStallTimeout(600, Walker.stallFloorFor(600), stallExplicit = true) shouldEqual
+    Main.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, Walker.stallFloorFor(600), stallExplicit = true) shouldEqual
       Right(Walker.stallFloorFor(600))
   }
 
   test("the floor is the child's whole lifetime, not just the budget") {
-    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
-    Walker.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
-    Walker.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
+    Walker.stallFloorFor(600) should be > BlobExec.maxChildLifetimeSeconds(600)
+    Main.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
+    Main.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
   }
 
   test("a refusal names the floor it wants, and the suggestion clears it") {
-    val why = Walker.resolveStallTimeout(600, 601, stallExplicit = true).swap.getOrElse("")
+    val why = Main.resolveStallTimeout(600, 601, stallExplicit = true).swap.getOrElse("")
     why should include(Walker.stallFloorFor(600).toString)
-    val suggested = Walker.stallTimeoutFor(600)
-    Walker.resolveStallTimeout(600, suggested, stallExplicit = true) shouldEqual Right(suggested)
+    val suggested = Main.widenedStall(600)
+    Main.resolveStallTimeout(600, suggested, stallExplicit = true) shouldEqual Right(suggested)
   }
 
-  test("a small budget is widened past the fixed kill overhead, not just tripled") {
-    Walker.resolveStallTimeout(5, 3, stallExplicit = false)
-      .getOrElse(0) should be >= Walker.stallFloorFor(5)
-    Walker.resolveStallTimeout(1, 1, stallExplicit = false)
-      .getOrElse(0) should be >= Walker.stallFloorFor(1)
+  test("a small --blob-timeout no longer lets the watchdog stop a healthy run") {
+    val oneBlobLifetimeNanos = BlobExec.maxChildLifetimeSeconds(5).toLong * 1000000000L
+    Main.resolveStallTimeout(5, 15, stallExplicit = true).isLeft shouldBe true
+    val window = Main.resolveStallTimeout(5, 3, stallExplicit = false).getOrElse(0)
+    Walker.isStalled(oneBlobLifetimeNanos, 0L, window) shouldBe false
+    Main.resolveStallTimeout(1, 1, stallExplicit = false).getOrElse(0) should be >= Walker.stallFloorFor(1)
   }
 
   test("the floor cannot overflow into a guard that always passes") {
     Walker.stallFloorFor(Int.MaxValue) should be > 0
-    ChildRunner.maxLifetimeSeconds(Int.MaxValue) should be > 0
+    BlobExec.maxChildLifetimeSeconds(Int.MaxValue) should be > 0
   }
 
   test("the defaults satisfy the relationship") {
-    Walker.resolveStallTimeout(
+    Main.resolveStallTimeout(
       BlobExec.DefaultTimeoutSeconds,
       Walker.DefaultStallTimeoutSeconds,
       stallExplicit = false
@@ -90,75 +94,35 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("a defaulted window is widened to fit a raised --blob-timeout") {
-    Walker.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
-    Walker.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
+    // The exact collision the printed advice used to create: --blob-timeout=1800
+    // against the 1800 default window.
+    Main.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
+    Main.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
   }
 
   test("an explicit window that is too small is refused, naming both values") {
-    val bad = Walker.resolveStallTimeout(1800, 1800, stallExplicit = true)
+    val bad = Main.resolveStallTimeout(1800, 1800, stallExplicit = true)
     bad.isLeft shouldBe true
     val why = bad.swap.getOrElse("")
     why should include("--stall-timeout=1800")
     why should include("--blob-timeout=1800")
-    Walker.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
+    Main.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
   }
 
   test("widening cannot overflow Int") {
-    Walker.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
+    Main.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
   }
 
-  // -- the stall window's floor -----------------------------------------------
-
-  test("the floor clears one blob's whole lifetime, kill path included") {
-    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
-    Walker.stallFloorFor(1) should be > ChildRunner.maxLifetimeSeconds(1)
-  }
-
-  test("the default window is derived from the blob budget, not a second literal") {
-    Walker.DefaultStallTimeoutSeconds shouldEqual Walker.stallTimeoutFor(BlobExec.DefaultTimeoutSeconds)
-  }
-
-  test("a defaulted window follows a raised budget past the floor") {
-    Walker.stallTimeoutFor(1800) shouldEqual 5400
-    Walker.stallTimeoutFor(5) should be >= Walker.stallFloorFor(5)
-    Walker.stallTimeoutFor(1) should be >= Walker.stallFloorFor(1)
-  }
-
-  test("a blob budget past the default window raises the floor above it") {
-    Walker.stallFloorFor(3600) should be > Walker.DefaultStallTimeoutSeconds
-  }
-
-  test("the floor grows with the blob budget, and never underflows") {
-    Walker.stallFloorFor(60) should be < Walker.stallFloorFor(600)
-    Walker.stallFloorFor(0) should be > 0
-    Walker.stallFloorFor(-5) should be > 0
-  }
-
-  test("a run at exactly the floor is not stalled by its own slowest blob") {
-    val blobBudget = 3600
-    val floor      = Walker.stallFloorFor(blobBudget)
-    val quiet      = ChildRunner.maxLifetimeSeconds(blobBudget).toLong * 1000000000L
-    Walker.isStalled(nowNanos = quiet, lastProgressNanos = 0L, floor) shouldBe false
-  }
-
-  test("the accepted range of a timeout keeps every derived window inside Int") {
-    Main.parsePositiveSeconds((Main.MaxTimeoutSeconds + 1).toString) shouldEqual None
-    Main.parsePositiveSeconds(Int.MaxValue.toString) shouldEqual None
-    Walker.stallTimeoutFor(Main.MaxTimeoutSeconds) should be > 0
-    ChildRunner.maxLifetimeSeconds(Main.MaxTimeoutSeconds) should be > 0
-  }
-
-  // -- which counters gate publication ----------------------------------------
+  // -- which counters change the exit status ----------------------------------
 
   private def stats(
       aborted: Boolean = false,
       blobsTimedOut: Long = 0L,
       blobsOversized: Long = 0L,
       blobsDenylisted: Long = 0L,
-      blobsParserCrashed: Long = 0L,
-      blobsTokenized: Int = 1
+      blobsParserCrashed: Long = 0L
   ) = WalkStats(
-    commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = blobsTokenized,
+    commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = 1,
     blobsCacheHit = 0, refsProjected = 1, aborted = aborted,
     blobsTimedOut = blobsTimedOut, blobsOversized = blobsOversized,
     blobsDenylisted = blobsDenylisted, blobsParserCrashed = blobsParserCrashed,
@@ -183,10 +147,11 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(blobsOversized = 3, blobsDenylisted = 4)) shouldEqual 0
   }
 
-  test("a timeout still blocks publication, even alongside a denylisted blob") {
-    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual Main.TimedOutExitStatus
-    Main.exitStatus(stats(blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual
-      Main.TimedOutExitStatus
+  test("a failed blob does not change the exit status: it is excluded") {
+    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual 0
+    Main.exitStatus(stats(blobsParserCrashed = 36)) shouldEqual 0
+    Main.exitStatus(stats(blobsTimedOut = 1, blobsParserCrashed = 1, blobsDenylisted = 4,
+      blobsOversized = 3)) shouldEqual 0
   }
 
   test("an abort still wins over everything") {
@@ -195,42 +160,29 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
   }
 
-  test("a crash rate past tolerance blocks publication, with its own status") {
-    Main.exitStatus(stats(blobsParserCrashed = 2, blobsTokenized = 100)) shouldEqual
-      Main.ParserCrashedExitStatus
-  }
-
-  test("a crash rate within tolerance still publishes: the blob is excluded either way") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsTokenized = 100)) shouldEqual 0
-    Main.exitStatus(stats(blobsParserCrashed = 500, blobsTokenized = 500000)) shouldEqual 0
-  }
-
-  test("one crash in a tiny project does not gate, so rounding cannot zero the tolerance") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsTokenized = 1)) shouldEqual 0
-    Main.exitStatus(stats(blobsParserCrashed = 2, blobsTokenized = 1)) shouldEqual
-      Main.ParserCrashedExitStatus
-  }
-
-  test("a crash past tolerance still blocks alongside explained exclusions") {
-    Main.exitStatus(stats(blobsParserCrashed = 9, blobsTokenized = 100,
-                          blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
-      Main.ParserCrashedExitStatus
-  }
-
-  test("the parser-crash status collides with no other blobExec exit status") {
+  // The ineffective-invalidation status must be distinct: run_pipeline_process.sh maps blobExec's statuses onto different
+  // remedies and different marker files, so a collision sends the operator to the
+  // wrong one. This status specifically must not be 0 — "--retokenize did
+  // nothing" reported as success is the failure the flag exists to prevent — and
+  // must not be 3, which means the run never started.
+  test("the ineffective-retokenize status collides with no other blobExec exit status") {
     val others = Map(
-      "clean"       -> 0,
-      "usage"       -> 1,
-      "aborted"     -> 2,
-      "maskChanged" -> 3,
-      "timedOut"    -> Main.TimedOutExitStatus,
-      "stalled"     -> Walker.StalledExitStatus
+      "clean"        -> 0,
+      "usage"        -> 1,
+      "aborted"      -> 2,
+      "maskChanged"  -> 3,
+      "stalled"      -> Walker.StalledExitStatus
     )
     others.foreach { case (name, status) =>
-      withClue(s"parser-crash status must differ from $name ($status): ") {
-        Main.ParserCrashedExitStatus should not equal status
+      withClue(s"ineffective-retokenize status must differ from $name ($status): ") {
+        Main.RetokenizeIneffectiveExitStatus should not equal status
       }
     }
+  }
+
+  test("an ineffective --retokenize is not reported as a clean walk") {
+    // Belt and braces on the one collision that would actually lose data.
+    Main.RetokenizeIneffectiveExitStatus should not equal 0
   }
 
   // -- the watchdog's decision ------------------------------------------------

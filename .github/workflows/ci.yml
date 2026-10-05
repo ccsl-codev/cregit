@@ -76,14 +76,48 @@ jobs:
       - name: Build & test Rust tokenizer (rust_tokenizer)
         run: devenv shell -- bash -c 'cd tokenize/rustTokenizer && make && make test'
 
+      - name: "Tokenizer worker: same output as tokenBySha.pl"
+        run: devenv shell -- bash tests/test_token_worker.sh
+
       - name: Perl tests (prove)
         run: devenv shell -- bash -c 'prove tests/t'
 
       - name: Pipeline tests (shell)
-        run: devenv shell -- bash -c 'tests/tokenize_gate.sh && tests/pipeline_workdir_guard.sh'
+        run: |
+          devenv shell -- bash -c 'set -e
+            for t in tokenize_gate pipeline_workdir_guard ensure_artifacts retokenize_passthrough reblame_passthrough; do
+              bash "tests/$t.sh"
+            done'
 
       - name: Dataset tests (pytest)
-        run: devenv shell -- bash -c 'pytest -q'
+        run: devenv shell -- pytest -q --junitxml=junit-generate-dataset.xml
+
+      # `devenv shell -- pytest` does not flush its summary line, so read the counts
+      # from the JUnit XML. Standard library only, so it needs no devenv shell.
+      - name: Re-check the pytest JUnit counts
+        if: always()
+        shell: bash
+        run: |
+          f=junit-generate-dataset.xml
+          [ -f "$f" ] || { echo "no $f: pytest did not get far enough to write one"; exit 1; }
+          python3 - "$f" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          s = root.find("testsuite") if root.tag == "testsuites" else root
+          a = s.attrib
+          print(f"tests={a['tests']} failures={a['failures']} "
+                f"errors={a['errors']} skipped={a['skipped']}")
+          if int(a["failures"]) or int(a["errors"]):
+              sys.exit("failures or errors in the suite")
+          PY
+
+      - name: Upload the pytest JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-generate-dataset
+          path: junit-generate-dataset.xml
+          if-no-files-found: warn
 
       - name: Build & test legacy onejar modules (sbt test one-jar, Scala 2.10 / JDK 8)
         run: |

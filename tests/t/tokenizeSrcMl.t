@@ -13,8 +13,6 @@ my $srcml2token = "$root/tokenize/srcMLtoken/srcml2token";
 my $fixtures    = "$root/tokenize/srcMLtoken/tests";
 my $expected    = "$FindBin::Bin/expected";
 
-plan skip_all => "srcml not on PATH"
-    unless system("srcml --version >/dev/null 2>&1") == 0;
 plan skip_all => "ctags not on PATH"
     unless system("ctags --version >/dev/null 2>&1") == 0;
 plan skip_all => "srcml2token not built (cd tokenize/srcMLtoken && make)"
@@ -79,7 +77,7 @@ sub run_tokenizer {
 {
     my $crasher = "$FindBin::Bin/fixtures/srcml-position-crash.c";
 
-    my $rawRc = system("srcml -l C --position '$crasher' >/dev/null 2>&1");
+    my $rawRc = system("'$srcml2token' -l C '$crasher' >/dev/null 2>&1");
 
     my $rawSignal = $rawRc & 127;
     if (not $rawSignal and ($rawRc >> 8) > 128) {
@@ -87,12 +85,12 @@ sub run_tokenizer {
     }
 
   SKIP: {
-        skip "srcml no longer dies on this fixture (rc=$rawRc): the upstream bug "
+        skip "srcml2token no longer dies on this fixture (rc=$rawRc): the upstream bug "
             . "appears fixed, so the crash-handling assertions cannot be exercised", 6
             unless $rawSignal;
 
         is($rawSignal == 11 || $rawSignal == 6, 1,
-           "fixture kills srcml with SIGSEGV(11) or SIGABRT(6), got signal $rawSignal");
+           "fixture kills srcml2token with SIGSEGV(11) or SIGABRT(6), got signal $rawSignal");
 
         my ($status, $out, $err) = run_tokenizer("--position", "'$crasher'");
 
@@ -104,14 +102,13 @@ sub run_tokenizer {
            "no tokenization is emitted on stdout");
         like($err, qr/FAILED/,
              "the failure is reported on stderr instead of passing silently");
-        like($err, qr/killed by signal $rawSignal/,
-             "stderr names the signal, so srcml's death is attributed to srcml "
-             . "and not to srcml2token, which exits 0 on the truncated XML");
+        like($err, qr/srcml2token was killed by signal $rawSignal/,
+             "stderr names the signal");
     }
 }
 
 {
-    my $dies = "$workdir/srcml-that-dies";
+    my $dies = "$workdir/srcml2token-that-dies";
     open(my $fh, '>', $dies) or die $!;
     print $fh "#!/bin/sh\nkill -SEGV \$\$\n";
     close $fh;
@@ -123,10 +120,10 @@ sub run_tokenizer {
     close $fh;
 
     my ($status, $out, $err) =
-        run_tokenizer("--srcml='$dies'", "--position", "'$victim'");
+        run_tokenizer("--srcml2token='$dies'", "--position", "'$victim'");
 
     is($status >> 8, $PARSER_CRASH_EXIT,
-       "a srcml killed by a signal exits $PARSER_CRASH_EXIT, whatever srcml we ship");
+       "a srcml2token killed by a signal exits $PARSER_CRASH_EXIT, whatever srcML we ship");
     is($out, "", "and emits no tokenization");
     like($err, qr/killed by signal 11/, "and names the signal on stderr");
 }
@@ -160,6 +157,6 @@ sub run_tokenizer {
     close $fh;
 
     my ($status, $out, $err) = run_tokenizer("--position", "\"$odd\"");
-    is($status, 0, "a path containing a quote is passed to the shell safely");
+    is($status, 0, "a path containing a quote tokenizes");
     like($out, qr/begin_unit/, "and really was tokenized");
 }

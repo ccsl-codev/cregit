@@ -51,7 +51,8 @@ HTML views land in the sibling directory `../cregit-files/html`. See
 ## Preliminaries
 
 - Code is written in Scala, C++, Rust and Perl.
-- Platform: Linux x86_64 or macOS arm64 — `devenv` builds the pinned `srcml` parser from source for those platforms (`nix/srcml.nix`). The 1.1.0 release binary segfaults under `--position`, which the pipeline always passes, and the fix is upstream but unreleased, so we pin a revision rather than a release. `srcml --version` still prints `1.1.0`.
+- Platform: Linux x86_64 or macOS arm64 — `devenv` builds the pinned `srcml`
+  1.1.0 parser from its release tag (`nix/srcml.nix`).
 
 ## Prerequisites
 
@@ -87,7 +88,7 @@ This builds, in dependency order:
 
 | artifact                                                      | module              | toolchain                 |
 | ------------------------------------------------------------- | ------------------- | ------------------------- |
-| `tokenize/srcMLtoken/srcml2token`                              | C++ transcoder      | gcc + xerces-c            |
+| `tokenize/srcMLtoken/srcml2token`                              | srcML tokenizer     | gcc + xerces-c + libsrcml |
 | `tokenize/rustTokenizer` binary                                | Rust tokenizer      | cargo                     |
 | `blobExec/target/scala-2.13/blobExec-0.1.0-assembly.jar`       | tokenization driver | sbt, JDK 21               |
 | `{slickGitLog,persons,remapCommits}/target/scala-2.10/*-one-jar.jar` | history / persons / remap tools | sbt 0.13, JDK 8 |
@@ -111,9 +112,12 @@ cd ../tokenize/srcMLtoken && make && make test
 cd ../rustTokenizer && make && make test
 
 cd ../..
+bash tests/test_token_worker.sh
 prove tests/t
 pytest -q
-tests/tokenize_gate.sh && tests/pipeline_workdir_guard.sh
+for t in tokenize_gate pipeline_workdir_guard ensure_artifacts retokenize_passthrough reblame_passthrough; do
+  bash "tests/$t.sh"
+done
 
 for module in slickGitLog persons remapCommits; do
   (cd "$module" && sbt --java-home "$LEGACY_JAVA_HOME" -batch test one-jar)
@@ -162,6 +166,20 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--memo-dir`          | where to memoize tokenized blobs; outside `--work` it survives the full-run wipe | `<work>/memo` |
 | `--mode` / `--shards` | tokenizer walk mode / shard count for `sharded`            | `pipeline` / `4`                 |
 | `--jobs`              | concurrent blame/HTML processes                            | `CREGIT_JOBS` or up to `4` CPUs  |
+| `--reblame`           | re-blame every file in step 7, replacing existing `.blame` output | off — a resume skips files already blamed |
+
+**`git blame` runs with `-C100` copy detection** (`blameRepo/formatBlame.pl`), so a
+token moved between files keeps its original author. Upstream shipped that commented
+out. Enabling it changed the author of up to 25% of a project's tokens, so blame output
+produced before 2026-09-22 is not comparable with output produced after it.
+
+**Pass `--reblame` whenever the blame itself changed**, not the file list.
+`blameRepoFiles.pl` skips any file whose `.blame` output already exists. That skip makes
+a resume cheap, and it makes a re-blame a silent no-op: step 7 reports every file as
+already done and exits 0, then step 10 rebuilds from the old blame. One pilot changed
+**0 of 15,036,195 tokens** that way, with identical row counts and `rc=0`. Read step 7's
+summary to confirm a real re-blame — `Already done [0]` is the proof. Do **not** pass the
+flag to resume an interrupted run.
 
 A full run starts by **deleting the work directory** — to keep several target
 repositories side by side, give each its own `--work`. To resume a failed run
@@ -174,18 +192,78 @@ returns without invoking `srcml` at all. Put it out of reach with `--memo-dir`,
 names neither repository nor extension). The runner refuses a step-1 wipe that
 would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 
-Four blobs in one corpus project are on a **blob denylist**
-(`blobExec/src/main/scala/cregit/blobexec/BlobDenylistEntries.scala`): srcML 1.1.0 does
-not terminate on them (upstream srcML/srcML#2361, which the revision we now pin closes,
-so the entries should be inert). They are never handed to
-the tokenizer, are dropped from the rewritten trees rather than kept as raw
-source, are counted as `blobsDenylisted` and named with a reason and a citation —
-and, unlike a tokenizer timeout, they do **not** change the exit status. Adding an
+209 blobs are on a **blob denylist**
+(`blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv`): 12 on which
+srcML 1.1.0 does not terminate (8 Java, srcML/srcML#2361; 4 C), and 197 C and C++
+blobs on which it crashes under `--position`. The file header cites each defect.
+Denylisted blobs never reach the tokenizer, are dropped from the rewritten trees,
+are counted as `blobsDenylisted`, and do **not** change the exit status. Adding an
 entry means editing that file and rebuilding the jar.
+
+A blob whose tokenizer times out or reports a parser crash is excluded the same
+way without an entry: it is named on an `EXCLUDED failed blob` line, tried once
+per run, and the run exits 0. An entry still saves the `--blob-timeout` (600 s by
+default) that a known hang costs on each run.
 
 Example run (cregit run on itself):
 ![Example cregit run](cregit.gif)
 p.s.: long pauses are trimmed.
+
+### When a tokenizer is corrected: `--retokenize`
+
+A corrected tokenizer does **not** by itself produce corrected tokens on a
+resume. blobExec decides whether to reuse a cached tokenization from the
+recorded `command` and `mask`. `command` is the constant path
+`tokenizeByBlobId/tokenBySha.pl`, and `mask` says *which* files to tokenize,
+never *how* — so rebuilding a tokenizer moves neither value, every cached row for
+that language stays a cache hit, and the run reproduces the old tokenizer's
+output and exits 0. Measured, for the Rust fix in `729643e`: 741,869 `.rs`
+(blob, path) pairs across 45 projects.
+
+Two mechanisms close that:
+
+1. **Every run reports a tokenizer identity** — one opaque digest per file
+   extension, covering that extension's whole parser toolchain
+   (`tokenize/tokenizerIdentity.pl`). blobExec records it in the blob map's
+   `meta` table and compares it on every later run. A mismatch, on an extension
+   that actually has cached rows, **refuses the run** (exit 3) and names the flag
+   to fix it. Nothing is invalidated automatically.
+2. **`--retokenize EXTS` is the opt-in past that refusal**, and it is selective:
+   re-tokenizing is 88% of total pipeline time, so a `.rs`-only defect costs
+   `.rs` entries only.
+
+To re-tokenize only the `.rs` entries of one project, after rebuilding the
+tokenizer:
+
+```sh
+# 1. make sure the binary is actually current (this also proves the identity moved)
+./run_pipeline_process.sh --ensure-artifacts
+
+# 2. resume that project at step 2 — never step 1, which deletes the work
+./run_pipeline_process.sh \
+  --repo-url <url> --repo-name <name> \
+  --work ../cregit-files-<name> \
+  --retokenize rs \
+  2
+```
+
+`--retokenize` needs `FROM_STEP=2` exactly: step 1 deletes the work directory
+(so there would be nothing cached to invalidate) and step 3 or later skips the
+invalidation entirely. It is not available with `--mode sharded`.
+
+What it does, in one transaction: drops the `blob_map` rows for those extensions,
+purges **their entries in the memo** (which is keyed on `sha1` of the file's
+content with no tokenizer in the key, so dropping only the `blob_map` row would
+let the memo answer with the same stale tokens), and drops `tree_map`,
+`commit_map` and `ref_map` because a tree names its blobs. Every other
+extension's tokenizations survive.
+
+It cannot quietly do nothing. blobExec refuses, **before changing anything**, if
+no cached row carries a named extension, if the memo held none of the affected
+blobs (which means `--memo-dir` is not this project's), if another extension's
+tokenizer also changed and was not named, or if a retained `new_blob` id is
+missing from the cregit repository. An ineffective `--retokenize` exits 7, never
+0.
 
 ### Outputs
 
