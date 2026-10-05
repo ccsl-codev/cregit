@@ -6,10 +6,7 @@ import org.scalatest.matchers.should.Matchers
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
 
-/** The memo layout has to match tokenizeByBlobId/tokenBySha.pl exactly, and the
-  * two are written in different languages, so the agreement is asserted rather
-  * than assumed. A silent disagreement here would look like a successful
-  * invalidation that purged nothing. */
+/** The memo layout must match tokenizeByBlobId/tokenBySha.pl byte for byte. */
 class TokenizerMemoSpec extends AnyFunSuite with Matchers {
 
   private def withTempDir[A](body: Path => A): A = {
@@ -38,15 +35,12 @@ class TokenizerMemoSpec extends AnyFunSuite with Matchers {
     val sha = "56f54d1636dfec63c3e1586e5e4bdc9a455bb9f6"
     TokenizerMemo.relativePathFor(sha) shouldEqual
       "56/f5/56f54d1636dfec63c3e1586e5e4bdc9a455bb9f6"
-    // Both halves come from the FRONT of the sha (substr 0,2 then 2,2), which is
-    // easy to get wrong as 0,2 then -2.
+    // Both halves from the front (substr 0,2 then 2,2), not 0,2 then -2.
     TokenizerMemo.relativePathFor(sha) should startWith("56/f5/")
   }
 
   test("sha1Hex agrees with perl's Digest::SHA on bytes perl might mangle") {
-    // The real inputs are arbitrary source bytes, including CRLF and high bytes.
-    // Perl reads the blob from stdin and hashes it; if either side treated the
-    // bytes as text the keys would diverge for exactly those files.
+    // If either side hashed text rather than bytes, CRLF and non-ASCII keys would diverge.
     val perl = Option(System.getenv("PATH")).toVector
       .flatMap(_.split(java.io.File.pathSeparator))
       .map(p => Path.of(p, "perl"))
@@ -104,8 +98,6 @@ class TokenizerMemoSpec extends AnyFunSuite with Matchers {
 
       Files.exists(TokenizerMemo.entryFor(root,
         TokenizerMemo.sha1Hex(contents("blob-rs-1").getBytes(UTF_8)))) shouldBe false
-      // The whole point of being selective: the C entry is still a valid
-      // tokenization and re-doing it would cost 88% of the pipeline for nothing.
       Files.exists(TokenizerMemo.entryFor(root,
         TokenizerMemo.sha1Hex(contents("blob-c-1").getBytes(UTF_8)))) shouldBe true
     }

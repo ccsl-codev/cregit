@@ -105,19 +105,14 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
   def setMeta(key: String, value: String): Unit =
     Mapping.execute(insMeta, key, value)
 
-  /** The tokenizer identity recorded for `extension`, if any. */
   def storedTokenizerId(extension: String): Option[String] =
     getMeta(Mapping.TokenizerIdKeyPrefix + extension)
 
   def setTokenizerId(extension: String, value: String): Unit =
     setMeta(Mapping.TokenizerIdKeyPrefix + extension, value)
 
-  /** Every extension whose recorded tokenizer identity differs from `identity`.
-    *
-    * An extension with nothing recorded is NOT a change: it is a map written
-    * before identities were recorded at all, which describes every blob map on
-    * this machine today. Treating that as a change would refuse all 188
-    * projects at once and say nothing true. */
+  /** Extensions whose recorded identity differs from `identity`. Nothing recorded
+    * is not a change: older maps carry no identity at all. */
   def tokenizerIdentityChanges(identity: TokenizerIdentity): Vector[Mapping.IdentityChange] =
     identity.byExtension.toVector.sorted.flatMap { case (ext, requested) =>
       storedTokenizerId(ext) match {
@@ -127,28 +122,13 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
       }
     }
 
-  /** The subset of [[tokenizerIdentityChanges]] that can actually poison this run:
-    * the extensions whose tokenizer moved AND which have cached tokenizations to
-    * reuse.
-    *
-    * The filter is not an optimisation, it is what keeps the mechanism usable. The
-    * pipeline reports one identity per extension it can parse, for every project,
-    * because the identity is a property of the checkout and not of the project. A
-    * Java-only project therefore carries a `c` identity it has no rows for — and
-    * refusing that project because the C toolchain changed would be a refusal with
-    * no remedy: `--retokenize=c` would then fail too, correctly, with "no tokenized
-    * row carries that extension". A deadlock where the only way forward is to
-    * delete the work.
-    *
-    * With no rows there is nothing to serve from cache, so the new identity is
-    * simply recorded: whatever gets tokenized from now on is tokenized by the
-    * tokenizer that is recorded. */
+  /** The changed extensions that also have cached tokenizations. Refusing one
+    * with no rows would deadlock: `--retokenize` of it fails too, as a no-op. */
   def cachePoisoningIdentityChanges(identity: TokenizerIdentity): Vector[Mapping.IdentityChange] =
     tokenizerIdentityChanges(identity)
       .filter(c => countTokenizedRowsForExtensions(Set(c.extension)) > 0L)
 
-  /** How many TOKENIZED rows sit on a path with one of these extensions. Zero is
-    * what makes a `--retokenize` request a no-op, and a no-op has to fail. */
+  /** Zero makes a `--retokenize` request a no-op, and a no-op has to fail. */
   def countTokenizedRowsForExtensions(extensions: Set[String]): Long = {
     val st = conn.createStatement()
     try {
@@ -159,14 +139,8 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     } finally st.close()
   }
 
-  /** The distinct ORIGINAL blob ids of the tokenized rows for these extensions.
-    * Distinct because the memo is keyed on content, so the same blob reached
-    * under two paths is one memo entry, and hashing it twice is wasted reads.
-    *
-    * Materialised rather than streamed: the caller hands the whole vector to the
-    * memo purge, which must complete before anything is deleted from the map.
-    * The corpus figure is 741,869 rows for a `.rs` invalidation, which is a
-    * vector of 40-character strings — tens of megabytes, not gigabytes. */
+  /** Distinct, because the memo is keyed on content: one blob under two paths is
+    * one memo entry. */
   def tokenizedOrigBlobsForExtensions(extensions: Set[String]): Vector[String] = {
     val st = conn.createStatement()
     try {
@@ -196,7 +170,6 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     } finally st.close()
   }
 
-  /** How many blob_map rows satisfy `predicate`. */
   private def countWhere(predicate: String): Long = {
     val st = conn.createStatement()
     try {
@@ -205,7 +178,6 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     } finally st.close()
   }
 
-  /** Row counts of the four maps, for the mask-widening report. */
   def rowCounts: Mapping.RowCounts = {
     def one(sql: String): Long = {
       val st = conn.createStatement()
@@ -223,27 +195,8 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     )
   }
 
-  /** The first `blob_map` path of a TOKENIZED row (orig_blob <> new_blob) that
-    * `newMask` no longer selects, or None when every one still matches.
-    *
-    * Restricted to tokenized rows on purpose, and that restriction is the whole
-    * correctness argument. `blob_map` also holds IDENTITY rows (orig == new) for
-    * every blob the walker merely passed through — `README.md`, `CMakeLists.txt`,
-    * a `.pdf` — written by Walker's `unchangedBlobs`. Those paths match no mask
-    * that ever existed, so a check over all rows refuses every project on this
-    * machine (measured: 198 of 198). A tokenized row, by contrast, exists only
-    * because the old mask selected its path, so "does the new mask still select
-    * it?" is exactly the superset question, asked of the data rather than of two
-    * regexes.
-    *
-    * Matched against the BASENAME, because that is what Walker matches
-    * (`fileMask.findFirstIn(tw.getNameString)`). Anchoring makes the two
-    * equivalent for every mask this pipeline has used, but replicating the
-    * walker is the point: the check must answer what the walker will do, not
-    * what a reader assumes it does.
-    *
-    * Streams the result set rather than materialising it: torvalds__linux holds
-    * 2.7 M tokenized rows. */
+  /** The first tokenized-row path `newMask` no longer selects. Identity rows are
+    * skipped: their paths match no mask. Matched on the basename, as Walker does. */
   def firstPathNarrowedBy(newMask: Regex): Option[String] = {
     val st = conn.createStatement()
     try {
@@ -259,16 +212,12 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     } finally st.close()
   }
 
-  /** Up to `size` (path, new_blob) pairs from the TOKENIZED rows, spread across
-    * the table rather than taken from its head, so the sample is not confined to
-    * whatever the first commit happened to touch. Deterministic: the same DB
-    * gives the same sample, so a refusal is reproducible. */
+  /** Up to `size` tokenized (path, new_blob) pairs, spread across the table and
+    * deterministic, so a refusal is reproducible. */
   def sampleTokenizedNewBlobs(size: Int, excludeExtensions: Set[String] = Set.empty): Vector[(String, String)] = {
     require(size > 0, "sample size must be positive")
-    // The probe must ask about the rows that will be KEPT. Under --retokenize the
-    // rows for the named extensions are about to be deleted, and their new_blob
-    // ids may legitimately have been garbage-collected out of dst already; asking
-    // about those would refuse a correct invalidation.
+    // Skip rows --retokenize is about to delete: their new_blob may already be
+    // gone from dst.
     val keep =
       if (excludeExtensions.isEmpty) Mapping.TokenizedPredicate
       else s"${Mapping.TokenizedPredicate} AND NOT ${Mapping.extensionPredicate(excludeExtensions)}"
@@ -293,31 +242,9 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     } finally st.close()
   }
 
-  /** Discard everything a wider mask invalidates and record the new mask.
-    *
-    * Four deletions, in one transaction, each for its own reason:
-    *
-    *  - `commit_map`: a commit names a tree, and every tree gains entries, so
-    *    every rewritten commit id changes.
-    *  - `ref_map`: its rows name commits. The FK cascades from `commit_map`, but
-    *    deleting it explicitly means this does not depend on a per-connection
-    *    pragma being on.
-    *  - `tree_map`: trees gain entries.
-    *  - `blob_map` IDENTITY rows only. This is the load-bearing one. An identity
-    *    row says "this path was not selected, so its bytes pass through". Under a
-    *    wider mask some of those paths ARE selected now, and `getBlob` would
-    *    serve the identity row as a cache hit — putting RAW SOURCE into the
-    *    tokenized repository, invisibly, for exactly the files this widening
-    *    exists to tokenize. Measured on this corpus: 456,363 such rows across 88
-    *    of 198 projects. Identity rows on still-unselected paths are never read
-    *    (`getBlob` is only called inside the mask branch), so dropping all of
-    *    them is free and re-inserting them is a walk, not a tokenize.
-    *
-    * What survives is every row where orig_blob <> new_blob: a real
-    * tokenization, keyed by (blob, path), so same content and same extension and
-    * therefore same language and same tokens. That is 94.4% of the work.
-    *
-    * Returns the counts before and after, for the caller to report. */
+  /** Drop commit, ref and tree maps and the identity blob rows, which a wider mask
+    * would otherwise serve as cache hits of raw source, and record the new mask.
+    * ref_map is deleted explicitly, not left to the per-connection FK pragma. */
   def applyMaskWidening(oldMask: String, newMask: String, atEpochSeconds: Long): Mapping.WideningResult = {
     val before = rowCounts
     inTx {
@@ -335,35 +262,9 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     Mapping.WideningResult(before, rowCounts)
   }
 
-  /** Discard everything a changed tokenizer invalidates for `extensions`, and
-    * record the new identity for them.
-    *
-    * Four deletions and the identity update, in ONE transaction, because a
-    * partially invalidated map is worse than either a stale one or a clean one:
-    * it is a state no flag describes and no later run can detect.
-    *
-    *  - `blob_map` TOKENIZED rows for these extensions. These are the poisoned
-    *    entries: same bytes, same path, but produced by the tokenizer that has
-    *    since been corrected.
-    *  - `tree_map`. A tree names the blobs under it, so a tree containing a
-    *    re-tokenized file has a different id; and a retained `tree_map` row
-    *    short-circuits the re-walk of that whole subtree (buildTreePlan consults
-    *    `getTree` before it looks at anything below), so keeping it would leave
-    *    the tree pointing at the old token blob and invalidate nothing.
-    *  - `commit_map`, because commits name trees, and `ref_map`, because refs
-    *    name commits. ref_map would cascade from commit_map's FK, but only if the
-    *    per-connection pragma is on, so it is deleted explicitly.
-    *
-    * What survives is every tokenized row for every OTHER extension. That is the
-    * whole point: re-tokenizing a corpus costs 88% of total pipeline time, and a
-    * `.rs`-only defect has no business touching the C work. Trees and commits are
-    * rebuilt by a walk, which is the cheap part.
-    *
-    * Identity pass-through rows (orig == new) are kept. They record "this path was
-    * not selected, its bytes pass through", the mask has not changed here, and so
-    * the same paths are still not selected. (That is exactly the case
-    * `--mask-widened` must handle differently, which is why the two flags refuse
-    * to run together.) */
+  /** Drop the tokenized blob rows for `extensions` plus tree, commit and ref maps,
+    * and record the new identity, in one transaction: a partial invalidation is
+    * undetectable. Identity rows stay, because the mask has not changed. */
   def applyRetokenize(
       extensions: Set[String],
       identity: TokenizerIdentity,
@@ -383,9 +284,8 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
           s"DELETE FROM blob_map WHERE ${Mapping.TokenizedPredicate} " +
             s"AND ${Mapping.extensionPredicate(extensions)}")
       } finally st.close()
-      // Every extension the run knows about gets its identity recorded, not just
-      // the invalidated ones: an extension with nothing recorded is a hole the
-      // next run cannot detect a change through.
+      // Record every extension, not only the invalidated ones: an unrecorded one
+      // is a hole the next run cannot detect a change through.
       identity.byExtension.foreach { case (ext, value) =>
         if (extensions.contains(ext) || storedTokenizerId(ext).isEmpty) setTokenizerId(ext, value)
       }
@@ -426,72 +326,35 @@ object Mapping {
   /** Mismatch between the recorded command/mask and the values passed in. */
   final class MetaMismatchException(message: String) extends RuntimeException(message)
 
-  /** `--mask-widened` was passed but the new mask does not select something the
-    * old one did, so it is not a widening. Distinct from MetaMismatchException
-    * because the cause is different — the flag was given and the data refused it,
-    * rather than the flag being absent — but Main maps both to exit 3, which
-    * already means "this memo does not match this run". */
+  /** `--mask-widened` was passed but the new mask is not a widening. */
   final class MaskNarrowedException(message: String) extends RuntimeException(message)
 
-  /** `--mask-widened` was passed and the map is reusable, but the `new_blob` ids
-    * it holds do not resolve in dst, so reusing it would dangle every reference. */
+  /** Reusing the map would dangle: its `new_blob` ids do not resolve in dst. */
   final class DanglingNewBlobException(message: String) extends RuntimeException(message)
 
-  /** A recorded tokenizer identity does not match this run's, and the operator
-    * did not ask for the affected entries to be invalidated. Reusing them would
-    * reproduce the tokens of the tokenizer that has since been corrected —
-    * silently, because nothing downstream can tell one token stream from
-    * another. Same exit status as a meta mismatch (3): the cause is the same
-    * class of thing, "this memo does not match this run". */
+  /** A recorded tokenizer identity changed and `--retokenize` did not name it. */
   final class TokenizerChangedException(message: String) extends RuntimeException(message)
 
-  /** `--retokenize` was passed and would have invalidated nothing.
-    *
-    * This exception is the whole safety property of the flag. An invalidation
-    * that quietly invalidates nothing and exits 0 is indistinguishable, in a log,
-    * from one that worked — and the operator then publishes a dataset believing
-    * the defect is out of it. Every path that reaches "nothing changed" raises
-    * this instead of returning. */
+  /** `--retokenize` would invalidate nothing; exiting 0 would look like success. */
   final class NothingInvalidatedException(message: String) extends RuntimeException(message)
 
-  /** A recorded identity that differs from the one this run reports. */
   final case class IdentityChange(extension: String, stored: String, requested: String)
 
-  /** What distinguishes a real tokenization from a pass-through. A tokenized row
-    * exists only because the mask selected its path; an identity row exists
-    * because it did not. Every decision in the mask-widening path turns on this
-    * one predicate, so it is written once. */
   private[blobexec] val TokenizedPredicate = "orig_blob <> new_blob"
 
-  /** meta keys recording that a widening happened, so the provenance of a reused
-    * blob_map is in the database rather than only in a log. */
   private[blobexec] val MaskWidenedFromKey = "mask_widened_from"
   private[blobexec] val MaskWidenedAtKey   = "mask_widened_at"
 
-  /** meta key prefix for the per-extension tokenizer identity: one row per
-    * extension, `tokenizer_id.rs`, `tokenizer_id.c`. Per extension rather than
-    * one combined value, because `--retokenize` has to be able to invalidate one
-    * language without disturbing the recorded state of the others. */
+  /** One meta row per extension, so `--retokenize` can invalidate one language. */
   private[blobexec] val TokenizerIdKeyPrefix = "tokenizer_id."
 
-  /** meta keys recording that an invalidation happened, and what it replaced, so
-    * a reused blob map carries its own provenance. */
   private[blobexec] val RetokenizedAtKey         = "retokenized_at"
   private[blobexec] val RetokenizedExtensionsKey = "retokenized_extensions"
   private[blobexec] val RetokenizedFromKey       = "retokenized_from"
 
-  /** "Does this path carry one of these extensions?", as SQL.
-    *
-    * `lower(path) LIKE '%.rs'` rather than a suffix computed in Scala, so the
-    * whole selection stays one statement over a table that holds 2.7 M rows for
-    * the largest project. Case-insensitive because the mask is (`(?i)` in
-    * CregitLanguages::file_mask) and `.C` and `.H` are real files in this corpus.
-    *
-    * The dot is part of the pattern, which is what stops `.c` from selecting
-    * `.cc` and `.cpp`. There is nothing to escape: [[TokenizerIdentity]] admits
-    * only `[a-z0-9+]+`, an alphabet with no quote, no `%` and no `_`. The require
-    * is there so that stays true if a future caller builds the set some other
-    * way. */
+  /** SQL for "path has one of these extensions", case-insensitive like the mask.
+    * The dot stops `.c` from matching `.cc`; TokenizerIdentity's alphabet leaves
+    * nothing to escape. */
   private[blobexec] def extensionPredicate(extensions: Set[String]): String = {
     require(extensions.nonEmpty, "extensionPredicate needs at least one extension")
     extensions.foreach(e => require(
@@ -500,10 +363,7 @@ object Mapping {
     extensions.toVector.sorted.map(e => s"lower(path) LIKE '%.$e'").mkString("(", " OR ", ")")
   }
 
-  /** How many `new_blob` ids to probe in dst. Every retained row's id must exist
-    * there, but reading 2.7 M of them is minutes of object lookup before the walk
-    * starts; a spread sample catches the failure this guards against, which is a
-    * dst that was wiped or never written, not one blob gone missing. */
+  /** A sample, not all 2.7 M ids: it guards against a wiped dst, not one lost blob. */
   private[blobexec] val ReachabilitySampleSize = 256
 
   final case class RowCounts(blobTokenized: Long, blobIdentity: Long, tree: Long,
@@ -518,26 +378,9 @@ object Mapping {
       blobsInvalidated: Long,
       memo: TokenizerMemo.PurgeReport)
 
-  /** The opt-in behind `--retokenize`, and the four things it has to be given.
-    *
-    * `extensions` is what makes it surgical. Re-tokenizing a corpus is 88% of
-    * total pipeline time, so a defect in one language's tokenizer must invalidate
-    * one language's entries.
-    *
-    * `newBlobResolves` answers "does this object id exist in dst?", for the rows
-    * that are KEPT. Not optional and with no default, for the same reason as in
-    * [[MaskWidening]]: `blob_map`'s `new_blob` ids live in dst and nowhere else.
-    *
-    * `purgeMemo` is handed the original blob ids being invalidated and must delete
-    * their entries from the content-addressed memo. It is not optional either, and
-    * that is the point: the memo is keyed on `sha1(contents)` alone
-    * (tokenizeByBlobId/tokenBySha.pl:76), with no tokenizer in the key, so
-    * dropping a `blob_map` row on its own just moves the stale answer one layer
-    * down. Two layers, one flag, no way to do one without the other.
-    *
-    * `report` receives the human-readable account of what was invalidated and
-    * what was kept. Injected so the decision is testable without capturing
-    * stdout. */
+  /** Opt-in for `--retokenize`. `purgeMemo` is mandatory: the memo is keyed on
+    * contents alone (tokenBySha.pl), so dropping only blob_map rows would serve
+    * the stale tokens from one layer down. */
   final case class Retokenize(
       extensions: Set[String],
       newBlobResolves: String => Boolean,
@@ -613,41 +456,21 @@ object Mapping {
     } finally st.close()
   }
 
-  /** The opt-in behind `--mask-widened`, and the two things it has to be given.
-    *
-    * `newBlobResolves` answers "does this object id exist in dst?". It is not
-    * optional and has no default, because `blob_map`'s `new_blob` ids live in
-    * dst and nowhere else: reusing the map against a dst that was wiped, or was
-    * never written, leaves every retained reference dangling and the failure
-    * surfaces as a corrupt repository several steps later. A default would let a
-    * caller skip the check by forgetting about it.
-    *
-    * `report` receives the human-readable account of what was kept and what was
-    * dropped. Injected so the decision is testable without capturing stdout. */
+  /** Opt-in for `--mask-widened`. `newBlobResolves` has no default: `new_blob` ids
+    * live only in dst, and a wiped dst would dangle every reused row. */
   final case class MaskWidening(newBlobResolves: String => Boolean,
                                 report: String => Unit,
                                 nowEpochSeconds: () => Long = () => System.currentTimeMillis() / 1000L,
                                 sampleSize: Int = ReachabilitySampleSize)
 
-  /** Open/create the SQLite DB at `path` (schema created if absent) and validate
-    * `command`/`mask` against `meta`: mismatch throws MetaMismatchException,
-    * absence records them.
-    *
-    * `maskWidening` is the ONLY way past the mask refusal, and it is deliberately
-    * narrow. `command` is still checked exactly as before: a different tokenizer
-    * means different tokens for the same bytes, and no amount of mask reasoning
-    * covers that. */
+  /** Open/create the DB at `path` and check `command`/`mask` against `meta`.
+    * `maskWidening` relaxes only the mask check, never the command check. */
   def open(path: Path, command: String, mask: String, warm: Option[Path] = None,
            maskWidening: Option[MaskWidening] = None,
            tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
            retokenize: Option[Retokenize] = None): Mapping = {
-    // Refused rather than composed. Both invalidations are verified against the
-    // rows before they touch anything, and running them together would mean
-    // verifying each against a state the other was about to change: a widening
-    // decides what to do with identity rows on the assumption the tokenizations
-    // are valid, and an invalidation decides which tokenizations to drop on the
-    // assumption the mask has not moved. One at a time, each with its own
-    // verified report, and the second run is a resume.
+    // Refused, not composed: each invalidation is verified against a state the
+    // other would change. Run one, then the other as a resume.
     require(!(maskWidening.isDefined && retokenize.isDefined),
       "--mask-widened and --retokenize cannot be used in the same run: each verifies its own " +
         "precondition against the rows, and together each would be verifying against a state the " +
@@ -681,8 +504,7 @@ object Mapping {
       case Some(w) => widenOrCheckMask(m, mask, w)
       case None    => checkOrSetMeta(m, "mask", mask)
     }
-    // Last, because it is the only check that can delete rows, and it must not do
-    // so against a map whose command or mask this run has already refused.
+    // Last: the only check that deletes rows must not run on a refused map.
     retokenize match {
       case Some(r) => retokenizeOrRefuse(m, tokenizerIdentity, r)
       case None    => if (tokenizerIdentity.nonEmpty) checkOrRecordTokenizerIdentity(m, tokenizerIdentity)
@@ -690,55 +512,21 @@ object Mapping {
     m
   }
 
-  /** The default path: record what is not recorded yet, and refuse if anything
-    * recorded disagrees.
-    *
-    * Refusing is not the same thing as invalidating, and the distinction is the
-    * whole reason this is safe to make the default. Nothing is deleted here. The
-    * 186 already-published projects are untouched — a project that is never run
-    * again is never refused either — and a project that IS re-run with a changed
-    * tokenizer stops instead of quietly reproducing the old tokens.
-    *
-    * An extension with nothing recorded is not a change. That is what every blob
-    * map in this corpus looks like today, and calling it a change would refuse
-    * every project at once on the strength of no evidence at all. */
+  /** Record identities not yet recorded; refuse on a recorded mismatch. Deletes
+    * nothing, so a re-run with a changed tokenizer stops instead of reusing. */
   private def checkOrRecordTokenizerIdentity(m: Mapping, identity: TokenizerIdentity): Unit = {
     val changes = m.cachePoisoningIdentityChanges(identity)
     if (changes.nonEmpty) throw new TokenizerChangedException(tokenizerChangedMessage(changes))
-    // Nothing recorded yet, or recorded but with no rows to poison: record the
-    // current value either way. Leaving an extension unrecorded is the hole this
-    // whole mechanism exists to close, and leaving a superseded value in place for
-    // an extension with no rows would refuse the next run for no reason.
+    // Also overwrite a superseded value with no rows behind it, or it would
+    // refuse the next run for no reason.
     identity.byExtension.foreach { case (ext, value) =>
       if (!m.storedTokenizerId(ext).contains(value)) m.setTokenizerId(ext, value)
     }
   }
 
-  /** The `--retokenize` path. Five outcomes, in this order, and the order is the
-    * safety property: nothing is deleted until every check has passed.
-    *
-    *  1. A changed tokenizer the flag did not name: refuse, naming it. Invalidating
-    *     the named extensions first and then refusing would leave a map no flag
-    *     describes — part redone under a new tokenizer, part stale, and the
-    *     recorded identity a mixture of both.
-    *  2. No tokenized row carries any of the named extensions: refuse. This is the
-    *     no-op case, and a no-op that exits 0 is the failure this flag exists to
-    *     prevent.
-    *  3. A sampled `new_blob` of a RETAINED row does not resolve in dst: refuse.
-    *     Those ids live only there, so the map is reusable only alongside it.
-    *  4. The memo purge. It runs BEFORE the transaction because the two failure
-    *     directions are not symmetric: a memo entry deleted for nothing costs one
-    *     tokenizer invocation, a memo entry kept serves the stale tokens the whole
-    *     exercise is meant to remove. If the purge throws, nothing has been
-    *     invalidated and the run stops.
-    *  5. The purge found no entries at all: refuse. With a non-empty blob_map the
-    *     tokenized rows were produced by tokenBySha.pl, which memoizes every one
-    *     of them, so "none of them are in this directory" means the directory is
-    *     not the memo — and the real memo would answer the re-tokenization with
-    *     the stale tokens.
-    *
-    * Only after all five does anything change, and then it changes in one
-    * transaction. */
+  /** Refuse an unnamed change, a no-op, a dangling dst sample, or a purge that
+    * found nothing. The purge runs before the transaction: a needless purge costs
+    * a re-tokenize, a skipped one serves stale tokens. */
   private def retokenizeOrRefuse(m: Mapping, identity: TokenizerIdentity, r: Retokenize): Unit = {
     val uncovered = m.cachePoisoningIdentityChanges(identity).filterNot(c => r.extensions.contains(c.extension))
     if (uncovered.nonEmpty)
@@ -821,18 +609,8 @@ object Mapping {
       "extension's tokenizations, and requires --memo-dir and a step-2 resume."
   }
 
-  /** The `--mask-widened` path. Four outcomes, in this order, and the order is
-    * the safety property: nothing is written until both checks have passed.
-    *
-    *  1. No stored mask (a fresh DB): record it. Nothing to reuse, nothing to
-    *     check — the flag is a no-op and says so.
-    *  2. Stored mask equals the new one: an ordinary resume. The flag is a no-op.
-    *  3. A tokenized row's path is no longer selected: this is a NARROWING, not a
-    *     widening. Refuse, naming the path, having written nothing.
-    *  4. A sampled `new_blob` does not resolve in dst: refuse, naming it, having
-    *     written nothing.
-    *
-    * Only after 3 and 4 both pass does anything change. */
+  /** No stored mask or an equal one: no-op. Otherwise refuse a narrowing or a
+    * dangling dst sample before writing anything. */
   private def widenOrCheckMask(m: Mapping, mask: String, w: MaskWidening): Unit =
     m.getMeta("mask") match {
       case None =>

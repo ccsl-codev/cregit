@@ -13,9 +13,6 @@ import org.scalatest.matchers.should.Matchers
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
 
-/** A blob whose tokenizer times out or crashes is excluded from the rewritten
-  * tree, like a denylisted blob: the walk carries on, the other blobs keep their
-  * tokens, and the run is not aborted. */
 class FailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   private val workRoot: Path = Files.createTempDirectory("failed-blob-")
@@ -125,8 +122,6 @@ class FailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
       } finally m.close()
     }
   }
-
-  // -- helpers ---------------------------------------------------------------
 
   private def blobIdAt(repo: Repository, commitId: ObjectId, path: String): ObjectId = {
     val rw = new RevWalk(repo)

@@ -5,14 +5,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.nio.file.{Files, Path}
 
-/** Tokenizer-identity recording, the refusal it makes possible, and the
-  * `--retokenize` invalidation, at the level of the blob map itself.
-  *
-  * The defect these exist for: `Mapping.open` decided reuse on `command` and
-  * `mask`, and `command` is the constant path `tokenizeByBlobId/tokenBySha.pl`.
-  * Correcting the Rust tokenizer (729643e) therefore changed nothing either
-  * check looks at, every cached `.rs` row stayed a hit, and a run with the fixed
-  * binary reproduced the broken tokens. */
+/** Tokenizer-identity recording, refusal and `--retokenize`, at the blob-map level. */
 class RetokenizeSpec extends AnyFunSuite with Matchers {
 
   private val cmd  = "/bin/cat"
@@ -38,9 +31,7 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
     }
   }
 
-  /** A blob map that looks like a finished run: two tokenized `.rs` rows, two
-    * tokenized `.c` rows, one identity (pass-through) row, and the tree, commit
-    * and ref rows above them. */
+  /** A finished run: two `.rs` rows, two `.c` rows and one identity row. */
   private def seed(db: Path, identity: TokenizerIdentity): Unit = {
     val m = Mapping.open(db, cmd, mask, tokenizerIdentity = identity)
     try {
@@ -76,8 +67,6 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
   private val emptyMemo: Vector[String] => TokenizerMemo.PurgeReport =
     blobs => TokenizerMemo.PurgeReport(blobs.size.toLong, 0L, blobs.size.toLong, 0L)
 
-  // -- recording and refusing ------------------------------------------------
-
   test("an identity absent from meta is recorded, so the first run establishes it") {
     withDb { db =>
       seed(db, id("rs" -> rustV1, "c" -> cV1))
@@ -104,13 +93,11 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
       val ex = intercept[Mapping.TokenizerChangedException] {
         Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV2, "c" -> cV1))
       }
-      // An operator has to be able to act on it without reading this source.
       ex.getMessage should include("rs")
       ex.getMessage should include(rustV1)
       ex.getMessage should include(rustV2)
       ex.getMessage should include("--retokenize=rs")
-      // The extension whose tokenizer did NOT change must not be named, or the
-      // hint tells the operator to throw away work that is still valid.
+      // Naming the unchanged extension would tell the operator to discard valid work.
       ex.getMessage should not include "--retokenize=c,rs"
     }
   }
@@ -130,8 +117,7 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
   }
 
   test("no identity passed at all leaves behaviour exactly as it was") {
-    // The 186 already-published projects must not become refusals or
-    // invalidations because this mechanism now exists.
+    // Already-published projects must not start refusing.
     withDb { db =>
       seed(db, TokenizerIdentity.empty)
       val m = Mapping.open(db, cmd, mask)
@@ -143,12 +129,8 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
   }
 
   test("a changed identity for an extension with no cached rows is recorded, not refused") {
-    // The pipeline reports one identity per extension the checkout can parse, for
-    // every project, because the identity describes the checkout and not the
-    // project. A Java-only project carries a `c` identity it has no rows for.
-    // Refusing it when the C toolchain moves would be a refusal with no remedy:
-    // --retokenize=c would then fail too, correctly, for having nothing to
-    // invalidate. Nothing can be served from a cache with no entries.
+    // Every project gets an identity for every extension the checkout parses, so a
+    // refusal here would have no remedy: --retokenize would have nothing to drop.
     withDb { db =>
       seed(db, id("rs" -> rustV1, "java" -> "9999999999999999"))
       val m = Mapping.open(db, cmd, mask,
@@ -172,8 +154,6 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
     }
   }
 
-  // -- the invalidation ------------------------------------------------------
-
   test("--retokenize drops only the named extension's tokenized rows") {
     withDb { db =>
       seed(db, id("rs" -> rustV1, "c" -> cV1))
@@ -182,11 +162,9 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
         tokenizerIdentity = id("rs" -> rustV2, "c" -> cV1),
         retokenize = Some(retokenize(Set("rs"), report = s => reported = s)))
       try {
-        // The assertion the whole flag exists for.
         m.getBlob("rsblob1", "src/one.rs") shouldBe None
         m.getBlob("rsblob2", "src/two.rs") shouldBe None
-        // And the assertion that makes it worth having rather than --drop-memo:
-        // the C tokenizations, which are 88% of the pipeline's time, are intact.
+        // The C rows survive: what makes this cheaper than --drop-memo.
         m.getBlob("cblob1", "src/one.c") shouldBe Some("newc1")
         m.getBlob("cblob2", "lib/two.h") shouldBe Some("newc2")
         m.storedTokenizerId("rs") shouldBe Some(rustV2)
@@ -203,9 +181,7 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
         tokenizerIdentity = id("rs" -> rustV2),
         retokenize = Some(retokenize(Set("rs"))))
       try {
-        // A retained tree_map row would short-circuit the re-walk of the subtree
-        // holding the .rs file, and the tree would keep pointing at the old
-        // token blob — a cache invalidation that invalidates nothing.
+        // A retained tree_map row would skip the re-walk and keep the old token blob.
         m.getTree("tree1") shouldBe None
         m.getCommit("commit1") shouldBe None
         m.getRef("refs/heads/master") shouldBe None
@@ -236,9 +212,8 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
         })))
       try {
         purged.sorted shouldEqual Vector("rsblob1", "rsblob2")
-        // The memo is keyed on sha1(contents) with no tokenizer in the key
-        // (tokenBySha.pl:76), so a dropped blob_map row alone would be answered
-        // by the memo with the same stale tokens.
+        // The memo key has no tokenizer in it (tokenBySha.pl:76), so it would
+        // serve the same stale tokens.
         purged should not contain "cblob1"
       } finally m.close()
     }
@@ -272,7 +247,6 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
       }
       ex.getMessage should include("--memo-dir")
       ex.getMessage should include("$BFG_MEMO_DIR")
-      // And it changed nothing.
       val m = Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV1))
       try m.getBlob("rsblob1", "src/one.rs") shouldBe Some("newrs1")
       finally m.close()
@@ -314,8 +288,6 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
     }
   }
 
-  // -- the ways it must refuse rather than no-op -----------------------------
-
   test("--retokenize on an extension with no tokenized rows refuses, it does not exit quietly") {
     withDb { db =>
       seed(db, id("rs" -> rustV1, "java" -> "cccccccccccccccc"))
@@ -325,7 +297,6 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
           retokenize = Some(retokenize(Set("java"))))
       }
       ex.getMessage should include("java")
-      // Nothing was dropped on the way to discovering it.
       val m = Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV1))
       try {
         m.rowCounts.blobTokenized shouldEqual 4L
@@ -343,9 +314,7 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
           retokenize = Some(retokenize(Set("rs"))))
       }
       ex.getMessage should include("c")
-      // If this had invalidated .rs and then refused, the map would be in a state
-      // no flag describes: .rs redone under a new tokenizer, .c stale, and the
-      // recorded identity a mixture. Half a cache invalidation is a corruption.
+      // Invalidating .rs and then refusing would leave a half-invalidated map.
       val m = Mapping.open(db, cmd, mask, tokenizerIdentity = id("rs" -> rustV1, "c" -> cV1))
       try {
         m.getBlob("rsblob1", "src/one.rs") shouldBe Some("newrs1")
@@ -399,8 +368,6 @@ class RetokenizeSpec extends AnyFunSuite with Matchers {
       } finally m.close()
     }
   }
-
-  // -- selection details -----------------------------------------------------
 
   test("extensions are matched case-insensitively, as the mask is") {
     withDb { db =>

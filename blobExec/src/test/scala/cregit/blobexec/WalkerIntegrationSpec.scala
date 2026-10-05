@@ -87,8 +87,6 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       // exercised by accident. The denylist tests pass their own.
       denylist: BlobDenylist = BlobDenylist.empty,
       maskWidened: Boolean = false,
-      // Empty by default so every test written before the tokenizer-identity
-      // mechanism existed keeps its exact previous behaviour.
       tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
       retokenizeExtensions: Set[String] = Set.empty,
       memoDir: Option[Path] = None
@@ -671,18 +669,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
 
 
   // -- large pass-through blob (regression) ----------------------------------
-  //
-  // redis/redis failed after 1,684s of real work with:
-  //   org.eclipse.jgit.errors.LargeObjectException: 12e1ac54... exceeds size limit
-  //     at cregit.blobexec.Walker.ensureOriginalBlobAvailable
-  //
-  // A blob that does not match the mask is copied verbatim, so its size is
-  // whatever the project committed, not the size of a source file.
-  // ObjectLoader.getBytes refuses anything above JGit's stream threshold, so the
-  // copy path must stream instead of materialising.
-  //
-  // The threshold is lowered here so a small blob reproduces it in milliseconds
-  // rather than needing a 50 MB fixture.
+  // getBytes refuses blobs above JGit's stream threshold, so the verbatim copy
+  // must stream. The threshold is lowered so a small blob reproduces it.
   private def withStreamFileThreshold[T](bytes: Int)(body: => T): T = {
     val lowered = new WindowCacheConfig
     lowered.setStreamFileThreshold(bytes)
@@ -742,33 +730,20 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- oversized MASK-MATCHED blob (regression) -------------------------------
-  //
-  // qualcomm/qcom-embedded-power-measurement ended a whole project with rc 1:
-  //   org.eclipse.jgit.errors.LargeObjectException: 205b0f65... exceeds size limit
-  //     at cregit.blobexec.Walker.readBlob
-  // on src/libraries/libexcel/excel.cpp — 102,897,757 bytes, 2,398,232 lines, a
-  // dumpcpp dump of Microsoft Excel's COM type library. The mask DID select it
-  // (.cpp), so the streaming fix on the pass-through path does not apply: the
-  // tokenizer cannot be handed 98 MB, so the blob has to be excluded outright.
+  // Streaming cannot help here: the tokenizer cannot take it, so it is excluded.
 
   test("the oversized limit is jgit's own threshold, not a constant above it") {
     val jgitDefault = new WindowCacheConfig().getStreamFileThreshold.toLong
-    // Read from jgit, so the two cannot drift. An earlier draft of this fix used
-    // a hand-picked 64 MiB, which leaves 50-64 MiB passing the size check and
-    // then throwing inside getBytes anyway.
+    // Read from jgit, so the two cannot drift.
     Walker.MaxBlobBytes shouldEqual jgitDefault
     jgitDefault shouldEqual 50L * 1024 * 1024
     Walker.isOversized(200L * 1024 * 1024) shouldBe true
-    Walker.isOversized(55L * 1024 * 1024) shouldBe true    // the band the 64 MiB constant missed
+    Walker.isOversized(55L * 1024 * 1024) shouldBe true
     Walker.isOversized(4096L) shouldBe false
   }
 
-  /** Run the exclusion end to end on `mode`, with jgit's threshold lowered so a
-    * 78 KB fixture reproduces a 98 MB blob in milliseconds.
-    *
-    * The fixture size is the point: 78 KB is far BELOW Walker.MaxBlobBytes, so
-    * the size fast path cannot see it and only the LargeObjectException catch
-    * can. That is exactly the band a bare size check gets wrong. */
+  /** The 78 KB fixture is below Walker.MaxBlobBytes, so only the LargeObjectException
+    * catch (under a lowered jgit threshold) can exclude it. */
   private def checkOversizedExclusion(label: String, pipeline: Boolean, pipelineTrees: Boolean): Unit = {
     val dir = freshWorkDir("oversized-masked-" + label)
     val git = initSrc(dir.resolve("src"))
@@ -780,7 +755,6 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
         "add a normal source file and a generated one")
     } finally git.close()
 
-    // Proof that the fast path is not what fires here.
     Walker.isOversized(generated.length.toLong) shouldBe false
 
     val srcRepo = openBare(dir.resolve("src/.git"))
@@ -830,18 +804,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- DENYLISTED mask-matched blob -------------------------------------------
-  //
-  // tencent__tencentkona-21 holds four blobs on which srcML 1.1.0 does not
-  // terminate: 0 bytes of output, one core at 101%, at every budget from 5s to
-  // 600s. Upstream srcML/srcML#2361 is open with no patch and v1.1.0 is the latest
-  // release, so there is nothing to upgrade to. The timeout path contains the hang
-  // but answers it with exit 4, "incomplete, do not publish", which would leave
-  // that project permanently unpublishable over a diagnosed third-party defect.
-  //
-  // So a denylisted blob takes the EXCLUSION path instead: dropped in
-  // microseconds, never handed to the tokenizer, counted on its own, and NOT
-  // gating the exit status. A timeout still gates it, because a timeout is a hang
-  // nobody has explained yet.
+  // srcML 1.1.0 never terminates on these (srcML/srcML#2361). A denylisted blob is
+  // excluded and does not gate the exit status; an unexplained timeout still does.
 
   /** The git blob id of `content`, computed the way git computes it, so a fixture
     * can be denylisted without first asking the repository what its sha is. */
@@ -919,8 +883,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   test("a denylisted blob is excluded without running the tokenizer (pipeline)") {
-    // The mode run_pipeline_process.sh actually uses for S/M projects, which is
-    // what tencent__tencentkona-21 runs as.
+    // The mode run_pipeline_process.sh uses for small and medium projects.
     checkDenylistExclusion("pipeline", pipeline = true, pipelineTrees = false)
   }
 
@@ -954,14 +917,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- --mask-widened, end to end ---------------------------------------------
-  //
-  // The one test that matters for the mask widening, because it is the only one
-  // that asks what ends up in dst. Reusing blob_map has to do two things at once:
-  // skip the work already done, AND tokenize the files the wider mask newly
-  // selects. The second is the trap. Those files already have an identity row
-  // from the first run, saying "not selected, bytes pass through", and a naive
-  // reuse serves that row as a cache hit — so the file lands in the TOKENIZED
-  // repository holding RAW SOURCE, and nothing downstream can tell.
+  // Trap: a newly selected file already has an identity row; serving it as a cache
+  // hit would put raw source in the tokenized repository.
 
   test("a widened mask reuses the tokenized rows and still tokenizes the newly selected ones") {
     val w = freshWorkDir("mask-widened")
@@ -980,23 +937,18 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       "README.md" -> "leave-me-alone\n"
     ), "only commit")
 
-    // Run 1, narrow mask: two files tokenized, c.cpp merely passed through.
     val first = runWalker(git.getRepository, dstDir, db, cmd, narrow)
     first.blobCommandExecutions shouldEqual 2L
     locally {
       val dst = openBare(dstDir)
       try {
         fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
-        // Raw, and correctly so: the narrow mask did not select it.
         fileAtHead(dst, "master", "c.cpp") shouldBe Some("int c;\n")
       } finally dst.close()
     }
 
-    // Run 2, wider mask, same dst and same db, with the opt-in.
     val second = runWalker(git.getRepository, dstDir, db, cmd, wide, maskWidened = true)
 
-    // Exactly ONE tokenizer invocation: a.c and b.h came from blob_map, c.cpp is
-    // new. That ratio is the entire point of reusing the map.
     second.blobCommandExecutions shouldEqual 1L
     second.blobsCacheHit shouldEqual 2
 
@@ -1004,9 +956,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     try {
       fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
       fileAtHead(dst, "master", "b.h") shouldBe Some("INT B;\n")
-      // The assertion this whole task turns on. Under a reused blob_map without
-      // the identity-row purge this reads "int c;\n" — raw source, in the
-      // tokenized repository, invisibly.
+      // Without the identity-row purge this would be the raw "int c;\n".
       fileAtHead(dst, "master", "c.cpp") shouldBe Some("INT C;\n")
       fileAtHead(dst, "master", "README.md") shouldBe Some("leave-me-alone\n")
     } finally dst.close()
@@ -1032,19 +982,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- tokenizer identity ----------------------------------------------------
-  //
-  // The defect, end to end. blob_map reuse was decided on `command` + `mask`, and
-  // `command` is the constant path tokenizeByBlobId/tokenBySha.pl. So correcting a
-  // tokenizer changed nothing either check looks at: every cached row for that
-  // language stayed a cache hit, and a run with the corrected tokenizer
-  // reproduced the OLD tokens exactly, with no error anywhere. Measured on the
-  // corpus for the Rust fix (729643e): 741,869 .rs (blob, path) pairs in 45
-  // projects would have been served from the poisoned cache.
-  //
-  // These two tests are the deliverable. The first says a changed tokenizer can
-  // no longer be silent. The second says the opt-in actually re-tokenizes the
-  // affected files, and ONLY those — re-tokenizing everything costs 88% of total
-  // pipeline time, so a `.rs`-only fix must not touch the C work.
+  // `command` is a constant path, so a corrected tokenizer must be detected by its
+  // identity, and --retokenize must redo only the affected extension.
 
   test("a changed tokenizer identity refuses the incremental run instead of reusing its tokens") {
     val w = freshWorkDir("tokid-refuse")
@@ -1059,9 +998,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     runWalker(git.getRepository, dstDir, db, v1, mask,
       tokenizerIdentity = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "1111111111")))
 
-    // Same content, same mask, same command path — only the Rust tokenizer's
-    // identity moved. Before this mechanism the run reused every .rs row and said
-    // nothing.
+    // Only the Rust tokenizer's identity moved.
     val ex = intercept[Mapping.TokenizerChangedException] {
       runWalker(git.getRepository, dstDir, db, v1, mask,
         tokenizerIdentity = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "2222222222")))
@@ -1082,12 +1019,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     Files.createDirectories(memo)
     val mask   = """\.(c|rs)$"""
 
-    // ONE command path whose behaviour changes between the two runs, because that
-    // is exactly the pipeline's situation: <command> is the constant path
-    // tokenizeByBlobId/tokenBySha.pl, which dispatches by extension to a tokenizer
-    // that can be rebuilt underneath it. Two different script paths would trip the
-    // existing `command` meta check and prove nothing — the defect is precisely
-    // that the command string does NOT change when the tokenizer does.
+    // One command path for both runs, as in the pipeline (tokenBySha.pl): a second
+    // path would trip the `command` meta check and prove nothing.
     val cmd = w.resolve("tokenize.sh")
     def writeTokenizer(rustBody: String): String = {
       Files.writeString(cmd,
@@ -1100,7 +1033,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       cmd.toFile.setExecutable(true)
       cmd.toAbsolutePath.toString
     }
-    // v1 emits the `line:col<TAB>` prefix the real defect emitted; v2 does not.
+    // v1 emits the buggy `line:col<TAB>` prefix; v2 does not.
     val v1 = writeTokenizer("""sed 's/^/1:1\t/'""")
 
     val git = initSrc(srcDir)
@@ -1119,16 +1052,12 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     locally {
       val dst = openBare(dstDir)
       try {
-        // The defect's signature: a line:col prefix the rest of the pipeline does
-        // not expect, shifting every later field by one.
         fileAtHead(dst, "master", "b.rs") shouldBe Some("1:1\tfn b() {}\n")
         fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
       } finally dst.close()
     }
 
-    // Plant the memo entries the real tokenizeByBlobId/tokenBySha.pl would have
-    // written, so the purge has something to purge and the test can assert the
-    // .c entry survives.
+    // The entries tokenBySha.pl would have written.
     val memoEntries = Map(
       "fn b() {}\n"      -> "1:1\tfn b() {}\n",
       "fn c() {}\n"      -> "1:1\tfn c() {}\n",
@@ -1140,33 +1069,25 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       content -> p
     }
 
-    // The tokenizer is corrected in place. Same path, same mask, same everything
-    // the old checks looked at.
     val v2 = writeTokenizer("cat")
     v2 shouldEqual v1
 
     val second = runWalker(git.getRepository, dstDir, db, v2, mask,
       tokenizerIdentity = idV2, retokenizeExtensions = Set("rs"), memoDir = Some(memo))
 
-    // Two invocations, not three: the .rs files were re-tokenized and a.c was not.
-    // That ratio IS the requirement — a flag that re-tokenized a.c as well would
-    // cost the 88% this exists to avoid.
+    // Only the .rs files are re-tokenized; a.c stays a cache hit.
     second.blobCommandExecutions shouldEqual 2L
     second.blobsCacheHit shouldEqual 1
 
     val dst = openBare(dstDir)
     try {
-      // The assertion the whole task turns on: the corrected tokenizer's output,
-      // not the cached wrong one.
       fileAtHead(dst, "master", "b.rs") shouldBe Some("fn b() {}\n")
       fileAtHead(dst, "master", "c.rs") shouldBe Some("fn c() {}\n")
       fileAtHead(dst, "master", "a.c")  shouldBe Some("INT A;\n")
       fileAtHead(dst, "master", "README.md") shouldBe Some("leave-me-alone\n")
     } finally dst.close()
 
-    // The memo, the second cache layer. Without purging it the walker would have
-    // re-run the command and tokenBySha.pl would have answered from sha1(contents)
-    // — the same stale tokens, through a different door.
+    // An unpurged memo would serve the same stale tokens by sha1(contents).
     Files.exists(memoEntries("fn b() {}\n")) shouldBe false
     Files.exists(memoEntries("fn c() {}\n")) shouldBe false
     Files.exists(memoEntries("int a;\n")) shouldBe true

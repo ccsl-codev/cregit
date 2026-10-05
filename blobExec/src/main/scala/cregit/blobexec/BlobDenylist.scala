@@ -6,28 +6,10 @@ import java.nio.file.{Files, Path}
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
-/** Blobs that must never be handed to the tokenizer, keyed by git blob id.
-  *
-  * The corpus holds four blobs on which srcML 1.1.0 does not terminate: it
-  * produces 0 bytes, pegs one core and never finishes, at every budget from 5 s to
-  * 600 s. The per-blob timeout (see [[BlobExec]]) excludes such a blob too, but
-  * only after it has spent the whole budget on it in every run. This hang is
-  * diagnosed, with a minimal reproducer and an open upstream defect, so the list
-  * excludes it at once and records the reason.
-  *
-  * So a denylisted blob takes the exclusion path instead, the same one an
-  * oversized blob takes: excluded in milliseconds, dropped from every rewritten
-  * tree, counted on its own, logged with its sha, path and reason, and NOT gating
-  * the exit status. The timeout stays exactly as it was.
-  *
-  * The entries live in a data file rather than in this code
-  * ([[BlobDenylist.ResourcePath]]), because the list is a documented property of
-  * the published dataset and a paper has to be able to cite it.
-  */
+/** Blobs never handed to the tokenizer, keyed by git blob id. The list is a data
+  * file ([[BlobDenylist.ResourcePath]]) so the dataset can cite it. */
 final class BlobDenylist private (private val bySha: Map[String, BlobDenylist.Entry]) {
 
-  /** The entry for `sha`, or None. Case-insensitive, because a git id is hex and
-    * both cases name the same object. */
   def entryFor(sha: String): Option[BlobDenylist.Entry] =
     if (bySha.isEmpty) None else bySha.get(sha.toLowerCase)
 
@@ -39,37 +21,23 @@ final class BlobDenylist private (private val bySha: Map[String, BlobDenylist.En
 
 object BlobDenylist {
 
-  /** One excluded blob: the git blob id, an upstream citation, and one line of
-    * reason. All three are required — an exclusion with no citation and no reason
-    * is indistinguishable from data loss. */
   final case class Entry(sha: String, citation: String, reason: String) {
-    /** The half of the log line that comes from the data file. */
     def describe: String = s"$reason [$citation]"
   }
 
-  /** Classpath location of the shipped list. A resource, so it travels inside the
-    * assembly jar and cannot go missing between the build and the run. */
   val ResourcePath = "/cregit/blobexec/blob-denylist.tsv"
 
   val empty: BlobDenylist = new BlobDenylist(Map.empty)
 
   private val ShaPattern = "^[0-9a-f]{40}$".r
 
-  /** Parse the TSV. Malformed input throws: a denylist that silently drops a line
-    * would silently re-introduce a blob that costs a 600 s timeout in every run,
-    * which is precisely the cost this list removes.
-    *
-    * `where` names the source in any error message, because the same parser reads
-    * the shipped resource and a test fixture.
-    */
+  /** Throws on malformed input: a dropped line would silently re-admit a blob. */
   def parse(lines: IterableOnce[String], where: String): BlobDenylist = {
     val acc = scala.collection.mutable.LinkedHashMap.empty[String, Entry]
     lines.iterator.zipWithIndex.foreach { case (raw, i) =>
       val line = raw.trim
       if (line.nonEmpty && !line.startsWith("#")) {
-        // Trailing tabs are tolerated; an empty field in the middle is not. A
-        // missing citation or a missing reason has to be an error, or the list
-        // stops being something a paper can cite.
+        // Trailing tabs are tolerated; an empty field in the middle is not.
         val fields = line.split("\t", -1).map(_.trim).reverse.dropWhile(_.isEmpty).reverse
         if (fields.length != 3 || fields.exists(_.isEmpty))
           throw new IllegalArgumentException(
@@ -104,7 +72,6 @@ object BlobDenylist {
       parse(src.getLines().toVector, resource))
   }
 
-  /** The shipped list. Parsed once, on first use, and a parse failure is fatal by
-    * design: running with a list nobody could read is worse than not running. */
+  /** Parsed on first use; a parse failure is fatal by design. */
   lazy val shipped: BlobDenylist = fromResource(ResourcePath)
 }

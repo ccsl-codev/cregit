@@ -45,12 +45,6 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   // -- the two timeouts are coupled -------------------------------------------
-  //
-  // A pure-blob commit's only progress stamp is a blob finishing or being killed,
-  // so the watchdog window must exceed the per-blob budget. The defaults (600 and
-  // 1800) satisfy it; following the advice to raise --blob-timeout to 1800 without
-  // touching the window would not, and a legitimately slow blob would then race
-  // its own watchdog.
 
   test("a window at or above the floor is accepted unchanged") {
     Main.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
@@ -94,8 +88,6 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("a defaulted window is widened to fit a raised --blob-timeout") {
-    // The exact collision the printed advice used to create: --blob-timeout=1800
-    // against the 1800 default window.
     Main.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
     Main.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
   }
@@ -160,11 +152,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
   }
 
-  // The ineffective-invalidation status must be distinct: run_pipeline_process.sh maps blobExec's statuses onto different
-  // remedies and different marker files, so a collision sends the operator to the
-  // wrong one. This status specifically must not be 0 — "--retokenize did
-  // nothing" reported as success is the failure the flag exists to prevent — and
-  // must not be 3, which means the run never started.
+  // run_pipeline_process.sh maps each status to its own remedy and marker file.
   test("the ineffective-retokenize status collides with no other blobExec exit status") {
     val others = Map(
       "clean"        -> 0,
@@ -181,7 +169,6 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("an ineffective --retokenize is not reported as a clean walk") {
-    // Belt and braces on the one collision that would actually lose data.
     Main.RetokenizeIneffectiveExitStatus should not equal 0
   }
 

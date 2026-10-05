@@ -5,18 +5,10 @@ import org.scalatest.matchers.should.Matchers
 
 import java.nio.file.Files
 
-/** The denylist is a DATA file, because the list of blobs a published dataset
-  * omits is a property of the dataset and a paper has to cite it. That makes the
-  * file's contents part of the contract, so they are asserted here and not only
-  * parsed. */
+/** The shipped file's contents are part of the contract, so they are asserted, not only parsed. */
 class BlobDenylistSpec extends AnyFunSuite with Matchers {
 
-  // CLASS 1 — the Java parser on type-annotated array types, upstream
-  // srcML/srcML#2361. Eight blobs, all in tencent__tencentkona-21's bare clone,
-  // all OpenJDK langtools regression tests. They are the historical versions of
-  // TWO files, one of which lives at two paths after a repository reorganisation —
-  // which is why the list is keyed on content, not on path. The second file
-  // carries a distinct sufficient construct within the same defect.
+  // Class 1: the Java parser hang, srcML/srcML#2361.
   private val JavaAnnotationShas = Set(
     // TestNewCastArray.java
     "2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65",
@@ -30,12 +22,7 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
     "afbd81e5789ba060147b0de3be4f01759963299d"
   )
 
-  // CLASS 2 — the C parser on C++ inside a `.h`, because CregitLanguages maps that
-  // extension to language C. A DIFFERENT defect in a DIFFERENT language, with NO
-  // upstream issue, so it cites the analysis document instead. Asserted separately
-  // because the one thing a reader must not do is read this list as one defect.
-  // Four historical versions of eden/fs/utils/StatTimes.h in facebook__sapling;
-  // the file's other four versions return by value and parse in milliseconds.
+  // Class 2: the C parser hang on C++ in a `.h` (StatTimes.h). No upstream issue.
   private val CParserShas = Set(
     "5460d43f1884e3be230e02215151b9b963844a48",
     "720914b27e170b73b38ef662fb04239273dd0a34",
@@ -43,25 +30,11 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
     "dbb885e0bf046755c4fcfbddfc2454f90c550c62"
   )
 
-  // CLASS 3 — the C and C++ parsers CRASHING ON A SIGNAL (SIGSEGV or SIGABRT)
-  // under `--position`. A THIRD defect, and the only one that is not a hang: srcml
-  // is dead in milliseconds, so no timeout budget is ever involved. 197 blobs, the
-  // whole history of 36 files across 18 projects, found by running the tokenizer's
-  // real chain over all 904 historical versions of those paths (707 of the 904
-  // parse cleanly — this is content-triggered, not a property of the path).
-  //
-  // Asserted by SIZE and by spot-checked members rather than by listing 197
-  // literals: a 197-line literal set duplicated here would be maintained by
-  // copy-paste and would stop being a check. What must not drift is the count, the
-  // citation, and the fact that class 3 never claims to be #2361.
+  // Class 3: C/C++ parser crashes under `--position`. Checked by count and spot
+  // checks, not by duplicating 197 literals.
   private val ParserCrashCount = 197
 
-  // Spot checks, one per distinguishing property, so the assertions below are
-  // anchored on real entries rather than on whatever happens to be first.
-  //   - the sweep's own control file, 1,263 B, which rules out a size limit
-  //   - a SIGABRT entry, where the signal is NOT a segfault
-  //   - a blob vendored byte-identically into TWO projects, which is why the list
-  //     is keyed on content and not on path
+  // crc32_small.c (position-only), a SIGABRT, and one blob vendored into two projects.
   private val CrashPositionOnlySha = "4a62830c807a5a2aff73f474891c38ed913d39c4"
   private val CrashAbortSha        = "37cf5d5b1985a7510ad9c952897ef253231e80f7"
   private val CrashSharedBlobSha   = "012ea8148e8d21cf515a9ff47d4af719d049b276"
@@ -69,10 +42,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   private val KnownHangShas = JavaAnnotationShas ++ CParserShas
 
   test("the shipped list is on the classpath and holds the twelve hangs plus 197 crashes") {
-    // A jar built without the resource would hand all of these back to srcml. The
-    // twelve would hang for 600s each and then exit 4; the 197 would segfault or
-    // abort, and blobExec would exit 6 on `blobsParserCrashed`. Either way the
-    // project cannot publish, so "the resource is present" is itself a requirement.
     BlobDenylist.shipped.size shouldEqual 12 + ParserCrashCount
     JavaAnnotationShas.size shouldEqual 8
     CParserShas.size shouldEqual 4
@@ -84,9 +53,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("class 3 holds exactly the 197 signal-death blobs, and no hang is counted among them") {
-    // The two groups are separated by citation, which is the only thing in the data
-    // file that distinguishes them, so this also pins that the citations did not
-    // get pasted across classes.
     val crashes = BlobDenylist.shipped.entries.filter(_.citation.contains("silent-empty-sweep.md"))
     crashes.size shouldEqual ParserCrashCount
     crashes.map(_.sha).toSet.size shouldEqual ParserCrashCount   // no duplicates
@@ -94,9 +60,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("a class 3 entry says CRASH, names its signal, and disclaims #2361") {
-    // "we could not parse it" is indefensible in a paper; so is calling a segfault
-    // a hang. Every class 3 reason has to carry the defect, the signal and the
-    // srcML version, and has to say which invocation produced it.
     val crashes = BlobDenylist.shipped.entries.filter(_.citation.contains("silent-empty-sweep.md"))
     crashes.foreach { e =>
       withClue(s"${e.sha}: ") {
@@ -105,20 +68,14 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
         e.reason should include("--position")
         e.reason.toUpperCase should include("CRASH")
         e.reason should (include("SIGSEGV (shell status 139)") or include("SIGABRT (shell status 134)"))
-        // the flag is not optional, and the reason has to say why
         e.reason should include("token format carries line:col positions")
-        // a crash is not the hang, and must not be mistaken for it
         e.reason should include("not the non-termination")
       }
     }
   }
 
   test("each class 3 entry records whether --position is the trigger, measured per blob") {
-    // silent-empty-sweep.md claims --position is the trigger for all of them. It is
-    // not: measured per blob, 132 are position-only, 49 die either way, and 16 exit
-    // 1 without the flag. Inheriting the sweep's single claim would have put a
-    // false statement on 65 entries, so each one states its own measurement and
-    // this holds the three groups to their counts.
+    // silent-empty-sweep.md says --position is the trigger for all; it is not for 65.
     val crashes = BlobDenylist.shipped.entries.filter(_.citation.contains("silent-empty-sweep.md"))
     val positionOnly = crashes.count(_.reason.contains("--position IS the trigger"))
     val eitherWay    = crashes.count(_.reason.contains("--position is NOT the trigger"))
@@ -131,34 +88,21 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("the spot-checked class 3 blobs are present, with the property each was chosen for") {
-    // crc32_small.c, 1,263 B — the sweep's control, and the file the committed
-    // reproducer tests/t/fixtures/srcml-position-crash.c is derived from.
+    // Source of the reproducer tests/t/fixtures/srcml-position-crash.c.
     val posOnly = BlobDenylist.shipped.entryFor(CrashPositionOnlySha).getOrElse(
       fail(s"$CrashPositionOnlySha (crc32_small.c) is missing from the shipped denylist"))
     posOnly.reason should include("--position IS the trigger")
     posOnly.reason should include("SIGSEGV (shell status 139)")
 
-    // An abort, not a segfault. The defect is broader than "segfault", and an
-    // abort evades a timeout-shaped denylist just as thoroughly.
     val abort = BlobDenylist.shipped.entryFor(CrashAbortSha).getOrElse(
       fail(s"$CrashAbortSha (util-linux swaplabel.c) is missing from the shipped denylist"))
     abort.reason should include("SIGABRT (shell status 134)")
 
-    // One blob, two projects: zlib's deflate.c is byte-identical in ossec__ossec-hids
-    // and azerothcore__azerothcore-wotlk. A path-keyed list would need two entries
-    // and would be wrong the moment a third project vendored the same bytes.
     BlobDenylist.shipped.entryFor(CrashSharedBlobSha) should not be empty
   }
 
   test("every entry carries a one-line reason and a citation for its own defect") {
-    // Without both, an exclusion is indistinguishable from data loss. The partner
-    // rejected "we could not parse it" as indefensible in a paper, and this is the
-    // assertion that keeps the answer in the artefact.
-    //
-    // The citation is per-CLASS, not global. Citing #2361 for the C parser hang
-    // would be a false attribution in a published artefact: it is a different
-    // language and a different construct, and no upstream issue exists for it.
-    // The same applies to class 3, which is not even a hang.
+    // Per class: citing #2361 for class 2 or 3 would be a false attribution.
     BlobDenylist.shipped.entries.foreach { e =>
       withClue(s"${e.sha}: ") {
         if (JavaAnnotationShas.contains(e.sha)) e.citation shouldEqual "srcML/srcML#2361"
@@ -172,9 +116,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("every citation belongs to exactly one of the three classes, so none is unattributed") {
-    // A pasted or empty citation would leave an omission in a published dataset with
-    // nothing to look up. Partitioning the whole list proves there is no fourth,
-    // accidental citation string hiding in the file.
     val byClass = BlobDenylist.shipped.entries.groupBy { e =>
       if (e.citation == "srcML/srcML#2361") "class1"
       else if (e.citation.contains("srcml-nontermination-analysis.md")) "class2"
@@ -188,8 +129,7 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("the C parser entries do not claim to be srcML#2361, and carry their reproducer") {
-    // The evidence for these is a minimised reproducer in the artefact rather than
-    // an upstream issue number, so the reproducer is part of the contract.
+    // With no upstream issue, the reproducer in the reason is the evidence.
     CParserShas.foreach { sha =>
       val e = BlobDenylist.shipped.entryFor(sha).getOrElse(
         fail(s"the C parser blob $sha is missing from the shipped denylist"))
@@ -225,7 +165,7 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
         "",
         "   ",
         s"  $sha1\tsrcML/srcML#2361\tnon-termination  ",
-        s"$sha2\tsrcML/srcML#2361\tnon-termination\t"   // a trailing tab is tolerated
+        s"$sha2\tsrcML/srcML#2361\tnon-termination\t"
       ),
       "fixture")
     list.size shouldEqual 2
@@ -233,8 +173,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("a line that is not three fields is refused, naming the line") {
-    // Silently skipping a malformed line would re-admit a blob that hangs the run
-    // for 600s and then blocks publication — the exact failure this list removes.
     val bad = intercept[IllegalArgumentException] {
       BlobDenylist.parse(Vector(s"$sha1\tsrcML/srcML#2361"), "fixture")
     }
@@ -248,9 +186,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("a key that is not a 40-hex git blob sha is refused") {
-    // The memo's key is sha1 of the file contents with no git header, so a
-    // plausible-looking wrong hash is an easy mistake to make. A 39-character or
-    // non-hex key would simply never match, silently.
     intercept[IllegalArgumentException] {
       BlobDenylist.parse(Vector(s"${"a" * 39}\tc\tr"), "fixture")
     }

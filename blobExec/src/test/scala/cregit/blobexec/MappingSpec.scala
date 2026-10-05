@@ -126,15 +126,8 @@ class MappingSpec extends AnyFunSuite with Matchers {
     } finally Files.deleteIfExists(tmp)
   }
 
-  // The mask widening (per-language masks -> one universal mask) is exactly the
-  // change this refusal exists for, so pin it with the real strings rather than
-  // ".*" vs "\.c$". A project whose mask changes MUST be rebuilt: its tree_map
-  // rows were assembled from the files the old mask selected, so reusing them
-  // would produce a repository that silently omits every newly selected file —
-  // and the omission is invisible afterwards, because the trees look complete.
-  //
-  // If someone later "fixes" this into a warning to make a resume work, this test
-  // is what says no. The rows below are the ones that would be reused.
+  // Reused tree_map rows would silently omit every newly selected file, so a
+  // mask change must rebuild. Pinned with the real mask strings.
   test("a widened mask is refused on resume, not silently reused") {
     val oldMask = """\.(c|cc|cp|cpp|cxx|h|hh|hpp)$"""
     val newMask = """(?i)\.(c|c\+\+|cc|cp|cpp|cxx|h|h\+\+|hh|hpp|hxx|java|rs|tcc)$"""
@@ -154,8 +147,6 @@ class MappingSpec extends AnyFunSuite with Matchers {
       ex.getMessage should include(oldMask)
       ex.getMessage should include(newMask)
 
-      // Same mask still resumes, and the rows are still there — the refusal is
-      // about the mask changing, not about resuming at all.
       val m2 = Mapping.open(tmp, "/bin/cat", oldMask)
       try {
         m2.getTree("origtree") shouldBe Some("newtree")
@@ -165,9 +156,8 @@ class MappingSpec extends AnyFunSuite with Matchers {
   }
 
   test("the warm-DB fallback refuses a widened mask too") {
-    // shard_build.sh passes a prior run's DB as --warm. Its blob ids were minted
-    // under that run's mask, so a mask change makes them foreign; openWarm has
-    // its own check and it must not drift from checkOrSetMeta's.
+    // openWarm (shard_build.sh --warm) has its own mask check; it must not drift
+    // from checkOrSetMeta's.
     val oldMask = """\.(c|cc|cp|cpp|cxx|h|hh|hpp)$"""
     val newMask = """(?i)\.(c|c\+\+|cc|cp|cpp|cxx|h|h\+\+|hh|hpp|hxx|java|rs|tcc)$"""
     val warm = Files.createTempFile("mapping-warm-", ".db")
@@ -187,15 +177,8 @@ class MappingSpec extends AnyFunSuite with Matchers {
     }
   }
 
-  // -- --mask-widened ---------------------------------------------------------
-  //
-  // The opt-in beside the refusal above. Everything here exists because reusing
-  // blob_map across a widening is only safe under conditions that have to be
-  // CHECKED, not assumed, and one of those conditions is not obvious: blob_map
-  // holds identity rows for blobs the old mask did NOT select, and a wider mask
-  // selects some of them. Serving one of those as a cache hit puts raw source
-  // into the tokenized repository, which is the one outcome that silently
-  // corrupts the dataset's meaning.
+  // --mask-widened. Trap: blob_map holds identity rows for blobs the old mask
+  // skipped; a wider mask selects some, and a cache hit would ship raw source.
 
   private val OldCMask  = """\.[ch]$"""
   private val OldCppMask = """\.(c|cc|cp|cpp|cxx|h|hh|hpp)$"""
@@ -211,19 +194,16 @@ class MappingSpec extends AnyFunSuite with Matchers {
     ), log)
   }
 
-  /** A blob map as a real run leaves it: tokenized rows for the paths the mask
-    * selected, identity rows for every other blob the walker passed through, plus
-    * trees, a commit and a ref. */
+  /** Tokenized rows for selected paths, identity rows for the rest, plus trees, a commit and a ref. */
   private def seedUnderOldMask(tmp: java.nio.file.Path, mask: String): Unit = {
     val m = Mapping.open(tmp, "/bin/cat", mask)
     try {
       m.putBlob("b1", "src/a.c", "tok1")
       m.putBlob("b2", "src/b.h", "tok2")
-      // Identity rows. These are the dangerous ones: under the universal mask
-      // a.cpp and T.java ARE selected, so a reused row would serve raw source.
+      // Identity rows the universal mask selects: reusing them would serve raw source.
       m.putBlob("b3", "src/a.cpp", "b3")
       m.putBlob("b4", "src/T.java", "b4")
-      // And these are paths no mask will ever select.
+      // Never selected by any mask.
       m.putBlob("b5", "README.md", "b5")
       m.putBlob("b6", "CMakeLists.txt", "b6")
       m.putTree("t1", "nt1")
@@ -240,7 +220,6 @@ class MappingSpec extends AnyFunSuite with Matchers {
         Mapping.open(tmp, "/bin/cat", UniversalMask)
       }
       ex.getMessage should include("mask")
-      // ...and it changed nothing, so the flag can still be used afterwards.
       val m = Mapping.open(tmp, "/bin/cat", OldCMask)
       try {
         m.getMeta("mask") shouldBe Some(OldCMask)
@@ -258,21 +237,16 @@ class MappingSpec extends AnyFunSuite with Matchers {
       val (w, log) = widening()
       val m = Mapping.open(tmp, "/bin/cat", UniversalMask, None, Some(w))
       try {
-        // Kept: the real tokenizations.
         m.getBlob("b1", "src/a.c") shouldBe Some("tok1")
         m.getBlob("b2", "src/b.h") shouldBe Some("tok2")
-        // Gone: every identity row, so the newly selected paths are cache MISSES
-        // and get tokenized instead of passing through as raw source.
         m.getBlob("b3", "src/a.cpp") shouldBe None
         m.getBlob("b4", "src/T.java") shouldBe None
         m.getBlob("b5", "README.md") shouldBe None
         m.getBlob("b6", "CMakeLists.txt") shouldBe None
-        // Gone: trees, commits and the refs that name them.
         m.getTree("t1") shouldBe None
         m.getCommit("c1") shouldBe None
         m.getRef("refs/heads/main") shouldBe None
         m.allCommitOrigShas shouldBe empty
-        // The stored mask is now the new one, with the old one kept as provenance.
         m.getMeta("mask") shouldBe Some(UniversalMask)
         m.getMeta(Mapping.MaskWidenedFromKey) shouldBe Some(OldCMask)
         m.getMeta(Mapping.MaskWidenedAtKey) shouldBe Some("1700000000")
@@ -294,13 +268,9 @@ class MappingSpec extends AnyFunSuite with Matchers {
     } finally Files.deleteIfExists(tmp)
   }
 
-  // THE check. A narrowing is refused on the evidence of the rows, and the
-  // databases are left exactly as they were — the operator can still resume
-  // under the old mask afterwards, which is the proof that nothing was touched.
   test("a NARROWING mask is refused, names the path, and leaves the databases untouched") {
     val tmp = Files.createTempFile("mapping-narrow-", ".db")
     try {
-      // Tokenized under the C++ mask, so src/a.cpp is a real tokenization.
       val seed = Mapping.open(tmp, "/bin/cat", OldCppMask)
       try {
         seed.putBlob("b1", "src/a.c", "tok1")
@@ -313,7 +283,6 @@ class MappingSpec extends AnyFunSuite with Matchers {
 
       val (w, log) = widening()
       val ex = intercept[Mapping.MaskNarrowedException] {
-        // C only. It drops .cpp, so it is a narrowing wearing the flag's name.
         Mapping.open(tmp, "/bin/cat", OldCMask, None, Some(w))
       }
       ex.getMessage should include("src/a.cpp")
@@ -322,7 +291,6 @@ class MappingSpec extends AnyFunSuite with Matchers {
       ex.getMessage should include("NARROWING")
       log.toString shouldBe ""
 
-      // Untouched: every row and the recorded mask.
       val m = Mapping.open(tmp, "/bin/cat", OldCppMask)
       try {
         m.getMeta("mask") shouldBe Some(OldCppMask)
@@ -337,10 +305,8 @@ class MappingSpec extends AnyFunSuite with Matchers {
     } finally Files.deleteIfExists(tmp)
   }
 
-  // An identity row on a path no mask selects must NOT be read as a narrowing.
-  // Every blob map on this machine holds such rows (README.md, CMakeLists.txt,
-  // .pdf), so a check over all rows rather than tokenized ones refuses every
-  // project and the feature never fires once.
+  // Every blob map holds such rows (README.md, ...); counting them would refuse
+  // every project.
   test("identity rows on never-selected paths do not count as a narrowing") {
     val tmp = Files.createTempFile("mapping-identity-ok-", ".db")
     try {
@@ -358,8 +324,7 @@ class MappingSpec extends AnyFunSuite with Matchers {
   }
 
   test("the narrowing check reads the basename, the way Walker matches the mask") {
-    // Walker matches against tw.getNameString, not the full path. Replicate it,
-    // or the check answers a question the walker never asks.
+    // Walker matches tw.getNameString, not the full path.
     Mapping.basename("src/kernel/a.c") shouldEqual "a.c"
     Mapping.basename("a.c") shouldEqual "a.c"
     Mapping.basename("dir.c/plain") shouldEqual "plain"
@@ -387,9 +352,8 @@ class MappingSpec extends AnyFunSuite with Matchers {
   }
 
   test("the reachability check probes only retained rows, never identity ones") {
-    // An identity row's new_blob is the ORIGINAL blob id, which lives in src and
-    // need not be in dst at all until tree assembly copies it. Probing one would
-    // refuse a perfectly good resume.
+    // An identity row's new_blob is the source blob id, which need not be in dst
+    // yet; probing it would refuse a good resume.
     val tmp = Files.createTempFile("mapping-probe-set-", ".db")
     try {
       seedUnderOldMask(tmp, OldCMask)
@@ -401,8 +365,7 @@ class MappingSpec extends AnyFunSuite with Matchers {
   }
 
   test("the command is still checked under the flag: a different tokenizer is refused") {
-    // The widening argument is about WHICH blobs, and says nothing about a
-    // different program producing different tokens from the same bytes.
+    // Widening is about which blobs, not about a different tokenizer.
     val tmp = Files.createTempFile("mapping-widen-cmd-", ".db")
     try {
       seedUnderOldMask(tmp, OldCMask)
@@ -454,11 +417,10 @@ class MappingSpec extends AnyFunSuite with Matchers {
       try {
         (0 until 100).foreach(i => m.putBlob(f"orig$i%03d", f"f$i%03d.c", f"tok$i%03d"))
         m.sampleTokenizedNewBlobs(10) should have size 10
-        // Spread, not the first ten: a head sample only sees the first commit.
+        // A spread, not the head: a head sample only sees the first commit.
         m.sampleTokenizedNewBlobs(10).map(_._2) shouldEqual
           m.sampleTokenizedNewBlobs(10).map(_._2)
         m.sampleTokenizedNewBlobs(10).map(_._2).toSet should contain("tok090")
-        // Asking for more than exists returns what exists.
         m.sampleTokenizedNewBlobs(1000) should have size 100
       } finally m.close()
     } finally Files.deleteIfExists(tmp)

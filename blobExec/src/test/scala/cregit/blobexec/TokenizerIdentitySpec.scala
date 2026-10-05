@@ -14,8 +14,6 @@ class TokenizerIdentitySpec extends AnyFunSuite with Matchers {
     val id = TokenizerIdentity.parse("h=aaaaaaaa,c=bbbbbbbb,rs=cccccccc").toOption.get
     id.extensions shouldBe Set("c", "h", "rs")
     id.render shouldEqual "c=bbbbbbbb,h=aaaaaaaa,rs=cccccccc"
-    // A rendering that depended on map order would make every log line and every
-    // refusal message a different string for the same fact.
     TokenizerIdentity.parse("c=bbbbbbbb,rs=cccccccc,h=aaaaaaaa").toOption.get.render shouldEqual id.render
   }
 
@@ -25,8 +23,6 @@ class TokenizerIdentitySpec extends AnyFunSuite with Matchers {
   }
 
   test("an empty spec is refused, not read as 'no extensions'") {
-    // "no extensions" would make --tokenizer-identity a silent no-op, which is
-    // the whole failure mode this mechanism exists to remove.
     TokenizerIdentity.parse("").isLeft shouldBe true
     TokenizerIdentity.parse("   ").isLeft shouldBe true
   }
@@ -47,8 +43,7 @@ class TokenizerIdentitySpec extends AnyFunSuite with Matchers {
   }
 
   test("a quote or a LIKE wildcard cannot get into an extension") {
-    // These strings reach a SQL LIKE pattern in Mapping. The alphabet is the
-    // defence, so it is asserted here rather than trusted there.
+    // Mapping interpolates extensions into a SQL LIKE.
     Seq("r's", "r%s", "r_s", "rs;", "rs)", "r s").foreach { bad =>
       TokenizerIdentity.parse(s"$bad=deadbeefcafe").isLeft shouldBe true
       TokenizerIdentity.parseExtensions(bad).isLeft shouldBe true

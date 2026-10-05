@@ -29,22 +29,11 @@ import java.nio.file.{Files, Paths}
  */
 object Main {
 
-  /** Exit status when `--retokenize` was asked for and would have invalidated
-    * nothing.
-    *
-    * Its own status, and not 3, because it is a different kind of answer. 3 means
-    * "this memo does not match this run, so the run did not start". This means
-    * "the run could have started, and the invalidation you asked for was a no-op".
-    * An operator scripting a corpus-wide re-tokenization needs to tell those
-    * apart: the first is a refusal to proceed, the second is a request that did
-    * nothing, and treating the second as success is how a poisoned cache gets
-    * published. 7 is the next free status after 1, 2, 3, 4, 5, 6;
-    * `retokenizeStatusIsUnique` in MainOptionsSpec pins that. */
+  /** Exit status when `--retokenize` would invalidate nothing. Not 3 (memo mismatch):
+    * a no-op request must be told apart from a refusal, and never read as success. */
   private[blobexec] val RetokenizeIneffectiveExitStatus = 7
 
-  /** The process exit status for a finished walk: 2 on an abort, else 0.
-    * Excluded blobs (oversized, denylisted, or whose tokenizer failed) are
-    * named on EXCLUDED lines and do not change it. */
+  /** 2 on an abort, else 0: excluded blobs are named on EXCLUDED lines, not failed. */
   private[blobexec] def exitStatus(stats: WalkStats): Int =
     if (stats.aborted) 2 else 0
 
@@ -364,9 +353,6 @@ object Main {
       sys.exit(1)
     }
 
-    // A shard writes its own fresh dst.git and blobmap.db every run, so there is
-    // never a recorded mask for --mask-widened to widen. Refusing says so instead
-    // of letting the flag be a silent no-op; --warm is the sharded equivalent.
     if (shard.isDefined && maskWidened) {
       System.err.println("Error: --mask-widened has nothing to do under --shard: each shard builds a " +
         "fresh dst.git and blobmap.db, so no mask is recorded to widen. Reuse a prior run's " +
@@ -375,9 +361,6 @@ object Main {
       sys.exit(1)
     }
 
-    // Every way --retokenize could end up doing nothing, refused before the walk.
-    // A flag whose whole purpose is to force work must never be able to run and
-    // force none.
     if (retokenizeExtensions.nonEmpty) {
       if (tokenizerIdentity.isEmpty) {
         System.err.println(
@@ -470,9 +453,7 @@ object Main {
     val dbParent = dbPath.getParent
     if (dbParent != null && !Files.isDirectory(dbParent)) Files.createDirectories(dbParent)
 
-    // Loaded here rather than on first use: a jar built without the resource, or a
-    // malformed line in it, must stop the run now and say so, not silently hand a
-    // known non-terminating blob to srcml an hour into the walk.
+    // Eager, so a missing or malformed denylist stops the run now, not mid-walk.
     val denylist =
       try BlobDenylist.shipped
       catch {
@@ -499,9 +480,6 @@ object Main {
     val src: FileRepository = openSrc(srcPath)
     val dst: FileRepository = openOrInitDst(dstPath)
 
-    // The reachability probe the widening needs. It reads dst, which is why the
-    // whole decision lives here and not inside Mapping.open's signature alone:
-    // `blob_map` is only meaningful next to the repository its new_blob ids are in.
     val widening =
       if (!maskWidened) None
       else Some(Mapping.MaskWidening(
@@ -514,10 +492,8 @@ object Main {
         report = msg => println(s"blobExec: $msg")
       ))
 
-    // The invalidation, wired to the two things only this layer can supply: the
-    // dst reachability probe, and a memo purge that reads the original blobs out
-    // of src to recompute their content sha1 — the memo's only key
-    // (tokenizeByBlobId/tokenBySha.pl:76).
+    // The memo is keyed on content sha1 alone (tokenizeByBlobId/tokenBySha.pl:76),
+    // so the purge re-reads the original blobs from src.
     val retokenize =
       if (retokenizeExtensions.isEmpty) None
       else Some(Mapping.Retokenize(
@@ -566,15 +542,12 @@ object Main {
         src.close(); dst.close()
         sys.exit(3)
       case n: Mapping.NothingInvalidatedException =>
-        // Deliberately NOT 0. The walk could have run; the invalidation asked for
-        // could not. Exiting 0 here would let a corpus script publish a project
-        // whose poisoned entries were never touched.
+        // Not 0: a corpus script would publish entries that were never invalidated.
         System.err.println(s"Error: ${n.getMessage}")
         src.close(); dst.close()
         sys.exit(RetokenizeIneffectiveExitStatus)
       case i: IllegalArgumentException =>
-        // Mapping.open's own preconditions on the flag combinations, re-checked
-        // there so a library caller cannot bypass what main() validates.
+        // Mapping.open re-checks main()'s flag rules, for library callers.
         System.err.println(s"Error: ${i.getMessage}")
         src.close(); dst.close()
         sys.exit(1)
@@ -634,9 +607,7 @@ object Main {
     }
 
     if (stats.blobsOversized > 0) {
-      // Reported, never fatal. An oversized blob is deterministic and fully
-      // explained by the EXCLUDED lines above, so gating publication on it would
-      // only mean this project could never publish while telling us nothing new.
+      // Not fatal: an oversized blob is deterministic and named on its EXCLUDED line.
       System.err.println(
         s"blobExec: ${stats.blobsOversized} blob(s) were excluded as oversized (>= " +
           s"${Walker.MaxBlobBytes} bytes, JGit's stream-file threshold). Each one is named with " +
@@ -657,10 +628,7 @@ object Main {
       )
     }
 
-    // Always exit explicitly. A timed-out blob abandons its (daemon) reader
-    // threads while they are blocked on a pipe, and on the pre-fix build the
-    // JVM outlived the finished walk on exactly those threads — a silent stall
-    // behind a done-line that read `aborted=false`.
+    // Exit explicitly: a timed-out blob's daemon reader threads can keep the JVM alive.
     sys.exit(exitStatus(stats))
   }
 

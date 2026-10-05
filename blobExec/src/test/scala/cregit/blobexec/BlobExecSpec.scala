@@ -101,12 +101,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     }
   }
 
-  // CHANGED ASSERTION. This test used to be "zero exit, empty stdout against
-  // non-empty input → Replace with empty blob", and it pinned the defect: a
-  // crashed srcML exits 0 through the wrapper with empty stdout, and that empty
-  // stdout was inserted as the file's tokenization. 36 files across 19 projects
-  // were published as 0-byte blobs that way, with nothing counting them. Zero
-  // output from non-empty input is now a counted failure, never a blob.
   test("zero exit, empty stdout against non-empty input → Skip, counted, no blob") {
     val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
     val cmd = shellScript("cat > /dev/null; true")
@@ -117,9 +111,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     crashes.get shouldEqual 1
   }
 
-  // The other half of the distinction the fix has to make: an input that is
-  // genuinely empty may legitimately produce empty output, and must stay a plain
-  // Skip that is NOT counted as a crash.
   test("zero exit, empty stdout against empty input → Skip, not counted a crash") {
     val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
     val cmd = shellScript("cat > /dev/null; true")
@@ -132,9 +123,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   test("the parser-crash exit status is Skip, counted, and never a Replace") {
     val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
-    // Writes plausible-looking output first, so the test proves the status is what
-    // rejects it rather than the emptiness check: a crashed srcML can emit a
-    // truncated prefix before dying, and that prefix must never become a blob.
     val cmd = shellScript(s"echo 'partial tokens'; exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
                  abortOnError = false, inserter,
@@ -144,9 +132,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("a parser crash skips one blob even with abortOnError, like a timeout") {
-    // The hostile case: one crashing blob must not take down a run that has
-    // already folded thousands of commits. It gates publication through the exit
-    // status instead (Main.exitStatus), which is where a timeout gates it too.
     val cmd = shellScript(s"exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
                  abortOnError = true, inserter) shouldBe BlobExec.Outcome.Skip
@@ -169,8 +154,6 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     timeouts.get shouldEqual 1
     crashes.get  shouldEqual 1   // a timeout is not a crash
 
-    // A healthy blob and an ordinary failure must leave both counts alone, or a
-    // project would be held back from publication for nothing.
     run(shellScript("tr a-z A-Z"))
     run(shellScript("exit 7"))
     crashes.get  shouldEqual 1
@@ -178,9 +161,8 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("a child that never exits is killed at the timeout, not awaited forever") {
-    // `sleep 30` stands in for the wedged srcml chain: it reads nothing and
-    // writes nothing, and it holds its stdout open so the reader thread parks
-    // in pipe_read. With a 1 second budget the call must return quickly.
+    // `sleep 30` is the wedged srcml chain: it reads nothing, writes nothing, and
+    // holds its stdout open so the reader parks in pipe_read.
     val cmd     = shellScript("sleep 30")
     val started = System.currentTimeMillis()
     val (exit, _, _) = BlobExec.invoke(
@@ -207,12 +189,8 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("an orphan grandchild holding the pipes cannot outlive the timeout") {
-    // The tencentkona-21 shape: tokenBySha.pl -> sh -> srcml, where killing the
-    // direct child leaves grandchildren holding the JVM's stdout/stderr pipes,
-    // the reader threads blocked, and `exitValue()`'s join unreturnable. The
-    // background `sleep` is that grandchild. Only a process-group kill returns
-    // near the budget; a destroy() of the direct child alone would park here
-    // until the JVM-side backstop latch, far past this assertion.
+    // The real process shape, tokenBySha.pl -> sh -> srcml: killing only the
+    // direct child leaves the background `sleep` holding this JVM's pipes.
     val cmd     = shellScript("sleep 30 & sleep 30")
     val started = System.currentTimeMillis()
     val (exit, _, _) = BlobExec.invoke(

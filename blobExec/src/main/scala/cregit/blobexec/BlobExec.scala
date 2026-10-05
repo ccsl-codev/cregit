@@ -9,75 +9,37 @@ import java.util.{Arrays => JavaArrays}
 import scala.io.Source
 import scala.sys.process.{Process, ProcessIO}
 
-/**
- * Run an external per-blob command and return the resulting `ObjectId`.
- *
- * Pure helper carved out of the old `BlobExecModifier`. Contract:
- *
- *   - env `BFG_BLOB`     = orig blob 40-hex
- *   - env `BFG_FILENAME` = blob basename (preserved for backward
- *                          compatibility with cregit's `tokenBySha.pl`,
- *                          which keys its on-disk memo by basename)
- *   - env `BFG_PATH`     = blob's full repo-root relative path
- *                          (e.g. `src/lib/foo.c`). Enables tokenizers to
- *                          make path-aware decisions.
- *   - stdin              = original blob bytes
- *   - stdout             = replacement blob bytes
- *   - exit != 0          → `Skip` (or `Abort` if `abortOnError`)
- *   - timeout            → child killed, `Skip` (never `Abort`, never `Replace`)
- *   - stdout == stdin    → `Skip` (no inserter activity)
- *   - otherwise          → `Replace(newBlob)`
- */
+/** Runs a per-blob command: original bytes on stdin, replacement on stdout, env
+  * `BFG_BLOB`, `BFG_PATH` and `BFG_FILENAME` (the basename, which `tokenBySha.pl`
+  * keys its memo by). */
 object BlobExec {
 
   /** Per-blob wall-clock budget for the external command, in seconds. */
   val DefaultTimeoutSeconds: Int = 600
 
-  /** Synthetic exit code reported by [[invoke]] when the child was killed for
-    * exceeding its budget. A real child can never produce it: on Unix a waited
-    * status is 0..255 (128+signal when killed), so negative values are free. */
+  /** Reported for a killed child; negative, so no real exit status can equal it. */
   val TimeoutExitCode: Int = -1
 
-  /** Exit status by which the tokenizer reports "srcML died on a signal, or this
-    * tokenization is otherwise unusable" — the defect that used to arrive here as
-    * a zero exit with empty stdout and become a silent 0-byte blob.
-    *
-    * Emitted by `tokenize/tokenizeSrcMl.pl` (`$PARSER_CRASH_EXIT` there) and
-    * propagated unchanged by `tokenize.pl` and `tokenizeByBlobId/tokenBySha.pl`.
-    * The two constants must stay in step; 33 is below 128 so it cannot collide
-    * with a shell's 128+signal encoding, and is clear of GNU `timeout`'s 124/137
-    * and of blobExec's own 2/3/4 exit statuses. */
+  /** Must match `$PARSER_CRASH_EXIT` in `tokenize/tokenizeSrcMl.pl`. */
   val ParserCrashExitCode: Int = 33
 
-  /** "the waiter never observed an exit status" — distinct from
-    * [[TimeoutExitCode]] so an interrupted wait can never be mistaken for a
-    * completed one, nor a completed one for a timeout. */
   private val NotExitedSentinel: Int = Int.MinValue
 
   /** Seconds GNU `timeout` waits between its SIGTERM and its SIGKILL (`-k`). */
   private val KillGraceSeconds: Int = 5
 
-  /** Slack on the JVM-side backstop latch beyond the child's own budget plus
-    * the kill grace. The latch should only ever fire if `timeout` itself is
-    * missing or wedged. */
+  /** Backstop for the JVM latch, which fires only if `timeout` is missing or wedged. */
   private val BackstopSlackSeconds: Int = 25
 
   /** Longest one [[invoke]] can take: the budget, the kill grace and the backstop. */
   private[blobexec] def maxChildLifetimeSeconds(timeoutSeconds: Int): Int =
     math.min(math.max(1, timeoutSeconds).toLong + KillGraceSeconds + BackstopSlackSeconds, Int.MaxValue.toLong).toInt
 
-  /** GNU `timeout`'s own statuses: 124 = the budget expired, 137 = 128+SIGKILL,
-    * i.e. the command ignored SIGTERM and needed the `-k` follow-up. Both mean
-    * "we killed it", and both must reach the Skip branch rather than the
-    * `exitCode != 0` branch, which `--abort-on-error` turns into a run abort. */
+  /** GNU `timeout`: 124 = budget expired, 137 = SIGKILL after `-k`. */
   private val TimeoutStatuses: Set[Int] = Set(124, 137)
 
-  /** GNU `timeout`, if it is on PATH. It is the only cheap way to kill the
-    * whole child *process group*: `Process.destroy()` signals the direct child's
-    * pid alone, and the tokenizer chain is `tokenBySha.pl` -> `sh` -> `srcml`,
-    * so the grandchildren survive, inherit the JVM's stderr pipe, and keep the
-    * reader thread blocked — which is how one wedged blob wedged a whole run.
-    * Resolved once; the warning is therefore printed at most once per process. */
+  /** GNU `timeout` kills the child's whole process group; `Process.destroy()` would
+    * kill only `tokenBySha.pl` and leave `srcml` holding our pipes open. */
   private lazy val gnuTimeout: Option[String] = {
     val found = sys.env
       .getOrElse("PATH", "")
@@ -104,11 +66,7 @@ object BlobExec {
     final case class Abort(stderr: String, exitCode: Int) extends Outcome
   }
 
-  /**
-   * Run `command` against `bytes`. Pure aside from the JVM process and the
-   * (single-threaded-per-call) jgit inserter. Thread-safe so long as
-   * `inserter` is confined to the calling thread.
-   */
+  /** Thread-safe if `inserter` is confined to the calling thread. */
   def run(
       bytes: Array[Byte],
       origSha: String,
@@ -128,12 +86,7 @@ object BlobExec {
     }
 
     if (exitCode == TimeoutExitCode) {
-      // A timed-out child skips exactly one blob. Deliberately *not* routed
-      // through `abortOnError`: one wedged tokenizer must never take down a
-      // run that has already folded thousands of commits, and its (discarded,
-      // possibly truncated) stdout must never be mistaken for a tokenization.
-      // `onTimeout` is how the caller counts it: a Skip that leaves raw source
-      // where tokens belong must not be invisible to the run's statistics.
+      // Not routed through `abortOnError`: one wedged blob must not abort a long run.
       System.err.println(
         s"Warning: command [$command] timed out after ${timeoutSeconds}s on blob $origSha " +
           s"at path [$fullPath]: child killed, blob excluded"
@@ -141,15 +94,7 @@ object BlobExec {
       onTimeout()
       Outcome.Skip
     } else if (exitCode == ParserCrashExitCode) {
-      // srcML died on a signal (SIGSEGV on 32 of the 36 known corpus files,
-      // SIGABRT on the other 4), or the token stream came back empty, which a
-      // healthy srcML parse never is. Treated exactly like a timeout in flow, and
-      // deliberately so: Skip rather than Replace, so the (empty or truncated)
-      // stdout can never become a blob; and NOT routed through `abortOnError`, so
-      // one crashing blob cannot take down a run that has folded thousands of
-      // commits. Counted separately from a timeout via `onParserCrash` because it
-      // is a different defect with a different fix — more time never helps a
-      // segfault — and because the operator needs to know which one happened.
+      // Skip like a timeout, but counted apart: more time never fixes a crash.
       System.err.println(
         s"Warning: command [$command] reported a parser crash (exit $exitCode) on blob $origSha " +
           s"at path [$fullPath]: srcML died or produced no tokens, so this blob is excluded " +
@@ -167,17 +112,7 @@ object BlobExec {
       logError(command, origSha, fullPath, exitCode, stderr)
       if (abortOnError) Outcome.Abort(stderr, exitCode) else Outcome.Skip
     } else if (stdout.isEmpty && bytes.nonEmpty) {
-      // Defence in depth, and the other half of "zero output is never success".
-      // The tokenizer now detects its own empty stream and exits
-      // ParserCrashExitCode, but this is the backstop for every way that could be
-      // bypassed — a wrapper that swallows the status, a different tokenizer, a
-      // future parser. Consuming real source and emitting nothing is a failure
-      // whatever the exit code says, and inserting it is precisely how a 1,263-byte
-      // C file became a 0-byte blob in a published dataset.
-      //
-      // The two cases the brief asks to be told apart are told apart here by
-      // `bytes.nonEmpty`: a genuinely empty input producing empty output is
-      // untouched and falls through to the `equals` branch below as a plain Skip.
+      // Backstop for any tokenizer that exits 0 with no output: never insert it.
       System.err.println(
         s"Warning: command [$command] exited 0 but produced no output for the ${bytes.length}-byte " +
           s"blob $origSha at path [$fullPath]. Refusing to write an empty tokenization: counting " +
@@ -192,11 +127,7 @@ object BlobExec {
     }
   }
 
-  /** Visible for testing. Runs the process and returns (exit, stdout, stderr).
-    *
-    * The child is bounded by `timeoutSeconds`; on expiry its whole process
-    * group is killed (via GNU `timeout`) and [[TimeoutExitCode]] is returned
-    * with empty stdout/stderr. */
+  /** Returns (exit, stdout, stderr), or [[TimeoutExitCode]] and no output if killed. */
   private[blobexec] def invoke(
       bytes: Array[Byte],
       origSha: String,
@@ -219,19 +150,11 @@ object BlobExec {
       try stderrBuilder.append(src.mkString) finally src.close()
     }
 
-    // daemonizeThreads = true: the stdout/stderr readers must not keep the JVM
-    // alive. `exitValue()` still joins them on the healthy path, so this only
-    // matters at JVM exit — and on the timeout path they are deliberately
-    // abandoned while blocked in `FileInputStream.readBytes`. Left non-daemon,
-    // two such threads kept the process running after the walk had finished,
-    // reintroducing the very stall this timeout exists to remove.
+    // Daemon readers: on timeout they are abandoned while blocked and must not
+    // keep the JVM alive.
     val io = new ProcessIO(writeStdin, readStdout, readStderr, daemonizeThreads = true)
 
     val secs = math.max(1, timeoutSeconds)
-    // Prefer the kernel over a pid-by-pid kill: GNU `timeout` runs the command
-    // in its own process group and signals the *group* on expiry, so `sh`,
-    // `tokenize.pl`, `srcml` and `srcml2token` all die together instead of
-    // orphaning themselves onto the JVM's pipes.
     val argv = gnuTimeout match {
       case Some(bin) => Seq(bin, "-k", KillGraceSeconds.toString, secs.toString, command)
       case None      => Seq(command)
@@ -246,12 +169,8 @@ object BlobExec {
     )
     val proc = pb.run(io)
 
-    // A stuck srcml/ctags used to park the caller forever: the child stops
-    // producing output but holds its stdout open, the reader thread blocks in
-    // pipe_read, `exitValue()` (which joins the io threads) never returns, and
-    // the whole project goes silent. Bound the child instead of trusting it to
-    // exit. `exitValue()` is moved onto a daemon thread so the timeout can be
-    // observed even when that join is the thing that is wedged.
+    // `exitValue()` joins the io threads, which a wedged child can block forever,
+    // so it runs on a daemon thread and the caller waits on a latch.
     val finished   = new java.util.concurrent.CountDownLatch(1)
     val exitHolder = new java.util.concurrent.atomic.AtomicInteger(NotExitedSentinel)
     val waiter = new Thread(
@@ -265,16 +184,10 @@ object BlobExec {
     waiter.setDaemon(true)
     waiter.start()
 
-    // `timeout` is the primary kill, so the latch is only a backstop: give it
-    // the child's own budget, the -k grace, and slack. It fires only when
-    // `timeout` is absent or itself wedged.
     val latchBudget = maxChildLifetimeSeconds(secs).toLong
 
-    // The io threads are abandoned rather than joined on every timeout path: if
-    // a surviving grandchild still holds a pipe, joining them is exactly the
-    // hang we are escaping. That makes `stdoutBuilder`/`stderrBuilder` live,
-    // racy state, so neither is read there — a timed-out blob's output is
-    // discarded by the caller anyway.
+    // On the timeout paths the io threads are abandoned, so the builders are racy:
+    // do not read them there.
     if (!finished.await(latchBudget, java.util.concurrent.TimeUnit.SECONDS)) {
       System.err.println(
         s"blobExec: no exit from [$command] ${latchBudget}s after start on blob $origSha " +
@@ -286,9 +199,7 @@ object BlobExec {
     } else
       exitHolder.get() match {
         case NotExitedSentinel =>
-          // The waiter was interrupted (e.g. pool.shutdownNow) before any status
-          // was observed. The blob may well have succeeded, but we cannot claim
-          // that, so it is reported as a timeout: Skip, never Replace.
+          // Interrupted before any status: the result is unknown, so Skip.
           System.err.println(
             s"blobExec: wait for blob $origSha ($fullPath) was interrupted before the child " +
               "reported a status; treating it as a timeout and discarding its output"
