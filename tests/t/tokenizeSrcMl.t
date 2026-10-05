@@ -18,7 +18,7 @@ plan skip_all => "ctags not on PATH"
 plan skip_all => "srcml2token not built (cd tokenize/srcMLtoken && make)"
     unless -x $srcml2token;
 
-plan tests => 24;
+plan tests => 27;
 
 my $workdir = tempdir(CLEANUP => 1);
 
@@ -105,6 +105,18 @@ sub run_tokenizer {
         like($err, qr/srcml2token was killed by signal $rawSignal/,
              "stderr names the signal");
     }
+}
+
+{
+    my $attr = "$workdir/attribute-in-parens.c";
+    open(my $fh, '>', $attr) or die $!;
+    print $fh "void f(int a) { F(a __attribute__((unused))); }\n";
+    close $fh;
+
+    my ($status, $out, $err) = run_tokenizer("--position", "'$attr'");
+    is($status, 0, "a GCC attribute after an expression inside parentheses tokenizes (srcML/srcML#2425)");
+    like($out, qr/^\d+:\d+\|attribute\|__attribute__\(\($/m, "and the attribute is in the tokenization");
+    like($out, qr/^\d+:\d+\|name\|unused$/m, "with its argument");
 }
 
 {
