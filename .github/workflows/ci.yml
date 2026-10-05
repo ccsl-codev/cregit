@@ -74,6 +74,9 @@ jobs:
       - name: Build & test Rust tokenizer (rust_tokenizer)
         run: devenv shell -- bash -c 'cd tokenize/rustTokenizer && make && make test'
 
+      - name: "Tokenizer worker: same output as tokenBySha.pl"
+        run: devenv shell -- bash tests/test_token_worker.sh
+
       - name: "Pipeline runner: artifact staleness guard"
         run: devenv shell -- bash test_ensure_artifacts.sh
 

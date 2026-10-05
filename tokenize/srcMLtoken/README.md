@@ -1,30 +1,27 @@
 # srcMLtoken
 
-`srcMLtoken` transcodes the output of srcML ([www.srcml.org](www.srcml.org)) to a tokenized view that can be used by Cregit.
-
-## Requirements
-
-`srcml` must be installed and in the PATH ([www.srcml.org](www.srcml.org))
+`srcml2token` parses a C, C++ or Java file with libsrcml
+([www.srcml.org](https://www.srcml.org)) and prints a tokenized view of its
+srcML that Cregit uses.
 
 ## How to use
 
-The input of `srml2token` is the output of `srcml`. `srml2token` takes no parameters, and it reads its input from _stdin_ and writes to _stdout_.
-
 ```sh
-srcml -l C --position <filename> | srcml2token
+srcml2token -l C <filename>
 ```
+
+It parses the file as `srcml -l C --position <filename>` does, and writes the
+tokens to _stdout_. `srcml2token --libsrcml-path` prints the libsrcml that it
+loads; `tokenize/tokenizerIdentity.pl` digests that file.
 
 ## How to build
 
-It requires `xerces` to be installed. Simply run:
+It needs `xerces-c` and the libsrcml headers and library. Inside `devenv shell`,
+`SRCML_PREFIX` names the srcML build of `nix/srcml.nix`. Run:
 
 ```sh
-make
+make && make test
 ```
-
-## TODO
-
-- Create a `cmake` configuration file.
 
 ## License
 
@@ -33,3 +30,4 @@ Apache-2.0
 
 Dependencies:
   - `xerces`: Apache-2.0
+  - `libsrcml`: GPL-3.0, so the linked `srcml2token` binary is under GPL-3.0

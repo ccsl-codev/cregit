@@ -60,6 +60,7 @@ final class Walker(
     destinationMayContainObjects: Boolean = true,
     blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
     stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
+    workerPool: Option[TokenizerWorkerPool] = None,
     // The shipped list by default, so a caller cannot forget it and hand a known
     // non-terminating blob to srcml. A parameter only so a test can supply its
     // own fixture; nothing at run time chooses a different list.
@@ -803,7 +804,8 @@ final class Walker(
         inserter     = workerInserter,
         timeoutSeconds = blobTimeoutSeconds,
         onTimeout      = () => { blobsTimedOut.increment(); failure.set("timeout") },
-        onParserCrash  = () => { blobsParserCrashed.increment(); failure.set("parser-crash") }
+        onParserCrash  = () => { blobsParserCrashed.increment(); failure.set("parser-crash") },
+        workerPool     = workerPool
       )
       val res = outcome match {
         case BlobExec.Outcome.Skip if failure.get() != null =>

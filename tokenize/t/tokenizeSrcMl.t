@@ -11,14 +11,12 @@ my $srcml2token = "$FindBin::Bin/../srcMLtoken/srcml2token";
 my $fixtures    = "$FindBin::Bin/../srcMLtoken/tests";
 my $expected    = "$FindBin::Bin/expected";
 
-plan skip_all => "srcml not on PATH"
-    unless system("srcml --version >/dev/null 2>&1") == 0;
 plan skip_all => "ctags not on PATH"
     unless system("ctags --version >/dev/null 2>&1") == 0;
 plan skip_all => "srcml2token not built (cd tokenize/srcMLtoken && make)"
     unless -x $srcml2token;
 
-plan tests => 21;
+plan tests => 24;
 
 # Exit status tokenizeSrcMl.pl uses for "srcML died / this tokenization is
 # unusable". Must match $PARSER_CRASH_EXIT there and BlobExec.ParserCrashExitCode.
@@ -77,7 +75,7 @@ sub run_tokenizer {
 
 # -- the silent-empty defect -------------------------------------------------
 #
-# srcML 1.1.0 dies on a signal when --position is given on certain C/C++ inputs.
+# libsrcml 1.1.0 dies on a signal when --position is given on certain C/C++ inputs.
 # This fixture is one of the 36 confirmed corpus files: the 1,263-byte
 # ext/liblzma/check/crc32_small.c from sumatrapdfreader__sumatrapdf, which is the
 # file that rules out any size explanation. Before the fix this exact input made
@@ -92,7 +90,7 @@ sub run_tokenizer {
     # Guard the fixture itself: if a future srcML stops crashing on it, these
     # assertions would silently stop testing anything, so prove the crash is real
     # before asserting on how it is handled.
-    my $rawRc = system("srcml -l C --position '$crasher' >/dev/null 2>&1");
+    my $rawRc = system("'$srcml2token' -l C '$crasher' >/dev/null 2>&1");
 
     # A signal death reaches us in one of two encodings and both must be accepted:
     # as a raw wait status ($rc & 127) when the child is waited for directly, or as
@@ -105,12 +103,12 @@ sub run_tokenizer {
     }
 
   SKIP: {
-        skip "srcml no longer dies on this fixture (rc=$rawRc): the upstream bug "
+        skip "srcml2token no longer dies on this fixture (rc=$rawRc): the upstream bug "
             . "appears fixed, so the crash-handling assertions cannot be exercised", 6
             unless $rawSignal;
 
         is($rawSignal == 11 || $rawSignal == 6, 1,
-           "fixture kills srcml with SIGSEGV(11) or SIGABRT(6), got signal $rawSignal");
+           "fixture kills srcml2token with SIGSEGV(11) or SIGABRT(6), got signal $rawSignal");
 
         my ($status, $out, $err) = run_tokenizer("--position", "'$crasher'");
 
@@ -122,10 +120,30 @@ sub run_tokenizer {
            "no tokenization is emitted on stdout");
         like($err, qr/FAILED/,
              "the failure is reported on stderr instead of passing silently");
-        like($err, qr/killed by signal $rawSignal/,
-             "stderr names the signal, so srcml's death is attributed to srcml "
-             . "and not to srcml2token, which exits 0 on the truncated XML");
+        like($err, qr/srcml2token was killed by signal $rawSignal/,
+             "stderr names the signal");
     }
+}
+
+{
+    my $dies = "$workdir/srcml2token-that-dies";
+    open(my $fh, '>', $dies) or die $!;
+    print $fh "#!/bin/sh\nkill -SEGV \$\$\n";
+    close $fh;
+    chmod 0755, $dies or die $!;
+
+    my $victim = "$workdir/ordinary.c";
+    open($fh, '>', $victim) or die $!;
+    print $fh "int main() { return 0; }\n";
+    close $fh;
+
+    my ($status, $out, $err) =
+        run_tokenizer("--srcml2token='$dies'", "--position", "'$victim'");
+
+    is($status >> 8, $PARSER_CRASH_EXIT,
+       "a srcml2token killed by a signal exits $PARSER_CRASH_EXIT, whatever srcML we ship");
+    is($out, "", "and emits no tokenization");
+    like($err, qr/killed by signal 11/, "and names the signal on stderr");
 }
 
 # The emptiness invariant the fix relies on, asserted rather than assumed: a
@@ -157,7 +175,7 @@ sub run_tokenizer {
 }
 
 # A path containing a single quote used to be interpolated straight into the shell
-# command string. Now it is quoted, so it must tokenize rather than fail.
+# command string, and broke the tokenizer.
 {
     my $odd = "$workdir/it's odd.c";
     open(my $fh, '>', $odd) or die $!;
@@ -165,6 +183,6 @@ sub run_tokenizer {
     close $fh;
 
     my ($status, $out, $err) = run_tokenizer("--position", "\"$odd\"");
-    is($status, 0, "a path containing a quote is passed to the shell safely");
+    is($status, 0, "a path containing a quote tokenizes");
     like($out, qr/begin_unit/, "and really was tokenized");
 }
