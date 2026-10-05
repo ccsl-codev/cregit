@@ -172,10 +172,8 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 token moved between files keeps its original author. It changes up to 25% of a
 project's authors, so blame from before 2026-09-22 is not comparable with later blame.
 
-**Pass `--reblame` whenever the blame itself changed**, not the file list. Without it
-step 7 skips every file whose `.blame` exists, exits 0, and step 10 rebuilds from the
-old blame. A real re-blame shows `Already done [0]` in step 7's summary. Do **not**
-pass the flag to resume an interrupted run.
+**Pass `--reblame` when the blame itself changed**: without it step 7 keeps every
+existing `.blame` file. Do **not** pass it to resume an interrupted run.
 
 A full run starts by **deleting the work directory** — to keep several target
 repositories side by side, give each its own `--work`. To resume a failed run
@@ -207,42 +205,9 @@ p.s.: long pauses are trimmed.
 
 ### When a tokenizer is corrected: `--retokenize`
 
-A rebuilt tokenizer does **not** by itself change cached tokens: blobExec's cache
-key (`command`, `mask`) stays the same, so a resume reuses the old output and exits 0.
-
-1. **Every run records a tokenizer identity** (`tokenize/tokenizerIdentity.pl`), one
-   digest per extension over its parser toolchain, in the blob map's `meta` table.
-   A mismatch on an extension with cached rows **refuses the run** (exit 3).
-   Nothing is invalidated automatically.
-2. **`--retokenize EXTS` is the opt-in past that refusal**, for those extensions
-   only (re-tokenizing is 88% of pipeline time).
-
-To re-tokenize only the `.rs` entries of one project, after rebuilding the
-tokenizer:
-
-```sh
-# 1. rebuild whatever is stale
-./run_pipeline_process.sh --ensure-artifacts
-
-# 2. resume at step 2 — never step 1, which deletes the work
-./run_pipeline_process.sh \
-  --repo-url <url> --repo-name <name> \
-  --work ../cregit-files-<name> \
-  --retokenize rs \
-  2
-```
-
-`--retokenize` needs `FROM_STEP=2` exactly: step 1 deletes the cache and step 3 or
-later skips the invalidation. It is not available with `--mode sharded`.
-
-In one transaction it drops those extensions' `blob_map` rows and **their memo
-entries** (the memo is keyed on content alone), plus `tree_map`, `commit_map` and
-`ref_map`. Other extensions' tokenizations survive.
-
-blobExec refuses **before changing anything** if no cached row carries a named
-extension, the memo held none of the affected blobs (wrong `--memo-dir`), another
-extension's tokenizer changed and was not named, or a retained `new_blob` id is
-missing from the cregit repository. An ineffective `--retokenize` exits 7, never 0.
+Each run records a tokenizer identity per extension; a changed one with cached rows refuses
+the run (exit 3). After `./run_pipeline_process.sh --ensure-artifacts`, resume at step 2 with
+`--retokenize rs` to redo only those cached tokens; one that would change nothing exits 7.
 
 ### Outputs
 

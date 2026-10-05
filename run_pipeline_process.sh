@@ -13,12 +13,7 @@ artifacts (jars, tokenizers) are built automatically first — run inside
 Build:
   --build-only      build all pipeline artifacts and exit, running nothing
   --ensure-artifacts
-                    run the pre-run build guard and exit. That guard builds any
-                    MISSING artifact, and also rebuilds the Rust tokenizer when its
-                    sources are newer than the binary — it is the pipeline's only
-                    compiled tokenizer, and a stale one silently shifts every
-                    Rust token column by a field. The four jars and srcml2token
-                    are still only checked for existence.
+                    build missing artifacts and a stale Rust tokenizer, then exit
 
 Target repository:
   --repo-url URL    git URL (or local path) of the repository to process (REQUIRED)
@@ -27,19 +22,13 @@ Target repository:
   --commit-url URL  base URL for the commit links in the generated HTML
                     (default: derived from --repo-url as <url minus .git>/commit/,
                     which is correct for GitHub/GitLab-style hosts)
-  --mask REGEX      regex selecting the files to tokenize; quote it
-                    (default: `perl tokenize/fileMask.pl`, every extension
-                    cregit can parse). A different mask forces a full rebuild,
-                    unless --mask-widened applies.
-  --mask-widened    resume across a wider mask, keeping blob_map's
-                    tokenizations. Needs FROM_STEP>=2, not with --mode sharded.
-                    blobExec verifies the rows and refuses with exit 3 if the
-                    new mask drops a tokenized path or a new_blob is missing.
-  --retokenize EXTS comma-separated extensions (as in CregitLanguages.pm, e.g.
-                    rs or c,h) whose cached tokenizations and memo entries are
-                    redone, after their tokenizer identity changed. Needs
-                    FROM_STEP=2 exactly, not with --mode sharded. blobExec
-                    refuses (exit 7) a --retokenize that would change nothing.
+  --mask REGEX      regex selecting the files to tokenize; quote it (default:
+                    `perl tokenize/fileMask.pl`, every extension cregit parses).
+                    A different mask forces a full rebuild, unless --mask-widened.
+  --mask-widened    resume across a wider mask, keeping blob_map's tokenizations.
+                    Needs FROM_STEP>=2, not with --mode sharded.
+  --retokenize EXTS redo the cached tokens of these extensions (e.g. rs or c,h)
+                    after their tokenizer changed. Needs FROM_STEP=2, not sharded.
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
@@ -63,11 +52,8 @@ Target repository:
                     A step-1 wipe that would delete a memo holding 10,000 entries
                     or more (MEMO_KEEP_THRESHOLD, overridable as
                     CREGIT_MEMO_KEEP_THRESHOLD) is refused; see --force-clean.
-  --blob-timeout N  wall-clock budget in seconds for one blob's tokenizer
-                    (blobExec default: 600). A child that exceeds it is killed
-                    and that blob is excluded, as an EXCLUDED failed blob line
-                    says. Also settable as CREGIT_BLOB_TIMEOUT in the
-                    environment, which is how to reach it through ctp.py.
+  --blob-timeout N  seconds before one blob's tokenizer is killed and the blob
+                    excluded (blobExec default: 600; env CREGIT_BLOB_TIMEOUT).
   --stall-timeout N watchdog window in seconds (blobExec default: 1800). If no
                     blob, tree, commit or blob copy completes anywhere in this
                     window the run is killed with exit 5. Must be larger than
@@ -88,9 +74,7 @@ Output:
                     should skip them. NOTE: the HTML views are the fallback
                     output when python3+duckdb is missing, so --skip-html
                     without duckdb leaves the run with no final artifact.
-  --reblame         re-blame every file in step 7, replacing existing .blame
-                    output. Pass it when the blame itself changed; a resume
-                    without it skips every file already blamed.
+  --reblame         re-blame every file in step 7, overwriting its .blame output
   --gc MODE         how to pack the generated cregit repo after tokenizing
                     (default: plain)
                       none        do not pack at all. Fastest, but every later
@@ -131,10 +115,8 @@ Tokenizer:
                                   delegates to blobExec/shard_build.sh
   --shards N    shard count for --mode sharded (default: 4)
   --tokenizer-worker
-                send each blob to a pool of persistent tokenizer processes
-                (tokenizeByBlobId/tokenWorker.pl) instead of starting the
-                tokenizer once per blob. Same output. Needs --mode pipeline or
-                pipeline-trees (default: off)
+                tokenize through a pool of persistent tokenizer processes; same
+                output. Needs --mode pipeline or pipeline-trees (default: off)
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck. Each file is independent, so the output does not
