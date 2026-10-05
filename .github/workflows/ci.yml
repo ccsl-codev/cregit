@@ -92,8 +92,7 @@ jobs:
       - name: Dataset tests (pytest)
         run: devenv shell -- pytest -q --junitxml=junit-generate-dataset.xml
 
-      # `devenv shell -- pytest` does not flush its summary line, so read the counts
-      # from the JUnit XML. Standard library only, so it needs no devenv shell.
+      # `devenv shell -- pytest` does not flush its summary line; read the JUnit XML.
       - name: Re-check the pytest JUnit counts
         if: always()
         shell: bash

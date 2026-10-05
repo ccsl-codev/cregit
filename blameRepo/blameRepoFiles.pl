@@ -230,8 +230,7 @@ blameRepoFiles.pl: create the "blame" of files in a git repository
 
 =item B<--overwrite>
 
-    By default, if an output file exists it is skipped. This changes that
-    behaviour and re-blames the file.
+    Re-blame files whose output already exists (by default they are skipped).
 
 =back
 

@@ -13,9 +13,8 @@ artifacts (jars, tokenizers) are built automatically first — run inside
 Build:
   --build-only      build all pipeline artifacts and exit, running nothing
   --ensure-artifacts
-                    run the pre-run build guard and exit, building nothing that
-                    is already current. That guard builds any MISSING artifact,
-                    and additionally rebuilds the Rust tokenizer when its
+                    run the pre-run build guard and exit. That guard builds any
+                    MISSING artifact, and also rebuilds the Rust tokenizer when its
                     sources are newer than the binary — it is the pipeline's only
                     compiled tokenizer, and a stale one silently shifts every
                     Rust token column by a field. The four jars and srcml2token
@@ -67,9 +66,8 @@ Target repository:
   --blob-timeout N  wall-clock budget in seconds for one blob's tokenizer
                     (blobExec default: 600). A child that exceeds it is killed
                     and that blob is excluded, as an EXCLUDED failed blob line
-                    says. Also settable
-                    as CREGIT_BLOB_TIMEOUT in the environment, which is how to
-                    reach it through ctp.py.
+                    says. Also settable as CREGIT_BLOB_TIMEOUT in the
+                    environment, which is how to reach it through ctp.py.
   --stall-timeout N watchdog window in seconds (blobExec default: 1800). If no
                     blob, tree, commit or blob copy completes anywhere in this
                     window the run is killed with exit 5. Must be larger than
@@ -222,9 +220,7 @@ DEFAULT_JOBS=4
 JOBS=${CREGIT_JOBS:-$DEFAULT_JOBS}
 FROM_STEP=1
 BUILD_ONLY=0
-# 1 means "run ensure_artifacts and exit". Distinct from --build-only, which
-# rebuilds all six unconditionally: this one runs exactly the guard a normal run
-# runs, so it is also how that guard is tested.
+# Unlike --build-only, runs exactly the guard a normal run runs (and tests it).
 ENSURE_ARTIFACTS_ONLY=0
 REPO_GIT_URL=""
 REPO_NAME=""
@@ -699,8 +695,6 @@ build_all() {
     log "build complete"
 }
 
-# Only the Rust tokenizer is checked for staleness: it is the one compiled
-# tokenizer. The jars and srcml2token are only checked for existence.
 RUST_TOKENIZER_SOURCES=(
     "$CREGIT/tokenize/rustTokenizer/Makefile"
     "$CREGIT/tokenize/rustTokenizer/Cargo.toml"
@@ -750,8 +744,7 @@ if [ "$BUILD_ONLY" = 1 ]; then
     exit 0
 fi
 
-# Auto-build any missing or out-of-date artifact BEFORE the work directory is
-# touched, so a build failure never disturbs the outputs of a previous run.
+# Before the work directory is touched, so a failed build keeps earlier outputs.
 ensure_artifacts
 
 if [ "$ENSURE_ARTIFACTS_ONLY" = 1 ]; then
@@ -858,38 +851,9 @@ echo "  Log: $LOG_FILE"
 echo "████████████████████████████████████████████████████████████████████████"
 echo ""
 
-# ---------------------------------------------------------------------------
-# --mask-widened / --retokenize: drop what a re-fold invalidates, keep what it
-# reuses
-# ---------------------------------------------------------------------------
-#
-# Both flags re-fold the whole history. A widening because every tree gains
-# entries; an invalidation because a re-tokenized blob changes the tree above it,
-# and blobExec empties tree_map and commit_map for exactly that reason. Either way
-# every rewritten commit gets a new sha. Steps 3-10 are all derived from those shas,
-# and two of them do NOT rebuild themselves, which makes this mandatory rather
-# than tidy:
-#
-#   step 6  `git clone` into a directory that already exists is `fatal:
-#           destination path already exists and is not an empty directory`.
-#           Verified. Any resume over a project that once completed dies here.
-#   step 7  blameRepoFiles.pl skips a file whose .blame output already exists
-#           (--overwrite is off by default). Those files name cregit commit shas
-#           from BEFORE the re-fold, so keeping them means step 10 joins blame
-#           against commits that no longer exist. That failure is quiet, which
-#           makes it worse than step 6's.
-#
-# Steps 3, 4 and 5 rebuild cleanly on their own (slickGitLog drops and recreates
-# its schema), but their outputs are deleted anyway: "everything derived from the
-# tokenized repository" is a rule someone can check, and "these three are
-# self-cleaning and those two are not" is a rule that rots.
-#
-# KEPT, deliberately and by name: the original bare clone (step 2's input), the
-# cregit bare repo (where blob_map's new_blob ids live), the blob map itself, and
-# the memo. Those four are the entire point of the flag.
-#
-# Named paths only. No globs, and never $WORK itself — the wipe of $WORK is the
-# expensive mistake this whole script is defended against.
+# A re-fold gives every cregit commit a new sha: step 6 cannot clone over its old
+# dir and step 7 would keep blame of the old shas. Keeps the bare repos, blob map
+# and memo. Named paths only, never a glob or $WORK itself.
 drop_refold_derived_artifacts() {  # $1 = which flag is asking, for the log
     log "$1: dropping the artifacts derived from the tokenized repo,"
     log "  because the re-fold gives every cregit commit a new sha."
@@ -921,13 +885,7 @@ if [ "$MASK_WIDENED" = 1 ]; then
     drop_refold_derived_artifacts "--mask-widened"
 fi
 
-# --retokenize does the same drop, but AFTER step 2 has actually invalidated
-# something — see the end of step 2. blobExec refuses a --retokenize that would
-# invalidate nothing, and doing the drop up front would mean a refused request had
-# already deleted the blame output. Blame is this pipeline's bottleneck (measured:
-# 8 files a minute, 5.6 days for the largest project), so destroying it to answer
-# a request that was then rejected is the most expensive possible way to handle a
-# typo in an extension name.
+# --retokenize drops them at the end of step 2 instead.
 
 # ---------------------------------------------------------------------------
 # Step 1 — clone bare original repo
@@ -950,15 +908,12 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 
 export BFG_MEMO_DIR="$MEMO_DIR"
 
-# Route through the tokenize.pl dispatcher (not tokenizeSrcMl.pl directly) so it can
-# fan out by language: srcML for .c/.h, rustTokenizer for .rs, etc. The
-# --srcml2token / --ctags paths are forwarded only to the srcML parser.
+# tokenize.pl dispatches by language; --srcml2token/--ctags reach only srcML.
 export BFG_TOKENIZE_CMD="${CREGIT}/tokenize/tokenize.pl \
   --srcml2token=${SRCML2TOKEN} \
   --ctags=$(which ctags)"
 
-# Lets blobExec refuse a cache built by a different tokenizer; fatal when empty,
-# because an empty identity turns the check off.
+# Fatal when empty: an empty identity turns blobExec's cache check off.
 TOKENIZER_IDENTITY=$(perl "${CREGIT}/tokenize/tokenizerIdentity.pl" \
     --srcml2token="${SRCML2TOKEN}" \
     --ctags="$(which ctags)") \
@@ -973,8 +928,6 @@ TOKENIZE_RC=0
 if [ "$MODE" = "sharded" ]; then
   # Memory-bounded path: N tree-only shards in parallel, then merge + serial
   # re-fold into $SHARD_OUT/final/{dst.git,blobmap.db} (byte-identical to serial).
-  # shard_build.sh propagates blobExec's 4 and 5 instead of collapsing them, so
-  # this branch gets the same marker and the same guard as the serial one.
   "${CREGIT}/blobExec/shard_build.sh" \
     --src "$REPO_PATH_ORIGINAL_BARE" \
     --out "$SHARD_OUT" \
@@ -986,11 +939,6 @@ if [ "$MODE" = "sharded" ]; then
     ${BLOB_TIMEOUT:+--blob-timeout "$BLOB_TIMEOUT"} \
     ${STALL_TIMEOUT:+--stall-timeout "$STALL_TIMEOUT"} || TOKENIZE_RC=$?
   tokenize_gate "$TOKENIZE_RC" "sharded tokenize (shard_build.sh)"
-  # Said out loud rather than left to be discovered. The tokenizer identity is not
-  # plumbed through shard_build.sh / shard_merge.py, so the merged blobmap.db a
-  # sharded build produces carries no tokenizer_id.* rows. A later non-sharded
-  # resume over that database records the identity of whatever tokenizer is then
-  # current, without being able to check it against the one that built it.
   log "note: --mode sharded does not record a tokenizer identity in the merged blob map."
   log "      A later resume cannot detect a tokenizer change against it. Non-sharded"
   log "      modes record and check it; see --retokenize."
@@ -1002,9 +950,7 @@ else
   [ "$MASK_WIDENED" = 1 ] && WIDENED_FLAG="--mask-widened"
   WORKER_FLAG=""
   [ "$TOKENIZER_WORKER" = 1 ] && WORKER_FLAG="--tokenizer-worker=${CREGIT}/tokenizeByBlobId/tokenWorker.pl"
-  # --retokenize carries --memo-dir with it, always, and blobExec refuses one
-  # without the other: the blob map and the memo are two caches of the same
-  # answer, and invalidating either alone invalidates nothing.
+  # blobExec refuses --retokenize without --memo-dir: the memo caches the same tokens.
   RETOKENIZE_FLAGS=()
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
@@ -1033,8 +979,7 @@ for _m in $KEEP_MARKERS; do
     fi
 done
 
-# Only after blobExec accepted the invalidation: a refused one (exit 7) must not
-# have cost the blame output.
+# Only after blobExec accepted it: a refused one (exit 7) must not cost the blame.
 if [ -n "$RETOKENIZE" ]; then
     drop_refold_derived_artifacts "--retokenize $RETOKENIZE"
 fi
