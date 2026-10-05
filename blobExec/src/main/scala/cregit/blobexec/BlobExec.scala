@@ -16,6 +16,9 @@ object BlobExec {
   /** Must match `$PARSER_CRASH_EXIT` in `tokenize/tokenizeSrcMl.pl`. */
   val ParserCrashExitCode: Int = 33
 
+  /** The JVM reports a death by signal N as exit status 128 + N. */
+  private val SignalDeathStatus: Int = 128
+
   sealed trait Outcome
   object Outcome {
     case object Skip                          extends Outcome
@@ -59,6 +62,16 @@ object BlobExec {
           s"Warning: command [$command] reported a parser crash (exit $ParserCrashExitCode) on blob " +
             s"$origSha at path [$fullPath]: srcML died or produced no tokens, so this blob is excluded " +
             "rather than written as an empty tokenization"
+        )
+        printStderr(command, origSha, fullPath, stderr)
+        onParserCrash()
+        Outcome.Skip
+
+      case ChildRunner.Outcome.Exited(status, _, stderr) if status > SignalDeathStatus =>
+        // A kill from outside (e.g. the OOM killer) must not keep the source as tokens.
+        System.err.println(
+          s"Warning: command [$command] was killed by signal ${status - SignalDeathStatus} on blob " +
+            s"$origSha at path [$fullPath]: blob excluded"
         )
         printStderr(command, origSha, fullPath, stderr)
         onParserCrash()

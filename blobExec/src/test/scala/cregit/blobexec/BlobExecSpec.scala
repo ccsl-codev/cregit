@@ -131,6 +131,16 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     crashes.get shouldEqual 1
   }
 
+  test("a tokenizer killed by a signal is excluded like a parser crash, never kept as source") {
+    val crashes = new java.util.concurrent.atomic.AtomicInteger(0)
+    val cmd = shellScript("cat > /dev/null; kill -9 $$")
+    BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                 abortOnError = false, inserter,
+                 onParserCrash = () => { crashes.incrementAndGet(); () }
+    ) shouldBe BlobExec.Outcome.Skip
+    crashes.get shouldEqual 1
+  }
+
   test("a parser crash skips one blob even with abortOnError, like a timeout") {
     val cmd = shellScript(s"exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,

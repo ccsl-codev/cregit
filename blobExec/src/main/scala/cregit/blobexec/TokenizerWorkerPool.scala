@@ -32,7 +32,7 @@ final class TokenizerWorkerPool(workerPath: String, size: Int) extends AutoClose
         ChildRunner.Outcome.Killed(s"tokenizer worker ${worker.index} gave no response within ${backstop}s; replaced it")
       case Some(Left(failure)) =>
         replace(worker)
-        ChildRunner.Outcome.Exited(1, Array.emptyByteArray, s"tokenizer worker ${worker.index} failed: $failure\n")
+        ChildRunner.Outcome.Killed(s"tokenizer worker ${worker.index} died ($failure); replaced it")
       case Some(Right(response)) =>
         if (worker.process.isAlive) idle.put(worker) else replace(worker)
         response

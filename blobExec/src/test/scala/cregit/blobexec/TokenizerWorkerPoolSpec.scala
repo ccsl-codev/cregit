@@ -87,6 +87,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
       }
       run("timeout.c") shouldEqual ((BlobExec.Outcome.Skip, "timeout"))
       run("crash.c") shouldEqual ((BlobExec.Outcome.Skip, "parser-crash"))
+      run("die.c") shouldEqual ((BlobExec.Outcome.Skip, "timeout"))
       run("ok.c")._1 shouldBe a[BlobExec.Outcome.Replace]
     }
   }
