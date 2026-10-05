@@ -169,17 +169,13 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--reblame`           | re-blame every file in step 7, replacing existing `.blame` output | off — a resume skips files already blamed |
 
 **`git blame` runs with `-C100` copy detection** (`blameRepo/formatBlame.pl`), so a
-token moved between files keeps its original author. Upstream shipped that commented
-out. Enabling it changed the author of up to 25% of a project's tokens, so blame output
-produced before 2026-09-22 is not comparable with output produced after it.
+token moved between files keeps its original author. It changes up to 25% of a
+project's authors, so blame from before 2026-09-22 is not comparable with later blame.
 
-**Pass `--reblame` whenever the blame itself changed**, not the file list.
-`blameRepoFiles.pl` skips any file whose `.blame` output already exists. That skip makes
-a resume cheap, and it makes a re-blame a silent no-op: step 7 reports every file as
-already done and exits 0, then step 10 rebuilds from the old blame. One pilot changed
-**0 of 15,036,195 tokens** that way, with identical row counts and `rc=0`. Read step 7's
-summary to confirm a real re-blame — `Already done [0]` is the proof. Do **not** pass the
-flag to resume an interrupted run.
+**Pass `--reblame` whenever the blame itself changed**, not the file list. Without it
+step 7 skips every file whose `.blame` exists, exits 0, and step 10 rebuilds from the
+old blame. A real re-blame shows `Already done [0]` in step 7's summary. Do **not**
+pass the flag to resume an interrupted run.
 
 A full run starts by **deleting the work directory** — to keep several target
 repositories side by side, give each its own `--work`. To resume a failed run
@@ -211,35 +207,24 @@ p.s.: long pauses are trimmed.
 
 ### When a tokenizer is corrected: `--retokenize`
 
-A corrected tokenizer does **not** by itself produce corrected tokens on a
-resume. blobExec decides whether to reuse a cached tokenization from the
-recorded `command` and `mask`. `command` is the constant path
-`tokenizeByBlobId/tokenBySha.pl`, and `mask` says *which* files to tokenize,
-never *how* — so rebuilding a tokenizer moves neither value, every cached row for
-that language stays a cache hit, and the run reproduces the old tokenizer's
-output and exits 0. Measured, for the Rust fix in `729643e`: 741,869 `.rs`
-(blob, path) pairs across 45 projects.
+A rebuilt tokenizer does **not** by itself change cached tokens: blobExec's cache
+key (`command`, `mask`) stays the same, so a resume reuses the old output and exits 0.
 
-Two mechanisms close that:
-
-1. **Every run reports a tokenizer identity** — one opaque digest per file
-   extension, covering that extension's whole parser toolchain
-   (`tokenize/tokenizerIdentity.pl`). blobExec records it in the blob map's
-   `meta` table and compares it on every later run. A mismatch, on an extension
-   that actually has cached rows, **refuses the run** (exit 3) and names the flag
-   to fix it. Nothing is invalidated automatically.
-2. **`--retokenize EXTS` is the opt-in past that refusal**, and it is selective:
-   re-tokenizing is 88% of total pipeline time, so a `.rs`-only defect costs
-   `.rs` entries only.
+1. **Every run records a tokenizer identity** (`tokenize/tokenizerIdentity.pl`), one
+   digest per extension over its parser toolchain, in the blob map's `meta` table.
+   A mismatch on an extension with cached rows **refuses the run** (exit 3).
+   Nothing is invalidated automatically.
+2. **`--retokenize EXTS` is the opt-in past that refusal**, for those extensions
+   only (re-tokenizing is 88% of pipeline time).
 
 To re-tokenize only the `.rs` entries of one project, after rebuilding the
 tokenizer:
 
 ```sh
-# 1. make sure the binary is actually current (this also proves the identity moved)
+# 1. rebuild whatever is stale
 ./run_pipeline_process.sh --ensure-artifacts
 
-# 2. resume that project at step 2 — never step 1, which deletes the work
+# 2. resume at step 2 — never step 1, which deletes the work
 ./run_pipeline_process.sh \
   --repo-url <url> --repo-name <name> \
   --work ../cregit-files-<name> \
@@ -247,23 +232,17 @@ tokenizer:
   2
 ```
 
-`--retokenize` needs `FROM_STEP=2` exactly: step 1 deletes the work directory
-(so there would be nothing cached to invalidate) and step 3 or later skips the
-invalidation entirely. It is not available with `--mode sharded`.
+`--retokenize` needs `FROM_STEP=2` exactly: step 1 deletes the cache and step 3 or
+later skips the invalidation. It is not available with `--mode sharded`.
 
-What it does, in one transaction: drops the `blob_map` rows for those extensions,
-purges **their entries in the memo** (which is keyed on `sha1` of the file's
-content with no tokenizer in the key, so dropping only the `blob_map` row would
-let the memo answer with the same stale tokens), and drops `tree_map`,
-`commit_map` and `ref_map` because a tree names its blobs. Every other
-extension's tokenizations survive.
+In one transaction it drops those extensions' `blob_map` rows and **their memo
+entries** (the memo is keyed on content alone), plus `tree_map`, `commit_map` and
+`ref_map`. Other extensions' tokenizations survive.
 
-It cannot quietly do nothing. blobExec refuses, **before changing anything**, if
-no cached row carries a named extension, if the memo held none of the affected
-blobs (which means `--memo-dir` is not this project's), if another extension's
-tokenizer also changed and was not named, or if a retained `new_blob` id is
-missing from the cregit repository. An ineffective `--retokenize` exits 7, never
-0.
+blobExec refuses **before changing anything** if no cached row carries a named
+extension, the memo held none of the affected blobs (wrong `--memo-dir`), another
+extension's tokenizer changed and was not named, or a retained `new_blob` id is
+missing from the cregit repository. An ineffective `--retokenize` exits 7, never 0.
 
 ### Outputs
 

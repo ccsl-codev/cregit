@@ -5,16 +5,14 @@
 sends each blob to an idle worker. A worker handles one request at a time.
 
 The worker reads `BFG_MEMO_DIR` and `BFG_TOKENIZE_CMD` from its environment,
-as `tokenBySha.pl` does. Its tokens, its memo files and its exit statuses are
-the same as those of `tokenBySha.pl`.
+as `tokenBySha.pl` does, and gives the same tokens, memo files and exit statuses.
 
 For C, C++ and Java, the worker does the work of `tokenizeSrcMl.pl` in its own
 process (`tokenize/CregitSrcMl.pm`) if `BFG_TOKENIZE_CMD` is `tokenize.pl` with
-only the options `--srcml2token=`, `--ctags=` and `--position`. It keeps one
-`ctags --_interactive` for each language alive, and starts only `srcml2token`
-for each file. For all other languages and commands, it starts
-`BFG_TOKENIZE_CMD` for each blob. The worker does not start if `srcml2token`
-does not answer `--libsrcml-path`.
+only the options `--srcml2token=`, `--ctags=` and `--position`: one
+`ctags --_interactive` per language stays alive and only `srcml2token` starts per
+file. Otherwise it starts `BFG_TOKENIZE_CMD` per blob. It refuses to start if
+`srcml2token` does not answer `--libsrcml-path`.
 
 ## Messages
 
