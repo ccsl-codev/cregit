@@ -1,6 +1,6 @@
-# srcML 1.1.0 built from its release tag, for the libsrcml headers. Later
-# revisions change the tokens of files that 1.1.0 parses (srcML/srcML#2325 marks
-# up some macro calls as expressions; UTF-8 input is no longer read as Latin-1).
+# srcML develop at d38271916: it fixes the heap corruption on a GCC attribute
+# after an expression in parentheses (srcML/srcML#2425), which 1.1.0 dies on.
+# No release carries the fix yet; move the pin to the first one that does.
 { lib
 , stdenv
 , fetchFromGitHub
@@ -13,6 +13,7 @@
 , libarchive
 , curl
 , libiconv
+, libxcb
 }:
 
 let
@@ -35,25 +36,33 @@ let
     hash = "sha256-O9l7k1/2fVfEcyfJmWzXmju6TRQHK+NZFoaYmdd5KRg=";
   };
 
+  clip = fetchFromGitHub {
+    owner = "dacap";
+    repo = "clip";
+    rev = "f2bd226fd96f3431f4675d9c13aa7334dd06ddda"; # tag v1.15
+    hash = "sha256-qviH7XwNOTA3sMnfwaJL+GqXHxeG6giIZneuTeB+Lm8=";
+  };
+
   cli11 = fetchurl {
-    url = "https://github.com/CLIUtils/CLI11/releases/download/v2.5.0/CLI11.hpp";
-    hash = "sha256-S/CpSQqnIJF2zNpwVE+VQT5ZTSIHzKM8nNGN7RiaY6Y=";
+    url = "https://github.com/CLIUtils/CLI11/releases/download/v2.7.0/CLI11.hpp";
+    hash = "sha256-WqjWN4eSFj0eDfZC7uMTrO7KaKU0ZFZq5yBNWcL14Wg=";
   };
 in
 stdenv.mkDerivation {
   pname = "srcml";
-  version = "1.1.0";
+  version = "1.1.0-unstable-2026-10-04";
 
   src = fetchFromGitHub {
     owner = "srcML";
     repo = "srcML";
-    rev = "af1efb78ddd6fc4a8fc75bc6dc3c2e22c5fd812d"; # tag v1.1.0
-    hash = "sha256-AdPVoUKI4/EigJz34BuGIbbN0jUGZTIxOQbmXr8IImM=";
+    rev = "d382719161daa1d035b594fcd3639ff376b4bb83";
+    hash = "sha256-SRUvvsMLenVadNOG3S49Rwe0eDEf3AidTxvo3RtZPHg=";
   };
 
   nativeBuildInputs = [ cmake ninja jdk_headless ];
 
   buildInputs = [ libxml2 libxslt libarchive curl ]
+    ++ lib.optionals stdenv.hostPlatform.isLinux [ libxcb ]
     ++ lib.optionals stdenv.hostPlatform.isDarwin [ libiconv ];
 
   # Without this the manpage step downloads a prebuilt page from a bare IP over
@@ -71,6 +80,7 @@ stdenv.mkDerivation {
     tar xf ${antlr} -C "$deps"
     cp -r --no-preserve=mode,ownership ${tinysha1} "$deps/tinysha1"
     cp -r --no-preserve=mode,ownership ${ctpl} "$deps/ctpl"
+    cp -r --no-preserve=mode,ownership ${clip} "$deps/clip"
     cp --no-preserve=mode,ownership ${cli11} "$deps/cli11/CLI11.hpp"
     cp --no-preserve=mode,ownership \
       ${lib.getDev libarchive}/include/archive.h \
@@ -81,6 +91,7 @@ stdenv.mkDerivation {
       "-DFETCHCONTENT_SOURCE_DIR_ANTLRSRC=$deps/antlr-2.7.7"
       "-DFETCHCONTENT_SOURCE_DIR_TINYSHA1=$deps/tinysha1"
       "-DFETCHCONTENT_SOURCE_DIR_CTPL_STL_SRC=$deps/ctpl"
+      "-DFETCHCONTENT_SOURCE_DIR_CLIP=$deps/clip"
       "-DFETCHCONTENT_SOURCE_DIR_CLI11=$deps/cli11"
       "-DFETCHCONTENT_SOURCE_DIR_LIBARCHIVEINCLUDE1=$deps/libarchive-include"
       "-DFETCHCONTENT_SOURCE_DIR_LIBARCHIVEINCLUDE=$deps/libarchive-include"
