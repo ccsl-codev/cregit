@@ -1,9 +1,12 @@
 # srcML at a pinned source revision. The 1.1.0 release binary segfaults under
 # `--position` (srcML/srcML#2395, fixed upstream by cebd3ab, still unreleased),
-# and the pipeline always passes `--position`.
+# and the pipeline always passes `--position`. The pin also segfaults on a GCC
+# `__attribute__` after an expression inside parentheses (srcML/srcML#2425), so
+# the upstream fix 0910c0eb is applied on top of it until a release carries it.
 { lib
 , stdenv
 , fetchFromGitHub
+, fetchpatch
 , fetchurl
 , cmake
 , ninja
@@ -58,6 +61,13 @@ stdenv.mkDerivation {
     rev = "8a3a629d84ac0e0228a5757e6b9876742f88ed25";
     hash = "sha256-stn1VP+D9Awd9B+r3UWIjHJUkoNU52SOJndX9hLEnrY=";
   };
+
+  patches = [
+    (fetchpatch {
+      url = "https://github.com/srcML/srcML/commit/0910c0ebac7d595a3ad47e3bbe681dfa130bf3b0.patch";
+      hash = "sha256-GqVYV8Z8OmK1TGsusNiGUjfXDAJlkB03ZPyuYLVABFA=";
+    })
+  ];
 
   nativeBuildInputs = [ cmake ninja jdk_headless ];
 
