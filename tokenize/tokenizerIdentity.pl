@@ -13,44 +13,9 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-# Prints blobExec's --tokenizer-identity argument: one opaque value per file
-# extension, changing whenever the thing that turns that extension's bytes into
-# tokens changes.
-#
-#   ext=<hex>,ext=<hex>,...
-#
-# Why this exists. blobExec decided whether to reuse a cached tokenization on
-# `command` and `mask`. `command` is the fixed path
-# tokenizeByBlobId/tokenBySha.pl and `mask` says WHICH files to tokenize, never
-# HOW. So when the Rust tokenizer's output format was corrected in 729643e,
-# neither value moved: every cached .rs row stayed a cache hit and a run with
-# the corrected binary reproduced the broken tokens, in 45 projects, with no
-# error anywhere. An identity that tracks the TOOLCHAIN is the missing key.
-#
-# What goes into an extension's identity, and why each part:
-#
-#   * its language's parser (CregitLanguages::LANG_PARSER_REL) — the tokenizer
-#     itself. For Rust that is the compiled cargo artifact, which is exactly the
-#     file that went stale.
-#   * srcml2token, the libsrcml it loads, ctags and CregitSrcMl.pm, for the
-#     srcML-routed languages only. srcml2token parses with libsrcml, and
-#     tokenizeSrcMl.pl (or CregitSrcMl.pm in the tokenizer worker) merges ctags
-#     output into its tokens. A change in any of them changes the tokens.
-#   * tokenize.pl and CregitLanguages.pm, for every extension. tokenize.pl is
-#     the dispatcher that decides which parser runs and with which flags
-#     (--position among them, which the token format depends on), and
-#     CregitLanguages.pm decides which language an extension is. Either one can
-#     change an extension's tokens without the parser changing at all.
-#
-# Including the shared files makes the identity CONSERVATIVE: editing
-# tokenize.pl moves every extension's identity, so every project with cached
-# rows refuses until an operator decides what to do. That is the right direction
-# to be blunt in. A refusal costs a conversation; a false "unchanged" costs a
-# republished corpus.
-#
-# The output is sorted and every value is a sha256 hex digest of a digest list,
-# so the string is byte-stable for a given checkout: it is stored in the blob
-# map's meta table and compared string-for-string on every resume.
+# Prints blobExec's --tokenizer-identity, ext=<sha256>,...: a digest of each
+# extension's parser, tokenize.pl, CregitLanguages.pm and, for srcML languages,
+# srcml2token, libsrcml, ctags and CregitSrcMl.pm. A change refuses old caches.
 
 use strict;
 use warnings;
@@ -87,8 +52,6 @@ GetOptions(
 
 my $basedir = $FindBin::Bin;
 
-# Every extension's identity includes these, because either one can change what
-# an extension's tokens are without any parser changing.
 my @shared = ("$basedir/tokenize.pl", "$basedir/CregitLanguages.pm");
 
 my %parsers = CregitLanguages::parsers($basedir);
@@ -97,11 +60,8 @@ my @extensions = $allExtensions
     ? CregitLanguages::extensions_sorted()
     : CregitLanguages::masked_extensions_sorted();
 
-# A file that is named but absent is fatal. Emitting an identity that silently
-# omitted a component would be worse than useless: it would compare EQUAL across
-# a change in that component, which is the exact failure this program exists to
-# make impossible. The Rust parser is a build artifact, so this is also where an
-# unbuilt checkout is caught.
+# A missing component is fatal: an identity without it would compare equal
+# across a change in it.
 sub digest_of {
     my ($path) = @_;
     open(my $fh, '<', $path)
@@ -146,8 +106,6 @@ for my $ext (@extensions) {
 
     my @components = (@shared, $parser);
 
-    # Required rather than optional: an identity for .c computed without
-    # srcml2token would not move when srcml2token does.
     if ($CregitLanguages::LANG_PARSER_REL{$language} eq $CregitLanguages::SRCML_PARSER_REL) {
         for my $pair (["--srcml2token", $srcml2tokenPath],
                       ["--ctags",       $ctagsPath]) {
@@ -161,9 +119,6 @@ for my $ext (@extensions) {
         push @components, $libsrcml, "$basedir/CregitSrcMl.pm";
     }
 
-    # Digest of the component digests, not of the concatenated bytes: the list is
-    # what identifies the toolchain, and a per-file digest makes a failure
-    # readable with --verbose-style debugging if it is ever needed.
     my $combined = sha256_hex(join("\n", map { cached_digest($_) } @components));
     push @pairs, "$ext=$combined";
 }
