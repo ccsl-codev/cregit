@@ -1,51 +1,31 @@
 package cregit.blobexec
 
 import org.eclipse.jgit.internal.storage.file.FileRepository
+import org.eclipse.jgit.lib.{Constants, ObjectId}
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder
 
-import java.nio.file.{Files, Paths}
+import java.nio.file.{Files, Path, Paths}
+import scala.util.Try
 
-/**
- * From-scratch rewriter for the cregit pipeline (step 2). Replaces the
- * previous in-place BFG-based rewrite with a jgit walk that builds a new
- * destination repo and persists `(orig → new)` mappings to SQLite, so a
- * subsequent invocation can resume incrementally.
- *
- *   blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
- *
- *   --abort-on-error  exit immediately (status 2) on the first non-zero
- *                     exit from <command>, instead of skipping that blob
- *   <src.git>         path to the bare source repo (read-only)
- *   <dst.git>         path to the bare destination repo (created if missing)
- *   <db.sqlite>       path to the SQLite mapping file (created if missing)
- *   <command>         absolute path to the per-blob script to run
- *   <fileMaskRegex>   regex matched against each blob's filename
- *
- * For each blob whose filename matches `fileMaskRegex`, `command` is invoked
- * with the blob bytes on stdin and env vars `BFG_BLOB` (orig sha) +
- * `BFG_FILENAME`. Its stdout becomes the new blob. Non-zero exit or
- * identical-output leaves the blob unchanged. The new commit message gets
- * `Former-commit-id: <orig-sha>` appended (BFG-compatible).
- */
+/** Step 2 of the cregit pipeline: rewrites <src.git> into <dst.git> through the
+  * per-blob <command>, and records (orig -> new) ids in SQLite so a rerun resumes. */
 object Main {
 
-  /** Exit status when `--retokenize` would invalidate nothing. Not 3 (memo mismatch):
-    * a no-op request must be told apart from a refusal, and never read as success. */
+  /** Not 3 (memo mismatch): a no-op request must be told apart from a refusal. */
   private[blobexec] val RetokenizeIneffectiveExitStatus = 7
+
+  private val UsageExitStatus   = 1
+  private val RefusedExitStatus = 3
 
   /** 2 on an abort, else 0: excluded blobs are named on EXCLUDED lines, not failed. */
   private[blobexec] def exitStatus(stats: WalkStats): Int =
     if (stats.aborted) 2 else 0
 
-  /** Value parser for the `--blob-timeout=` / `--stall-timeout=` seconds: a
-    * positive whole number, else None (which the caller reports and exits 1 on).
-    * Zero and negatives are rejected rather than read as "no limit" — an
-    * unbounded blob is the defect this whole change exists to remove. */
+  /** Zero and negatives are refused rather than read as "no limit". */
   private[blobexec] def parsePositiveSeconds(spec: String): Option[Int] =
     spec.toIntOption.filter(_ > 0)
 
-  /** Multiple of `--blob-timeout` used when the stall window has to be widened
-    * for it, matching the ratio of the two defaults (600 and 1800). */
+  /** Ratio of the two defaults (600 and 1800). */
   private[blobexec] val StallTimeoutMultiple = 3
 
   /** An explicit window below the floor is refused; a defaulted one is widened to
@@ -74,565 +54,432 @@ object Main {
       Walker.stallFloorFor(blobTimeoutSeconds)
     )
 
-  // `raw` (not `s`): the mask example below contains a regex backslash, which a
-  // processed-escape interpolator rejects. `$$` therefore renders a literal `$`.
-  private val Usage =
-    raw"""Usage: blobExec [--abort-on-error] [--pipeline | --pipeline-trees | --shard=K/N] [--warm=<db>] [--mask-widened] [--tokenizer-identity=<ext>=<value>,...] [--retokenize=<ext>,...] [--memo-dir=<dir>] [--tokenizer-worker=<path>] [--blob-timeout=<seconds>] [--stall-timeout=<seconds>] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
+  // `raw`: the mask example holds a regex backslash; `$$` renders a literal `$`.
+  private[blobexec] val Usage =
+    raw"""Usage: blobExec [options] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
-      |  --abort-on-error  exit immediately (status 2) on the first non-zero
-      |                    exit from <command>, instead of skipping that blob
-      |  --mask-widened    resume against a blob map recorded under a DIFFERENT
-      |                    <fileMaskRegex>, keeping the tokenizations already in
-      |                    blob_map. Without it a mask change is refused (status
-      |                    3), which is the right default and stays the default.
-      |                    Valid only because the mask decides WHICH blobs are
-      |                    tokenized, never HOW: the language comes from the
-      |                    file's extension, per file, so the same (blob, path)
-      |                    yields the same tokens under any mask that selects it.
+      |  --abort-on-error           exit 2 on the first error from <command> instead of skipping the blob
+      |  --pipeline                 look-ahead pipelined walker; same output as the serial walker
+      |  --pipeline-trees           as --pipeline, and also assemble trees on the worker pool
+      |  --shard=K/N                tree-only run of shard K (0-based) of N commit ranges, no commits or
+      |                             refs (merge with shard_merge.py); not with --pipeline(-trees)
+      |  --warm=<db>                read-only fallback mapping DB, consulted on a blob_map/tree_map miss
+      |  --mask-widened             resume under a wider <fileMaskRegex>, keeping blob_map's tokens;
+      |                             refused (status 3) unless every tokenized path still matches the
+      |                             new mask and <dst.git> holds the kept ids
+      |  --tokenizer-identity=<ext>=<value>[,...]
+      |                             tokenizer digest per extension (tokenize/tokenizerIdentity.pl); a
+      |                             change since the cache was built refuses the run (status 3)
+      |  --retokenize=<ext>[,...]   drop these extensions' cached tokens (blob_map and memo); needs
+      |                             --tokenizer-identity and --memo-dir; a no-op is refused (status ${RetokenizeIneffectiveExitStatus})
+      |  --memo-dir=<dir>           the tokenizer memo ($$BFG_MEMO_DIR) that --retokenize purges
+      |  --tokenizer-worker=<path>  tokenize through a pool of persistent workers; needs --pipeline(-trees)
+      |  --blob-timeout=<seconds>   budget for one <command> run (default ${BlobExec.DefaultTimeoutSeconds}); then its process
+      |                             tree is killed and the blob excluded
+      |  --stall-timeout=<seconds>  exit ${Walker.StalledExitStatus} after this long with no progress (default ${Walker.DefaultStallTimeoutSeconds});
+      |                             must cover one blob's lifetime: below it is refused, a default raised
+      |  <src.git>                  bare source repository (read-only)
+      |  <dst.git>                  bare destination repository (created if missing, reused on resume)
+      |  <db.sqlite>                SQLite mapping file (created if missing, reused on resume)
+      |  <command>                  absolute path of the per-blob command
+      |  <fileMaskRegex>            regex matched against each blob's filename (e.g. '\.[ch]$$')
       |
-      |                    It is not taken on trust. Two checks run first, and
-      |                    NOTHING is written until both pass:
-      |                      1. every path of a tokenized row (orig <> new) must
-      |                         still match the new mask. One regex test per row,
-      |                         against the data, so a narrowing mislabelled as a
-      |                         widening is caught and named. Regexes are never
-      |                         compared to each other.
-      |                      2. a spread sample of the retained new_blob ids must
-      |                         resolve in <dst.git>. Those ids exist only there,
-      |                         so the map is reusable only alongside it.
+      |  Denylisted (${BlobDenylist.EntriesSource}) and oversized blobs, and blobs whose tokenizer
+      |  times out or crashes, are left out of the trees and named on an EXCLUDED line; they do not
+      |  change the exit status.
       |
-      |                    Then: tree_map, commit_map and ref_map are emptied
-      |                    (trees gain entries, commits name trees, refs name
-      |                    commits), and so are blob_map's IDENTITY rows
-      |                    (orig == new). The identity rows are the subtle part:
-      |                    they record "this path was not selected, its bytes pass
-      |                    through", and under a wider mask some of those paths
-      |                    ARE selected. Keeping them would serve RAW SOURCE as a
-      |                    cache hit for precisely the files the widening exists
-      |                    to tokenize.
-      |
-      |                    This is a step-2 resume that KEEPS the work directory,
-      |                    never a fresh run — a fresh run deletes dst.git, and
-      |                    check 2 then refuses.
-      |  --tokenizer-identity=<ext>=<value>[,<ext>=<value>...]
-      |                    which tokenizer produced the tokens for each file
-      |                    extension, as an opaque value per extension (a digest
-      |                    of the parser toolchain; tokenize/tokenizerIdentity.pl
-      |                    computes it). Recorded in the blob map's meta table on
-      |                    first sight and COMPARED on every later run.
-      |
-      |                    This closes a hole that <command> could not. <command>
-      |                    is the constant path tokenizeByBlobId/tokenBySha.pl, so
-      |                    when a tokenizer behind it is corrected, nothing the
-      |                    reuse decision looks at changes: every cached row for
-      |                    that language stays a cache hit and the run reproduces
-      |                    the OLD tokenizer's output with no error anywhere. That
-      |                    happened — a rustTokenizer binary 16 days older than
-      |                    its source kept emitting a `line:col<TAB>` prefix, and
-      |                    741,869 .rs entries in 45 projects carried it.
-      |
-      |                    A mismatch REFUSES the run (status 3) and names the
-      |                    flag to fix it. It never invalidates anything by
-      |                    itself, which is why comparing is safe as a default:
-      |                    the 186 published projects are not touched. An
-      |                    extension with nothing recorded is not a mismatch —
-      |                    that is what every blob map built before this flag
-      |                    looks like — so it is simply recorded.
-      |  --retokenize=<ext>[,<ext>...]
-      |                    the opt-in past that refusal: invalidate the cached
-      |                    tokenizations of these extensions and nothing else.
-      |                    Requires --tokenizer-identity and --memo-dir, and a
-      |                    step-2 resume (the ids live in <dst.git>).
-      |
-      |                    SELECTIVE on purpose. Re-tokenizing is 88% of total
-      |                    pipeline time, so a defect in one language's tokenizer
-      |                    must cost one language's entries. Deliberately NOT
-      |                    --drop-memo, which destroys 2.6 M memoized
-      |                    tokenizations wholesale, and deliberately not
-      |                    --mask-widened, which answers a different question.
-      |
-      |                    BOTH cache layers go, together, and neither can be
-      |                    done without the other:
-      |                      - blob_map's tokenized rows on those extensions, and
-      |                      - their entries in the memo under --memo-dir. The
-      |                        memo is keyed on sha1(contents) ALONE
-      |                        (tokenBySha.pl:76) with no tokenizer in the key, so
-      |                        dropping only the blob_map row just moves the stale
-      |                        answer one layer down.
-      |                    tree_map, commit_map and ref_map go too: a tree names
-      |                    its blobs, and a retained tree_map row short-circuits
-      |                    the re-walk of the subtree holding the file.
-      |
-      |                    IT CANNOT QUIETLY DO NOTHING. It refuses, before
-      |                    changing anything, when: another extension's tokenizer
-      |                    also changed and was not named; no tokenized row
-      |                    carries any named extension (status ${RetokenizeIneffectiveExitStatus}); the memo held
-      |                    none of the affected blobs and --memo-dir is not
-      |                    $$BFG_MEMO_DIR, the memo tokenBySha.pl reads (status ${RetokenizeIneffectiveExitStatus});
-      |                    or a RETAINED new_blob id does not resolve in <dst.git>.
-      |  --memo-dir=<dir>  the memo directory ($$BFG_MEMO_DIR) whose entries
-      |                    --retokenize must purge. Only read with --retokenize;
-      |                    passing it alone is an error rather than a no-op.
-      |  --tokenizer-worker=<path>
-      |                    send each blob to one of a pool of persistent
-      |                    tokenizer processes (tokenizeByBlobId/tokenWorker.pl)
-      |                    instead of running <command> once per blob. Its
-      |                    output is the same. Needs --pipeline or --pipeline-trees.
-      |  --blob-timeout=<seconds>
-      |                    wall-clock budget for one <command> invocation
-      |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
-      |                    killed (whole process tree) and that blob is
-      |                    excluded as failed (see below); the run continues.
-      |  --stall-timeout=<seconds>
-      |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}); must clear one
-      |                    blob's whole lifetime (--blob-timeout plus the kill
-      |                    path), since a pure-blob commit's only progress is a
-      |                    blob finishing or being killed. If it is not, an
-      |                    explicit value is refused and a defaulted one is raised
-      |                    to ${StallTimeoutMultiple}x --blob-timeout or that floor. If no blob, tree,
-      |                    commit or blob copy completes anywhere in this window,
-      |                    the run is stuck in a way the per-blob kill did not
-      |                    cover: it is reported with the work in flight and the
-      |                    process is killed with status ${Walker.StalledExitStatus}. The memo is
-      |                    durable, so re-running resumes.
-      |
-      |  Blobs on the shipped denylist (${BlobDenylist.EntriesSource}) are never
-      |  handed to <command>: they are dropped from the rewritten trees, counted as
-      |  blobsDenylisted, named with their reason and citation on an EXCLUDED line,
-      |  and they do NOT change the exit status. srcML 1.1.0 does not terminate on
-      |  the listed blobs, so the list saves the --blob-timeout each run would spend.
-      |
-      |  A blob whose tokenizer times out or reports a parser crash is excluded
-      |  the same way: dropped from the rewritten trees, counted as blobsTimedOut
-      |  or blobsParserCrashed, named on an 'EXCLUDED failed blob' line, and tried
-      |  only once per run. It does NOT change the exit status.
-      |
-      |  Exit status: 0 = clean, 1 = usage, 2 = aborted on a command error,
-      |               3 = memo meta mismatch (including a changed tokenizer with
-      |               no --retokenize), ${Walker.StalledExitStatus} = killed by the stall watchdog,
-      |               ${RetokenizeIneffectiveExitStatus} = --retokenize would have invalidated nothing.
-      |  --pipeline        use the look-ahead pipelined walker (producer runs
-      |                    ahead so the blob-command pool stays saturated);
-      |                    output is identical to the default serial walker
-      |  --pipeline-trees  as --pipeline, but also assembles rewritten trees on
-      |                    the worker pool (Design B: only commit construction
-      |                    and the ordered DB write stay on the consumer);
-      |                    output is identical to the default serial walker
-      |  --shard=K/N       TREE-ONLY history shard: partition the commits (in
-      |                    canonical TOPO+REVERSE order) into N contiguous
-      |                    ranges and process only shard K (0-based). Tokenizes
-      |                    blobs and builds+persists trees (blob_map + tree_map
-      |                    incl. subtree ids) for the slice, but does NOT fold
-      |                    commits (no commit_map, no refs). Run N shards to
-      |                    their own dst.git + db.sqlite, then merge + serial
-      |                    re-fold (shard_merge.py) for byte-identical output.
-      |                    Uses the flat-memory serial walker; mutually
-      |                    exclusive with --pipeline / --pipeline-trees.
-      |  --warm=<db>       optional read-only fallback DB (a frozen prior memo,
-      |                    e.g. the paused whole-kernel run). On a blob_map /
-      |                    tree_map miss the lookup falls through to this DB, so
-      |                    a shard skips re-tokenizing content already done.
-      |                    Never written; commit_map is never consulted.
-      |  <src.git>         bare source repo (read-only)
-      |  <dst.git>         bare destination repo (created on first run, reused on incremental)
-      |  <db.sqlite>       SQLite mapping file (created on first run, reused on incremental)
-      |  <command>         absolute path to the per-blob script to run
-      |  <fileMaskRegex>   regex matched against each blob's filename (e.g. '\.[ch]$$')
+      |  Exit status: 0 clean, 1 usage, 2 aborted on a command error, 3 cache mismatch,
+      |  ${Walker.StalledExitStatus} stalled, ${RetokenizeIneffectiveExitStatus} --retokenize would invalidate nothing.
       |""".stripMargin
 
-  def main(args: Array[String]): Unit = {
+  private[blobexec] final case class Options(
+      abortOnError: Boolean = false,
+      pipeline: Boolean = false,
+      pipelineTrees: Boolean = false,
+      shard: Option[(Int, Int)] = None,
+      warm: Option[Path] = None,
+      maskWidened: Boolean = false,
+      tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
+      retokenize: Set[String] = Set.empty,
+      memoDir: Option[Path] = None,
+      tokenizerWorker: Option[Path] = None,
+      blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
+      stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
+      stallExplicit: Boolean = false,
+      positional: Vector[String] = Vector.empty
+  ) {
+    def src: Path       = Paths.get(positional(0))
+    def dst: Path       = Paths.get(positional(1))
+    def db: Path        = Paths.get(positional(2))
+    def command: String = positional(3)
+    def mask: String    = positional(4)
+
+    def stallWindow: Either[String, Int] =
+      resolveStallTimeout(blobTimeoutSeconds, stallTimeoutSeconds, stallExplicit)
+
+    def anyPipeline: Boolean = pipeline || pipelineTrees
+  }
+
+  private object Messages {
+    def withUsage(error: String): String = s"$error\n$Usage"
+
+    def unknownFlag(flag: String): String = withUsage(s"Error: unknown flag [$flag]")
+    def badFlagValue(flag: String, why: String): String = s"Error: $flag: $why"
+
+    def secondsWanted(spec: String): String = s"must be a positive whole number of seconds [$spec]"
+    def shardRange(spec: String): String    = s"must be K/N with 0 <= K < N and N >= 1 [$spec]"
+    def shardForm(spec: String): String     = s"must be of the form K/N [$spec]"
+
+    val NotAFile = "is not a file"
+    val NotTheMemo =
+      "is not a directory. It must be the SAME memo this project's tokenizations were written " +
+        "into, or the invalidation would leave the real memo's stale entries in place."
+
+    val PipelinesExclusive = withUsage("Error: --pipeline and --pipeline-trees are mutually exclusive")
+    val ShardWithPipeline = withUsage(
+      "Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
+    val MaskWidenedUnderShard = withUsage(
+      "Error: --mask-widened has nothing to do under --shard: each shard builds a fresh dst.git and " +
+        "blobmap.db, so no mask is recorded to widen. Reuse a prior run's tokenizations with --warm=<db> instead.")
+
+    val RetokenizeNeedsIdentity = withUsage(
+      "Error: --retokenize needs --tokenizer-identity. Invalidating the entries without recording which " +
+        "tokenizer replaces them leaves nothing for the next run to detect a change against, so the next " +
+        "tokenizer defect would be just as silent as this one.")
+    val RetokenizeNeedsMemoDir = withUsage(
+      "Error: --retokenize needs --memo-dir. There are two caches, not one: dropping a blob_map row makes " +
+        "the walker re-run <command>, and <command> is tokenizeByBlobId/tokenBySha.pl, which answers from " +
+        "$BFG_MEMO_DIR keyed on sha1(contents) with no tokenizer in the key. Invalidating one layer " +
+        "without the other invalidates nothing at all.")
+    def retokenizeUncovered(unknown: Set[String], known: Set[String]): String =
+      s"Error: --retokenize names extension(s) --tokenizer-identity does not cover: " +
+        s"${unknown.toVector.sorted.mkString(", ")}. Known: ${known.toVector.sorted.mkString(", ")}."
+    val RetokenizeWithMaskWidened =
+      "Error: --mask-widened and --retokenize cannot be combined. Each verifies its own precondition " +
+        "against the rows, and together each would verify against a state the other is about to " +
+        "change. Widen first, then resume with --retokenize."
+    val RetokenizeUnderShard =
+      "Error: --retokenize has nothing to do under --shard: each shard builds a fresh dst.git and " +
+        "blobmap.db, so there are no cached tokenizations to invalidate. Retokenize the merged result, " +
+        "or drop the shards' --warm=<db>."
+    val MemoDirWithoutRetokenize =
+      "Error: --memo-dir has no effect without --retokenize. Nothing else in blobExec reads the memo " +
+        "— tokenizeByBlobId/tokenBySha.pl takes it from $BFG_MEMO_DIR in the environment."
+
+    def workerNotExecutable(path: Path): String = s"Error: --tokenizer-worker [$path] is not an executable file"
+    val WorkerNeedsPipeline = "Error: --tokenizer-worker needs --pipeline or --pipeline-trees"
+
+    def srcNotADirectory(path: Path): String = s"Error: src repo [$path] is not a directory"
+    def commandMissing(command: String): String = s"Error: command [$command] does not exist"
+    val EmptyMask = "Error: fileMaskRegex must be non-empty"
+
+    def stallRaised(from: Int, to: Int, blobTimeoutSeconds: Int): String =
+      s"blobExec: raising the stall window from ${from}s to ${to}s, because " +
+        s"--blob-timeout=${blobTimeoutSeconds}s needs a window that clears one blob's whole lifetime. " +
+        "Pass --stall-timeout explicitly to choose your own."
+
+    def error(e: Throwable): String = s"Error: ${e.getMessage}"
+    val MaskWidenedHint =
+      "Hint: if the new mask is a strict superset of the recorded one, --mask-widened reuses the " +
+        "tokenizations already in blob_map instead of redoing them. It verifies that against the rows " +
+        "themselves and refuses if it is not true. It requires the work directory to be intact (resume " +
+        "at step 2), because blob_map's ids live in dst."
+
+    def denylisted(count: Long, entries: Int): String =
+      s"blobExec: $count blob(s) were excluded by the blob denylist " +
+        s"(${BlobDenylist.EntriesSource}, $entries entr${if (entries == 1) "y" else "ies"}). Each one is " +
+        "named with its sha, path, reason and upstream citation on an 'EXCLUDED denylisted blob' line " +
+        "above; those lines and that list are the record of what this project's dataset does not " +
+        "contain. The files are absent from the tokenized repository, not present as raw source, so " +
+        "they produce no blame and no dataset row. This is not a failure and does not affect the exit status."
+
+    def oversized(count: Long): String =
+      s"blobExec: $count blob(s) were excluded as oversized (>= ${Walker.MaxBlobBytes} bytes, JGit's " +
+        "stream-file threshold). Each one is named with its sha, path and size on an 'EXCLUDED " +
+        "oversized blob' line above; those lines are the record of what this project's dataset does " +
+        "not contain. The files are absent from the tokenized repository, not present as raw source, " +
+        "so they produce no blame and no dataset row. This is not a failure and does not affect the exit status."
+
+    def failed(timedOut: Long, crashed: Long, blobTimeoutSeconds: Int): String =
+      s"blobExec: ${timedOut + crashed} blob(s) were excluded because their tokenizer failed " +
+        s"($timedOut timed out after ${blobTimeoutSeconds}s, $crashed reported a parser crash). Each " +
+        "one is named on an 'EXCLUDED failed blob' line above; those lines are the record of what " +
+        "this project's dataset does not contain. This does not affect the exit status."
+  }
+
+  /** `--name=<value>` as a pattern: `case Flag(value) =>`. */
+  private final class ValuedFlag(val name: String) {
+    private val prefix = name + "="
+    def unapply(arg: String): Option[String] = Option.when(arg.startsWith(prefix))(arg.substring(prefix.length))
+  }
+
+  private val TokenizerIdentityFlag = new ValuedFlag("--tokenizer-identity")
+  private val RetokenizeFlag        = new ValuedFlag("--retokenize")
+  private val MemoDirFlag           = new ValuedFlag("--memo-dir")
+  private val ShardFlag             = new ValuedFlag("--shard")
+  private val WarmFlag              = new ValuedFlag("--warm")
+  private val TokenizerWorkerFlag   = new ValuedFlag("--tokenizer-worker")
+  private val BlobTimeoutFlag       = new ValuedFlag("--blob-timeout")
+  private val StallTimeoutFlag      = new ValuedFlag("--stall-timeout")
+
+  private def flagValue[A](flag: ValuedFlag, spec: String)(parse: String => Either[String, A]): Either[String, A] =
+    parse(spec).left.map(Messages.badFlagValue(flag.name, _))
+
+  private def seconds(spec: String): Either[String, Int] =
+    parsePositiveSeconds(spec).toRight(Messages.secondsWanted(spec))
+
+  private def shardSpec(spec: String): Either[String, (Int, Int)] =
+    spec.split("/", -1) match {
+      case Array(k, n) =>
+        (k.toIntOption, n.toIntOption) match {
+          case (Some(k), Some(n)) if n >= 1 && k >= 0 && k < n => Right((k, n))
+          case _                                               => Left(Messages.shardRange(spec))
+        }
+      case _ => Left(Messages.shardForm(spec))
+    }
+
+  private def existingPath(isValid: Path => Boolean, otherwise: String)(spec: String): Either[String, Path] = {
+    val path = Paths.get(spec)
+    if (isValid(path)) Right(path) else Left(s"[$path] $otherwise")
+  }
+
+  private def parseFlag(o: Options, flag: String): Either[String, Options] = flag match {
+    case "--abort-on-error" => Right(o.copy(abortOnError = true))
+    case "--pipeline"       => Right(o.copy(pipeline = true))
+    case "--pipeline-trees" => Right(o.copy(pipelineTrees = true))
+    case "--mask-widened"   => Right(o.copy(maskWidened = true))
+    case TokenizerIdentityFlag(spec) =>
+      flagValue(TokenizerIdentityFlag, spec)(TokenizerIdentity.parse).map(id => o.copy(tokenizerIdentity = id))
+    case RetokenizeFlag(spec) =>
+      flagValue(RetokenizeFlag, spec)(TokenizerIdentity.parseExtensions).map(exts => o.copy(retokenize = exts))
+    case MemoDirFlag(spec) =>
+      flagValue(MemoDirFlag, spec)(existingPath(Files.isDirectory(_), Messages.NotTheMemo))
+        .map(dir => o.copy(memoDir = Some(dir)))
+    case ShardFlag(spec) =>
+      flagValue(ShardFlag, spec)(shardSpec).map(kn => o.copy(shard = Some(kn)))
+    case WarmFlag(spec) =>
+      flagValue(WarmFlag, spec)(existingPath(Files.isRegularFile(_), Messages.NotAFile))
+        .map(db => o.copy(warm = Some(db)))
+    case TokenizerWorkerFlag(spec) =>
+      Right(o.copy(tokenizerWorker = Some(Paths.get(spec))))
+    case BlobTimeoutFlag(spec) =>
+      flagValue(BlobTimeoutFlag, spec)(seconds).map(secs => o.copy(blobTimeoutSeconds = secs))
+    case StallTimeoutFlag(spec) =>
+      flagValue(StallTimeoutFlag, spec)(seconds).map(secs => o.copy(stallTimeoutSeconds = secs, stallExplicit = true))
+    case other => Left(Messages.unknownFlag(other))
+  }
+
+  /** The first rule a combination of flags breaks, in the order they are checked. */
+  private def combinationError(o: Options): Option[String] = {
+    val retokenizing = o.retokenize.nonEmpty
+    val uncovered    = o.retokenize -- o.tokenizerIdentity.extensions
+    val rules: Seq[(Boolean, () => String)] = Seq(
+      (o.pipeline && o.pipelineTrees)               -> (() => Messages.PipelinesExclusive),
+      (o.shard.isDefined && o.maskWidened)          -> (() => Messages.MaskWidenedUnderShard),
+      (retokenizing && o.tokenizerIdentity.isEmpty) -> (() => Messages.RetokenizeNeedsIdentity),
+      (retokenizing && o.memoDir.isEmpty)           -> (() => Messages.RetokenizeNeedsMemoDir),
+      (retokenizing && uncovered.nonEmpty)          ->
+        (() => Messages.retokenizeUncovered(uncovered, o.tokenizerIdentity.extensions)),
+      (retokenizing && o.maskWidened)               -> (() => Messages.RetokenizeWithMaskWidened),
+      (retokenizing && o.shard.isDefined)           -> (() => Messages.RetokenizeUnderShard),
+      (!retokenizing && o.memoDir.isDefined)        -> (() => Messages.MemoDirWithoutRetokenize),
+      (o.shard.isDefined && o.anyPipeline)          -> (() => Messages.ShardWithPipeline),
+      o.tokenizerWorker.exists(p => !Files.isRegularFile(p) || !Files.isExecutable(p)) ->
+        (() => Messages.workerNotExecutable(o.tokenizerWorker.get)),
+      (o.tokenizerWorker.isDefined && !o.anyPipeline) -> (() => Messages.WorkerNeedsPipeline)
+    )
+    rules.collectFirst { case (true, message) => message() }
+  }
+
+  private def positionalError(o: Options): Option[String] =
+    if (!Files.isDirectory(o.src)) Some(Messages.srcNotADirectory(o.src))
+    else if (!Files.exists(Paths.get(o.command))) Some(Messages.commandMissing(o.command))
+    else if (o.mask.isEmpty) Some(Messages.EmptyMask)
+    else None
+
+  /** Left is the whole text to print before exiting with the usage status. */
+  private[blobexec] def parse(args: Seq[String]): Either[String, Options] = {
     val (flags, positional) = args.partition(_.startsWith("-"))
+    for {
+      parsed <- flags.foldLeft[Either[String, Options]](Right(Options()))((acc, f) => acc.flatMap(parseFlag(_, f)))
+      _      <- parsed.stallWindow.left.map(why => s"Error: $why")
+      _      <- combinationError(parsed).toLeft(())
+      _      <- Either.cond(positional.length == 5, (), Usage)
+      full    = parsed.copy(positional = positional.toVector)
+      _      <- positionalError(full).toLeft(())
+    } yield full
+  }
 
-    var abortOnError = false
-    var pipeline     = false
-    var pipelineTrees = false
-    var shard: Option[(Int, Int)] = None
-    var warmPath: Option[java.nio.file.Path] = None
-    var blobTimeoutSeconds = BlobExec.DefaultTimeoutSeconds
-    var stallTimeoutSeconds = Walker.DefaultStallTimeoutSeconds
-    var stallExplicit = false
-    var maskWidened = false
-    var tokenizerIdentity = TokenizerIdentity.empty
-    var retokenizeExtensions: Set[String] = Set.empty
-    var memoDir: Option[java.nio.file.Path] = None
-    var tokenizerWorker: Option[java.nio.file.Path] = None
-    flags.foreach {
-      case "--abort-on-error" => abortOnError = true
-      case "--pipeline"       => pipeline = true
-      case "--pipeline-trees" => pipelineTrees = true
-      case "--mask-widened"   => maskWidened = true
-      case t if t.startsWith("--tokenizer-identity=") =>
-        TokenizerIdentity.parse(t.stripPrefix("--tokenizer-identity=")) match {
-          case Right(id) => tokenizerIdentity = id
-          case Left(why) =>
-            System.err.println(s"Error: --tokenizer-identity: $why")
-            sys.exit(1)
-        }
-      case t if t.startsWith("--retokenize=") =>
-        TokenizerIdentity.parseExtensions(t.stripPrefix("--retokenize=")) match {
-          case Right(exts) => retokenizeExtensions = exts
-          case Left(why) =>
-            System.err.println(s"Error: --retokenize: $why")
-            sys.exit(1)
-        }
-      case t if t.startsWith("--memo-dir=") =>
-        val p = Paths.get(t.stripPrefix("--memo-dir="))
-        if (!Files.isDirectory(p)) {
-          System.err.println(
-            s"Error: --memo-dir [$p] is not a directory. It must be the SAME memo this project's " +
-              "tokenizations were written into, or the invalidation would leave the real memo's " +
-              "stale entries in place.")
-          sys.exit(1)
-        }
-        memoDir = Some(p)
-      case s if s.startsWith("--shard=") =>
-        val spec = s.stripPrefix("--shard=")
-        spec.split("/", -1) match {
-          case Array(kStr, nStr) =>
-            val k = kStr.toIntOption.getOrElse(-1)
-            val n = nStr.toIntOption.getOrElse(-1)
-            if (n < 1 || k < 0 || k >= n) {
-              System.err.println(s"Error: --shard must be K/N with 0 <= K < N and N >= 1 [$spec]")
-              sys.exit(1)
-            }
-            shard = Some((k, n))
-          case _ =>
-            System.err.println(s"Error: --shard must be of the form K/N [$spec]")
-            sys.exit(1)
-        }
-      case w if w.startsWith("--warm=") =>
-        val p = Paths.get(w.stripPrefix("--warm="))
-        if (!Files.isRegularFile(p)) {
-          System.err.println(s"Error: --warm db [$p] is not a file")
-          sys.exit(1)
-        }
-        warmPath = Some(p)
-      case t if t.startsWith("--tokenizer-worker=") =>
-        tokenizerWorker = Some(Paths.get(t.stripPrefix("--tokenizer-worker=")))
-      case t if t.startsWith("--blob-timeout=") =>
-        val spec = t.stripPrefix("--blob-timeout=")
-        parsePositiveSeconds(spec) match {
-          case Some(secs) => blobTimeoutSeconds = secs
-          case None =>
-            System.err.println(s"Error: --blob-timeout must be a positive whole number of seconds [$spec]")
-            sys.exit(1)
-        }
-      case t if t.startsWith("--stall-timeout=") =>
-        val spec = t.stripPrefix("--stall-timeout=")
-        parsePositiveSeconds(spec) match {
-          case Some(secs) => stallTimeoutSeconds = secs; stallExplicit = true
-          case None =>
-            System.err.println(s"Error: --stall-timeout must be a positive whole number of seconds [$spec]")
-            sys.exit(1)
-        }
-      case other =>
-        System.err.println(s"Error: unknown flag [$other]")
-        System.err.println(Usage)
-        sys.exit(1)
+  def main(args: Array[String]): Unit = {
+    val options = parse(args.toVector) match {
+      case Right(o)  => o
+      case Left(why) => exit(why, UsageExitStatus)
     }
-
-    resolveStallTimeout(blobTimeoutSeconds, stallTimeoutSeconds, stallExplicit) match {
-      case Right(secs) =>
-        if (secs != stallTimeoutSeconds) {
-          System.err.println(
-            s"blobExec: raising the stall window from ${stallTimeoutSeconds}s to ${secs}s, because " +
-              s"--blob-timeout=${blobTimeoutSeconds}s needs a window that clears one blob's whole lifetime. " +
-              "Pass --stall-timeout explicitly to choose your own."
-          )
-          stallTimeoutSeconds = secs
-        }
-      case Left(why) =>
-        System.err.println(s"Error: $why")
-        sys.exit(1)
-    }
-
-    if (pipeline && pipelineTrees) {
-      System.err.println("Error: --pipeline and --pipeline-trees are mutually exclusive")
-      System.err.println(Usage)
-      sys.exit(1)
-    }
-
-    if (shard.isDefined && maskWidened) {
-      System.err.println("Error: --mask-widened has nothing to do under --shard: each shard builds a " +
-        "fresh dst.git and blobmap.db, so no mask is recorded to widen. Reuse a prior run's " +
-        "tokenizations with --warm=<db> instead.")
-      System.err.println(Usage)
-      sys.exit(1)
-    }
-
-    if (retokenizeExtensions.nonEmpty) {
-      if (tokenizerIdentity.isEmpty) {
-        System.err.println(
-          "Error: --retokenize needs --tokenizer-identity. Invalidating the entries without " +
-            "recording which tokenizer replaces them leaves nothing for the next run to detect a " +
-            "change against, so the next tokenizer defect would be just as silent as this one.")
-        System.err.println(Usage)
-        sys.exit(1)
-      }
-      if (memoDir.isEmpty) {
-        System.err.println(
-          "Error: --retokenize needs --memo-dir. There are two caches, not one: dropping a blob_map " +
-            "row makes the walker re-run <command>, and <command> is tokenizeByBlobId/tokenBySha.pl, " +
-            "which answers from $BFG_MEMO_DIR keyed on sha1(contents) with no tokenizer in the key. " +
-            "Invalidating one layer without the other invalidates nothing at all.")
-        System.err.println(Usage)
-        sys.exit(1)
-      }
-      val unknown = retokenizeExtensions -- tokenizerIdentity.extensions
-      if (unknown.nonEmpty) {
-        System.err.println(
-          s"Error: --retokenize names extension(s) --tokenizer-identity does not cover: " +
-            s"${unknown.toVector.sorted.mkString(", ")}. Known: " +
-            s"${tokenizerIdentity.extensions.toVector.sorted.mkString(", ")}.")
-        sys.exit(1)
-      }
-      if (maskWidened) {
-        System.err.println(
-          "Error: --mask-widened and --retokenize cannot be combined. Each verifies its own " +
-            "precondition against the rows, and together each would verify against a state the " +
-            "other is about to change. Widen first, then resume with --retokenize.")
-        sys.exit(1)
-      }
-      if (shard.isDefined) {
-        System.err.println(
-          "Error: --retokenize has nothing to do under --shard: each shard builds a fresh dst.git " +
-            "and blobmap.db, so there are no cached tokenizations to invalidate. Retokenize the " +
-            "merged result, or drop the shards' --warm=<db>.")
-        sys.exit(1)
-      }
-    } else if (memoDir.isDefined) {
-      System.err.println(
-        "Error: --memo-dir has no effect without --retokenize. Nothing else in blobExec reads the " +
-          "memo — tokenizeByBlobId/tokenBySha.pl takes it from $BFG_MEMO_DIR in the environment.")
-      sys.exit(1)
-    }
-
-    if (shard.isDefined && (pipeline || pipelineTrees)) {
-      System.err.println("Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
-      System.err.println(Usage)
-      sys.exit(1)
-    }
-
-    tokenizerWorker.foreach { path =>
-      if (!Files.isRegularFile(path) || !Files.isExecutable(path)) {
-        System.err.println(s"Error: --tokenizer-worker [$path] is not an executable file")
-        sys.exit(1)
-      }
-      if (!(pipeline || pipelineTrees)) {
-        System.err.println("Error: --tokenizer-worker needs --pipeline or --pipeline-trees")
-        sys.exit(1)
-      }
-    }
-
-    if (positional.length != 5) {
-      System.err.println(Usage)
-      sys.exit(1)
-    }
-    val srcPath = Paths.get(positional(0))
-    val dstPath = Paths.get(positional(1))
-    val dbPath  = Paths.get(positional(2))
-    val command = positional(3)
-    val mask    = positional(4)
-
-    if (!Files.isDirectory(srcPath)) {
-      System.err.println(s"Error: src repo [$srcPath] is not a directory")
-      sys.exit(1)
-    }
-    if (!Files.exists(Paths.get(command))) {
-      System.err.println(s"Error: command [$command] does not exist")
-      sys.exit(1)
-    }
-    if (mask.isEmpty) {
-      System.err.println("Error: fileMaskRegex must be non-empty")
-      sys.exit(1)
-    }
-    // Files.createDirectories throws FileAlreadyExistsException on macOS
-    // when the target is a symlink (e.g. /tmp -> /private/tmp). Guard
-    // against that with an explicit isDirectory check.
-    val dbParent = dbPath.getParent
-    if (dbParent != null && !Files.isDirectory(dbParent)) Files.createDirectories(dbParent)
-
-    val denylist = BlobDenylist.shipped
-
-    val incremental = Files.isDirectory(dstPath)
-    val shardStr = shard.map { case (k, n) => s"$k/$n" }.getOrElse("none")
-    val warmStr  = warmPath.map(_.toString).getOrElse("none")
-    println(
-      s"blobExec: src=$srcPath dst=$dstPath db=$dbPath command=$command mask=$mask " +
-        s"abortOnError=$abortOnError pipeline=$pipeline pipelineTrees=$pipelineTrees " +
-        s"shard=$shardStr warm=$warmStr blobTimeout=${blobTimeoutSeconds}s " +
-        s"stallTimeout=${stallTimeoutSeconds}s incremental=$incremental " +
-        s"maskWidened=$maskWidened denylistEntries=${denylist.size} " +
-        s"tokenizerIdentity=${if (tokenizerIdentity.isEmpty) "none" else tokenizerIdentity.render} " +
-        s"retokenize=${if (retokenizeExtensions.isEmpty) "none" else retokenizeExtensions.toVector.sorted.mkString(",")} " +
-        s"memoDir=${memoDir.map(_.toString).getOrElse("none")} " +
-        s"tokenizerWorker=${tokenizerWorker.map(_.toString).getOrElse("none")}"
-    )
-
-    val src: FileRepository = openSrc(srcPath)
-    val dst: FileRepository = openOrInitDst(dstPath)
-
-    val widening =
-      if (!maskWidened) None
-      else Some(Mapping.MaskWidening(
-        newBlobResolves = id => {
-          val reader = dst.newObjectReader()
-          try reader.has(org.eclipse.jgit.lib.ObjectId.fromString(id))
-          catch { case _: IllegalArgumentException => false }
-          finally reader.close()
-        },
-        report = msg => println(s"blobExec: $msg")
-      ))
-
-    // The memo is keyed on content sha1 alone (tokenizeByBlobId/tokenBySha.pl:76),
-    // so the purge re-reads the original blobs from src.
-    val retokenize =
-      if (retokenizeExtensions.isEmpty) None
-      else Some(Mapping.Retokenize(
-        extensions = retokenizeExtensions,
-        newBlobResolves = id => {
-          val reader = dst.newObjectReader()
-          try reader.has(org.eclipse.jgit.lib.ObjectId.fromString(id))
-          catch { case _: IllegalArgumentException => false }
-          finally reader.close()
-        },
-        purgeMemo = blobs => TokenizerMemo.purge(memoDir.get, blobs, sha => {
-          val reader = src.newObjectReader()
-          try Some(reader.open(org.eclipse.jgit.lib.ObjectId.fromString(sha),
-            org.eclipse.jgit.lib.Constants.OBJ_BLOB).getBytes)
-          catch { case _: Exception => None }
-          finally reader.close()
-        }),
-        report = msg => println(s"blobExec: $msg"),
-        memoDirIsTokenizerMemo =
-          memoDir.exists(d => TokenizerMemo.isTokenizerMemo(d, sys.env.get("BFG_MEMO_DIR")))
-      ))
-
-    val mapping = try Mapping.open(dbPath, command, mask, warmPath, widening,
-                                   tokenizerIdentity, retokenize) catch {
-      case m: Mapping.MetaMismatchException =>
-        System.err.println(s"Error: ${m.getMessage}")
-        if (!maskWidened && m.getMessage.contains("mask"))
-          System.err.println(
-            "Hint: if the new mask is a strict superset of the recorded one, --mask-widened reuses " +
-              "the tokenizations already in blob_map instead of redoing them. It verifies that " +
-              "against the rows themselves and refuses if it is not true. It requires the work " +
-              "directory to be intact (resume at step 2), because blob_map's ids live in dst."
-          )
-        src.close(); dst.close()
-        sys.exit(3)
-      case n: Mapping.MaskNarrowedException =>
-        System.err.println(s"Error: ${n.getMessage}")
-        src.close(); dst.close()
-        sys.exit(3)
-      case d: Mapping.DanglingNewBlobException =>
-        System.err.println(s"Error: ${d.getMessage}")
-        src.close(); dst.close()
-        sys.exit(3)
-      case t: Mapping.TokenizerChangedException =>
-        System.err.println(s"Error: ${t.getMessage}")
-        src.close(); dst.close()
-        sys.exit(3)
-      case n: Mapping.NothingInvalidatedException =>
-        // Not 0: a corpus script would publish entries that were never invalidated.
-        System.err.println(s"Error: ${n.getMessage}")
-        src.close(); dst.close()
-        sys.exit(RetokenizeIneffectiveExitStatus)
-      case i: IllegalArgumentException =>
-        // Mapping.open re-checks main()'s flag rules, for library callers.
-        System.err.println(s"Error: ${i.getMessage}")
-        src.close(); dst.close()
-        sys.exit(1)
-    }
-
-    val stats = try {
-      val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
-      val workerPool = tokenizerWorker.map(path => new TokenizerWorkerPool(path.toString, parallelism))
-      val walker = new Walker(
-        src, dst, mapping, mask.r, command, abortOnError, parallelism,
-        pipeline, pipelineTrees, shard,
-        destinationMayContainObjects = incremental,
-        blobTimeoutSeconds = blobTimeoutSeconds,
-        stallTimeoutSeconds = stallTimeoutSeconds,
-        workerPool = workerPool,
-        denylist = denylist
-      )
-      try walker.run()
-      finally workerPool.foreach(_.close())
-    } finally {
-      mapping.close()
-      dst.close()
-      src.close()
-    }
-
-    println(
-      s"blobExec done: commitsProcessed=${stats.commitsProcessed} " +
-        s"blobsRunThroughCommand=${stats.blobsRunThroughCommand} " +
-        s"blobCommandExecutions=${stats.blobCommandExecutions} " +
-        s"blobsCacheHit=${stats.blobsCacheHit} " +
-        s"originalBlobCopyRequests=${stats.originalBlobCopyRequests} " +
-        s"originalBlobCopies=${stats.originalBlobCopies} " +
-        s"originalBlobAlreadyPresent=${stats.originalBlobAlreadyPresent} " +
-        s"originalBlobCacheHits=${stats.originalBlobCacheHits} " +
-        s"originalBlobDestinationLookups=${stats.originalBlobDestinationLookups} " +
-        s"originalBlobBytesCopied=${stats.originalBlobBytesCopied} " +
-        s"originalBlobBytesAvoided=${stats.originalBlobBytesAvoided} " +
-        s"refsProjected=${stats.refsProjected} " +
-        s"blobsTimedOut=${stats.blobsTimedOut} " +
-        s"blobsOversized=${stats.blobsOversized} " +
-        s"blobsDenylisted=${stats.blobsDenylisted} " +
-        s"blobsParserCrashed=${stats.blobsParserCrashed} " +
-        s"aborted=${stats.aborted}"
-    )
-
-    if (stats.blobsDenylisted > 0) {
-      System.err.println(
-        s"blobExec: ${stats.blobsDenylisted} blob(s) were excluded by the blob denylist " +
-          s"(${BlobDenylist.EntriesSource}, ${denylist.size} entr" +
-          s"${if (denylist.size == 1) "y" else "ies"}). Each one is named with its sha, path, " +
-          "reason and upstream citation on an 'EXCLUDED denylisted blob' line above; those " +
-          "lines and that list are the record of what this project's dataset does not contain. " +
-          "The files are absent from the tokenized repository, not present as raw source, so " +
-          "they produce no blame and no dataset row. This is not a failure and does not affect " +
-          "the exit status."
-      )
-    }
-
-    if (stats.blobsOversized > 0) {
-      // Not fatal: an oversized blob is deterministic and named on its EXCLUDED line.
-      System.err.println(
-        s"blobExec: ${stats.blobsOversized} blob(s) were excluded as oversized (>= " +
-          s"${Walker.MaxBlobBytes} bytes, JGit's stream-file threshold). Each one is named with " +
-          "its sha, path and size on an 'EXCLUDED oversized blob' line above; those lines are the " +
-          "record of what this project's dataset does not contain. The files are absent from the " +
-          "tokenized repository, not present as raw source, so they produce no blame and no " +
-          "dataset row. This is not a failure and does not affect the exit status."
-      )
-    }
-
-    if (stats.blobsTimedOut + stats.blobsParserCrashed > 0) {
-      System.err.println(
-        s"blobExec: ${stats.blobsTimedOut + stats.blobsParserCrashed} blob(s) were excluded because " +
-          s"their tokenizer failed (${stats.blobsTimedOut} timed out after ${blobTimeoutSeconds}s, " +
-          s"${stats.blobsParserCrashed} reported a parser crash). Each one is named on an " +
-          "'EXCLUDED failed blob' line above; those lines are the record of what this project's " +
-          "dataset does not contain. This does not affect the exit status."
-      )
-    }
-
+    val stats = run(options, stallSeconds(options))
     // Exit explicitly: a timed-out blob's daemon reader threads can keep the JVM alive.
     sys.exit(exitStatus(stats))
   }
 
-  private def openSrc(path: java.nio.file.Path): FileRepository = {
+  private def exit(message: String, status: Int): Nothing = {
+    System.err.println(message)
+    sys.exit(status)
+  }
+
+  private def stallSeconds(o: Options): Int = {
+    val secs = o.stallWindow.getOrElse(o.stallTimeoutSeconds)
+    if (secs != o.stallTimeoutSeconds)
+      System.err.println(Messages.stallRaised(o.stallTimeoutSeconds, secs, o.blobTimeoutSeconds))
+    secs
+  }
+
+  private def run(o: Options, stallSeconds: Int): WalkStats = {
+    createParentDirectory(o.db)
+    val incremental = Files.isDirectory(o.dst)
+    println(startLine(o, stallSeconds, incremental))
+
+    val src = openSrc(o.src)
+    val dst = openOrInitDst(o.dst)
+    val mapping = openMapping(o, src, dst) match {
+      case Right(m) => m
+      case Left(refusal) =>
+        src.close(); dst.close()
+        exit(refusal.message, refusal.status)
+    }
+
+    val stats =
+      try walk(o, stallSeconds, src, dst, mapping, incremental)
+      finally { mapping.close(); dst.close(); src.close() }
+    println(doneLine(stats))
+    reportExclusions(stats, o.blobTimeoutSeconds)
+    stats
+  }
+
+  // Not Files.createDirectories alone: it throws on macOS when the target is a symlink (/tmp).
+  private def createParentDirectory(path: Path): Unit =
+    Option(path.getParent).filterNot(Files.isDirectory(_)).foreach(Files.createDirectories(_))
+
+  private def startLine(o: Options, stallSeconds: Int, incremental: Boolean): String = {
+    def orNone(value: Option[Any]): String = value.map(_.toString).getOrElse("none")
+    s"blobExec: src=${o.src} dst=${o.dst} db=${o.db} command=${o.command} mask=${o.mask} " +
+      s"abortOnError=${o.abortOnError} pipeline=${o.pipeline} pipelineTrees=${o.pipelineTrees} " +
+      s"shard=${orNone(o.shard.map { case (k, n) => s"$k/$n" })} warm=${orNone(o.warm)} " +
+      s"blobTimeout=${o.blobTimeoutSeconds}s stallTimeout=${stallSeconds}s incremental=$incremental " +
+      s"maskWidened=${o.maskWidened} denylistEntries=${BlobDenylist.shipped.size} " +
+      s"tokenizerIdentity=${if (o.tokenizerIdentity.isEmpty) "none" else o.tokenizerIdentity.render} " +
+      s"retokenize=${if (o.retokenize.isEmpty) "none" else o.retokenize.toVector.sorted.mkString(",")} " +
+      s"memoDir=${orNone(o.memoDir)} tokenizerWorker=${orNone(o.tokenizerWorker)}"
+  }
+
+  private final case class Refusal(status: Int, message: String)
+
+  private def openMapping(o: Options, src: FileRepository, dst: FileRepository): Either[Refusal, Mapping] =
+    Try(Mapping.open(o.db, o.command, o.mask, o.warm, widening(o, dst), o.tokenizerIdentity, retokenize(o, src, dst)))
+      .toEither
+      .left.map(e => refusalFor(e, o).getOrElse(throw e))
+
+  private def refusalFor(e: Throwable, o: Options): Option[Refusal] = e match {
+    case _: Mapping.MetaMismatchException if !o.maskWidened && e.getMessage.contains("mask") =>
+      Some(Refusal(RefusedExitStatus, s"${Messages.error(e)}\n${Messages.MaskWidenedHint}"))
+    case _: Mapping.MetaMismatchException | _: Mapping.MaskNarrowedException |
+        _: Mapping.DanglingNewBlobException | _: Mapping.TokenizerChangedException =>
+      Some(Refusal(RefusedExitStatus, Messages.error(e)))
+    // Not 0: a corpus script would publish entries that were never invalidated.
+    case _: Mapping.NothingInvalidatedException => Some(Refusal(RetokenizeIneffectiveExitStatus, Messages.error(e)))
+    // Mapping.open re-checks the flag rules above, for library callers.
+    case _: IllegalArgumentException => Some(Refusal(UsageExitStatus, Messages.error(e)))
+    case _                           => None
+  }
+
+  private val report: String => Unit = msg => println(s"blobExec: $msg")
+
+  private def widening(o: Options, dst: FileRepository): Option[Mapping.MaskWidening] =
+    Option.when(o.maskWidened)(Mapping.MaskWidening(newBlobResolves = hasObject(dst), report = report))
+
+  // The memo is keyed on content sha1 alone (tokenizeByBlobId/tokenBySha.pl:76),
+  // so the purge re-reads the original blobs from src.
+  private def retokenize(o: Options, src: FileRepository, dst: FileRepository): Option[Mapping.Retokenize] =
+    Option.when(o.retokenize.nonEmpty)(Mapping.Retokenize(
+      extensions = o.retokenize,
+      newBlobResolves = hasObject(dst),
+      purgeMemo = blobs => TokenizerMemo.purge(o.memoDir.get, blobs, blobBytes(src)),
+      report = report,
+      memoDirIsTokenizerMemo = o.memoDir.exists(d => TokenizerMemo.isTokenizerMemo(d, sys.env.get("BFG_MEMO_DIR")))
+    ))
+
+  private def hasObject(repo: FileRepository)(id: String): Boolean = {
+    val reader = repo.newObjectReader()
+    try reader.has(ObjectId.fromString(id))
+    catch { case _: IllegalArgumentException => false }
+    finally reader.close()
+  }
+
+  private def blobBytes(repo: FileRepository)(sha: String): Option[Array[Byte]] = {
+    val reader = repo.newObjectReader()
+    try Some(reader.open(ObjectId.fromString(sha), Constants.OBJ_BLOB).getBytes)
+    catch { case _: Exception => None }
+    finally reader.close()
+  }
+
+  private def walk(
+      o: Options,
+      stallSeconds: Int,
+      src: FileRepository,
+      dst: FileRepository,
+      mapping: Mapping,
+      incremental: Boolean
+  ): WalkStats = {
+    val parallelism = math.max(1, Runtime.getRuntime.availableProcessors)
+    val workerPool  = o.tokenizerWorker.map(path => new TokenizerWorkerPool(path.toString, parallelism))
+    try
+      new Walker(
+        src, dst, mapping, o.mask.r, o.command, o.abortOnError, parallelism,
+        o.pipeline, o.pipelineTrees, o.shard,
+        destinationMayContainObjects = incremental,
+        blobTimeoutSeconds = o.blobTimeoutSeconds,
+        stallTimeoutSeconds = stallSeconds,
+        workerPool = workerPool,
+        denylist = BlobDenylist.shipped
+      ).run()
+    finally workerPool.foreach(_.close())
+  }
+
+  private def doneLine(stats: WalkStats): String =
+    s"blobExec done: commitsProcessed=${stats.commitsProcessed} " +
+      s"blobsRunThroughCommand=${stats.blobsRunThroughCommand} " +
+      s"blobCommandExecutions=${stats.blobCommandExecutions} " +
+      s"blobsCacheHit=${stats.blobsCacheHit} " +
+      s"originalBlobCopyRequests=${stats.originalBlobCopyRequests} " +
+      s"originalBlobCopies=${stats.originalBlobCopies} " +
+      s"originalBlobAlreadyPresent=${stats.originalBlobAlreadyPresent} " +
+      s"originalBlobCacheHits=${stats.originalBlobCacheHits} " +
+      s"originalBlobDestinationLookups=${stats.originalBlobDestinationLookups} " +
+      s"originalBlobBytesCopied=${stats.originalBlobBytesCopied} " +
+      s"originalBlobBytesAvoided=${stats.originalBlobBytesAvoided} " +
+      s"refsProjected=${stats.refsProjected} " +
+      s"blobsTimedOut=${stats.blobsTimedOut} " +
+      s"blobsOversized=${stats.blobsOversized} " +
+      s"blobsDenylisted=${stats.blobsDenylisted} " +
+      s"blobsParserCrashed=${stats.blobsParserCrashed} " +
+      s"aborted=${stats.aborted}"
+
+  private def reportExclusions(stats: WalkStats, blobTimeoutSeconds: Int): Unit = {
+    if (stats.blobsDenylisted > 0)
+      System.err.println(Messages.denylisted(stats.blobsDenylisted, BlobDenylist.shipped.size))
+    if (stats.blobsOversized > 0)
+      System.err.println(Messages.oversized(stats.blobsOversized))
+    if (stats.blobsTimedOut + stats.blobsParserCrashed > 0)
+      System.err.println(Messages.failed(stats.blobsTimedOut, stats.blobsParserCrashed, blobTimeoutSeconds))
+  }
+
+  private def openSrc(path: Path): FileRepository = {
     val gitDir = if (Files.isDirectory(path.resolve(".git"))) path.resolve(".git").toFile else path.toFile
     FileRepositoryBuilder.create(gitDir).asInstanceOf[FileRepository]
   }
 
-  private def openOrInitDst(path: java.nio.file.Path): FileRepository = {
+  private def openOrInitDst(path: Path): FileRepository = {
     val exists = Files.isDirectory(path)
     val repo = FileRepositoryBuilder.create(path.toFile).asInstanceOf[FileRepository]
-    if (!exists) repo.create(true)  // bare init
+    if (!exists) repo.create(true)
     repo
   }
 }

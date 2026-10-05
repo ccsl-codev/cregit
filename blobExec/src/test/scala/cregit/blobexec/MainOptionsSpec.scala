@@ -3,12 +3,10 @@ package cregit.blobexec
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-/** `--blob-timeout` and `--stall-timeout` are binding parts of the spec: 600 and
-  * 1800 by default, and values that are not a positive whole number of seconds
-  * must be rejected rather than silently read as "no limit". The shared value
-  * parser is tested here; `main` itself cannot be, because it answers bad input
-  * with `sys.exit`. The stall watchdog's decision is tested here too, because
-  * the watchdog itself halts the JVM and so cannot be exercised in-process. */
+import java.nio.file.Files
+
+/** The option parser, the 600/1800 budget defaults and the stall watchdog's decision.
+  * `main` itself answers with `sys.exit`, so its parts are tested instead. */
 class MainOptionsSpec extends AnyFunSuite with Matchers {
 
   test("the default per-blob budget is 600 seconds") {
@@ -201,4 +199,71 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   test("nanoTime is monotonic but not epoch-based, so negative elapsed is never a stall") {
     Walker.isStalled(nowNanos = -5 * second, lastProgressNanos = -3 * second, 30) shouldBe false
   }
+  // -- the option parser --------------------------------------------------------
+
+  private lazy val srcDir = Files.createTempDirectory("main-options-src-")
+  private def positional = Seq(srcDir.toString, "/tmp/dst.git", "/tmp/db.sqlite", "/bin/sh", "\\.c$")
+
+  test("parse reads every flag into one options value") {
+    val parsed = Main.parse(Seq("--abort-on-error", "--pipeline", "--mask-widened",
+      "--blob-timeout=60", "--stall-timeout=900") ++ positional)
+    inside(parsed) { case Right(o) =>
+      (o.abortOnError, o.pipeline, o.maskWidened) shouldEqual ((true, true, true))
+      (o.blobTimeoutSeconds, o.stallTimeoutSeconds, o.stallExplicit) shouldEqual ((60, 900, true))
+      (o.command, o.mask) shouldEqual (("/bin/sh", "\\.c$"))
+    }
+  }
+
+  test("a shard is read as K and N") {
+    inside(Main.parse("--shard=1/4" +: positional)) { case Right(o) => o.shard shouldEqual Some((1, 4)) }
+  }
+
+  test("parse leaves the defaults when no flag is given") {
+    inside(Main.parse(positional)) { case Right(o) =>
+      o shouldEqual Main.Options(positional = positional.toVector)
+    }
+  }
+
+  test("an unknown flag is refused with the usage text") {
+    inside(Main.parse("--frobnicate" +: positional)) { case Left(why) =>
+      why should include("unknown flag [--frobnicate]")
+      why should include(Main.Usage)
+    }
+  }
+
+  test("a bad flag value is refused, naming the flag") {
+    Seq(
+      "--blob-timeout=0"         -> "--blob-timeout",
+      "--stall-timeout=x"        -> "--stall-timeout",
+      "--shard=4/4"              -> "--shard",
+      "--shard=1"                -> "--shard",
+      "--warm=/nonexistent/db"   -> "--warm",
+      "--tokenizer-identity="    -> "--tokenizer-identity",
+      "--memo-dir=/nonexistent/" -> "--memo-dir"
+    ).foreach { case (flag, name) =>
+      withClue(s"$flag: ") {
+        inside(Main.parse(flag +: positional)) { case Left(why) => why should startWith(s"Error: $name") }
+      }
+    }
+  }
+
+  test("a wrong number of positional arguments prints the usage text alone") {
+    Main.parse(positional.dropRight(1)) shouldEqual Left(Main.Usage)
+  }
+
+  test("every option description in the usage text is at most three lines, and most are one") {
+    val continuation = "^ {29}\\S".r
+    val entries = Main.Usage.linesIterator.foldLeft(Vector.empty[Vector[String]]) {
+      case (acc, line) if line.startsWith("  --") || line.startsWith("  <") => acc :+ Vector(line)
+      case (acc, line) if acc.nonEmpty && continuation.findFirstIn(line).isDefined => acc.init :+ (acc.last :+ line)
+      case (acc, _) => acc
+    }
+    val lengths = entries.map(e => e.size - (if (e.head.trim.contains(' ')) 0 else 1))
+    entries should not be empty
+    all(lengths) should be <= 3
+    lengths.count(_ == 1) should be > entries.size / 2
+  }
+
+  private def inside[T](v: T)(pf: PartialFunction[T, Unit]): Unit =
+    if (pf.isDefinedAt(v)) pf(v) else fail(s"value did not match: $v")
 }
