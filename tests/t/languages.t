@@ -1,8 +1,7 @@
 #!/usr/bin/env perl
 
-# The extension table has been stable since 2017 and needs no test. These
-# assertions cover the case-insensitive mask, which selects .C and .H, and a
-# pipeline default derived from the table rather than written out a second time.
+# Covers the case-insensitive mask (.C, .H) and the pipeline default derived
+# from the table; the table itself is not tested.
 
 use strict;
 use warnings;

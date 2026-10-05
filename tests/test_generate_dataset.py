@@ -484,10 +484,6 @@ def footers_of(duckdb, path):
 
 @pytest.mark.parametrize("value", ["bob@example.com", "Bob bob@example.com"])
 def test_a_bare_address_trailer_resolves_to_a_personid(monkeypatch, tmp_path, value):
-    """`Reviewed-by: bob@example.com`, no angle brackets. The trailer text
-    reached footer_reviewed_by while footer_personids stayed empty, because the
-    coalesce never reached the bare-address pattern and that pattern had no
-    capture group anyway."""
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path, seed=seed_footers(
         ("Reviewed-by", value),
@@ -500,8 +496,7 @@ def test_a_bare_address_trailer_resolves_to_a_personid(monkeypatch, tmp_path, va
 
 
 def test_the_angle_bracket_form_still_wins_over_a_second_address(monkeypatch, tmp_path):
-    """Precedence, which the nullif must not disturb: a trailer holding both
-    forms resolves to the bracketed one."""
+    """The nullif must not change precedence: the bracketed form wins."""
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path, seed=seed_footers(
         ("Reviewed-by", "noreply@example.com writing for Bob B <bob@example.com>"),
@@ -513,10 +508,7 @@ def test_the_angle_bracket_form_still_wins_over_a_second_address(monkeypatch, tm
 
 
 def test_a_trailer_with_no_address_attributes_nobody(monkeypatch, tmp_path):
-    """`Former-commit-id: <sha>` carries no address, so it must contribute no
-    person. It used to join on '', which matches an emails row for an author
-    committing as `Name <>` — 27 of 199 corpus persons DBs hold one, so this
-    published a wrong personid on every commit carrying such a trailer."""
+    """Joining on '' would match the emails row of an author committing as `Name <>`."""
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path, seed=seed_footers(
         ("Former-commit-id", "6a32a91a877bc2341810ef674dfdc3be21c500bc"),
@@ -528,11 +520,8 @@ def test_a_trailer_with_no_address_attributes_nobody(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# firm attribution. The shape is different from everything above: the 29
-# metadata columns are per-project CONSTANTS injected as SQL literals, while
-# firm is PER ROW and comes from a real join against an external CSV. So the
-# failure modes are different too — a duplicate key in either lookup table
-# multiplies token rows through the LEFT JOIN, and nothing downstream notices.
+# firm attribution: a per-row LEFT JOIN, so a duplicate key in either lookup
+# table silently multiplies token rows.
 # --------------------------------------------------------------------------- #
 
 FIRM_MAP_HEADER = "domain,company,kind,source\n"
@@ -552,12 +541,7 @@ def write_canonical(tmp_path, *lines, name="canon.csv"):
 
 
 def generate_with_domain(monkeypatch, tmp_path, domain, argv_extra=()):
-    """The tiny project, plus one identified person on `domain`.
-
-    build_tiny_project leaves emails and persons empty, so person_domain is NULL
-    there and every firm column is blank whatever the map says. A positive test
-    needs a person the commit actually joins to.
-    """
+    """The tiny project plus one person on `domain`, so person_domain is set."""
     import generate_dataset as gd
 
     blame, src, cregit_db, persons_db = build_tiny_project(tmp_path)
@@ -596,16 +580,13 @@ def test_the_firm_field_list_is_three_names_in_dataset_order():
 
 
 def test_no_firm_map_emits_no_join_and_three_empty_literals():
-    """An older caller must still produce a schema-valid file, the same bargain
-    --project-meta makes. So the columns exist and the join does not."""
+    """An older caller must still produce a schema-valid file."""
     select, join = firm_sql("", "")
     assert join == ""
     assert select.count("'' AS") == 3
 
 
 def test_a_map_without_a_canonical_table_makes_firm_repeat_firm_raw():
-    """Honest rather than clever: without a reviewed table the split spellings
-    stay split, and `firm` says the same thing `firm_raw` does."""
     select, join = firm_sql("/m.csv", "")
     assert "read_csv_auto('/m.csv'" in join
     assert "fc" not in join
@@ -620,8 +601,7 @@ def test_the_map_path_is_escaped_like_every_other_literal():
 
 def test_the_three_firm_columns_sit_between_person_domain_and_repo_tag(
         monkeypatch, tmp_path):
-    """Position is a claim, not a convenience: firm is resolved FROM
-    person_domain, so the key and its answers are adjacent."""
+    """firm is resolved from person_domain, so they sit side by side."""
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path)
     names = [n for n, _ in schema_of(duckdb, out)]
@@ -640,8 +620,7 @@ def test_a_call_with_no_firm_flags_writes_three_empty_strings(
 
 
 def test_a_domain_in_the_map_gets_its_firm_and_its_source(monkeypatch, tmp_path):
-    """The headline case, in miniature: the map says who, and firm_source says on
-    what evidence. `correction` is this repository's reviewed overlay."""
+    """`correction` is this repository's reviewed overlay."""
     duckdb = pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "qti.qualcomm.com,Qualcomm,company,correction")
     out = generate_with_domain(monkeypatch, tmp_path, "qti.qualcomm.com",
@@ -652,8 +631,7 @@ def test_a_domain_in_the_map_gets_its_firm_and_its_source(monkeypatch, tmp_path)
 
 def test_the_canonical_table_fills_firm_and_never_touches_firm_raw(
         monkeypatch, tmp_path):
-    """The partner's standing preference: carry more, cut at publication. The raw
-    string is evidence and must survive beside the canonical name."""
+    """The raw string is evidence and must survive beside the canonical name."""
     duckdb = pytest.importorskip("duckdb")
     firm_map = write_map(
         tmp_path, "au1.ibm.com,International Business Machines,company,cncf-gitdm")
@@ -668,8 +646,7 @@ def test_the_canonical_table_fills_firm_and_never_touches_firm_raw(
 
 def test_a_name_the_canonical_table_does_not_mention_passes_through(
         monkeypatch, tmp_path):
-    """The table lists only the names that change. Everything else is already
-    canonical, and a missing row must not blank the column."""
+    """The table lists only the names that change."""
     duckdb = pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
     canon = write_canonical(tmp_path, "NVidia,NVIDIA,merge,case only")
@@ -682,8 +659,7 @@ def test_a_name_the_canonical_table_does_not_mention_passes_through(
 
 def test_a_domain_absent_from_the_map_gets_three_empty_strings(
         monkeypatch, tmp_path):
-    """An empty firm_source is the filter for 'not attributed at all', so it must
-    mean exactly that rather than 'the map had no source column'."""
+    """An empty firm_source must mean exactly 'not attributed'."""
     duckdb = pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
     out = generate_with_domain(monkeypatch, tmp_path, "nowhere.example",
@@ -692,8 +668,7 @@ def test_a_domain_absent_from_the_map_gets_three_empty_strings(
 
 
 def test_the_domain_match_ignores_case(monkeypatch, tmp_path):
-    """build_domain_map writes lower-cased domains, but persons.db carries
-    whatever the commit's e-mail header held."""
+    """build_domain_map lower-cases domains; persons.db keeps the header's case."""
     duckdb = pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "redhat.com,Red Hat,company,gitdm")
     out = generate_with_domain(monkeypatch, tmp_path, "RedHat.COM",
@@ -702,9 +677,7 @@ def test_the_domain_match_ignores_case(monkeypatch, tmp_path):
 
 
 def test_a_company_spelled_like_a_number_stays_a_string(monkeypatch, tmp_path):
-    """all_varchar=true on the read. Without it DuckDB sniffs `360` as a number,
-    the firm columns change type, and validate_schema.py fails the whole corpus
-    on one project's map hit."""
+    """Without all_varchar=true DuckDB reads `360` as a number and the schema breaks."""
     duckdb = pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "360.cn,360,company,gitdm")
     out = generate_with_domain(monkeypatch, tmp_path, "360.cn",
@@ -714,8 +687,6 @@ def test_a_company_spelled_like_a_number_stays_a_string(monkeypatch, tmp_path):
 
 
 def test_one_token_stays_one_row_when_the_map_matches(monkeypatch, tmp_path):
-    """The join must not fan out. This is the assertion that would catch a future
-    map keyed on something less unique than a domain."""
     duckdb = pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
     canon = write_canonical(tmp_path, "Google,Google LLC,merge,irrelevant here")
@@ -727,9 +698,7 @@ def test_one_token_stays_one_row_when_the_map_matches(monkeypatch, tmp_path):
 
 def test_a_repeated_domain_in_the_map_stops_the_run_before_phase_1(
         monkeypatch, tmp_path):
-    """The one failure mode of this join that would be invisible. Two rows for one
-    domain duplicate every token row of every person on it: the file still
-    validates, the schema still matches, and only the row count betrays it."""
+    """Otherwise invisible: the file still validates; only the row count grows."""
     pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "google.com,Google,company,gitdm",
                          "Google.com,Alphabet,company,gitdm")
@@ -741,8 +710,7 @@ def test_a_repeated_domain_in_the_map_stops_the_run_before_phase_1(
 
 def test_a_repeated_name_in_the_canonical_table_stops_the_run(
         monkeypatch, tmp_path):
-    """Two canonical names for one raw string is an unresolved review, not a
-    default to pick from."""
+    """Two canonical names for one raw string is an unresolved review."""
     pytest.importorskip("duckdb")
     firm_map = write_map(tmp_path, "google.com,Google,company,gitdm")
     canon = write_canonical(tmp_path, "Google,Alphabet,merge,one reviewer",
@@ -760,8 +728,7 @@ def test_check_key_is_unique_returns_the_row_count(tmp_path):
 
 
 def test_a_canonical_table_without_a_map_is_refused(monkeypatch, tmp_path):
-    """argparse exits 2. There is no firm_raw to canonicalise without a map, and
-    accepting the pair would write `firm` out of nothing."""
+    """Without a map there is no firm_raw to canonicalise."""
     canon = write_canonical(tmp_path, "NVidia,NVIDIA,merge,case only")
     with pytest.raises(SystemExit):
         run_main(monkeypatch, tmp_path,
@@ -786,8 +753,7 @@ def test_a_missing_canonical_table_stops_the_run_before_phase_1(
 
 # --------------------------------------------------------------------------- #
 # Token-line repairs before the source walk: srcML mojibake, the Rust position
-# prefix, and the byte-order mark. Each one moved the walk, so each test checks
-# the text and the position of the token after the defect.
+# prefix and the BOM. Each test checks text and position after the defect.
 # --------------------------------------------------------------------------- #
 
 def walk(tmp_path, name, source: bytes, *token_lines, stats=None):
@@ -831,7 +797,6 @@ def test_a_mojibake_token_gets_the_true_text_and_the_walk_stays_aligned(tmp_path
     rows = walk(tmp_path, "a.c", C_SOURCE, *C_MOJIBAKE)
     assert rows[0][1] == "/* Högskolan */"
     assert rows[0][2].startswith("/* Högskolan */")
-    # The next token is where the source has it: line 2, column 1.
     assert rows[1][1:5] == ("int", "int ", 2, 1)
     assert rows[2][3:5] == (2, 5)
 
@@ -864,7 +829,6 @@ def test_a_rust_line_loses_its_position_prefix(tmp_path):
     assert [r[0] for r in rows] == ["begin_unit", "keyword", "identifier",
                                     "op", "op", "op", "op", "end_unit"]
     assert rows[0][5] == 1 and rows[-1][5] == 1
-    # The walk now agrees with the position the tokenizer wrote.
     assert [r[3:5] for r in rows[1:7]] == [(1, 1), (1, 4), (1, 8), (1, 9),
                                            (1, 11), (1, 12)]
     assert rows[2][2] == "main"
@@ -904,9 +868,7 @@ def test_the_repairs_are_counted(tmp_path):
 
 
 def test_a_line_from_the_fixed_rust_tokenizer_is_kept(tmp_path):
-    # The tokenizer no longer writes the prefix without --position. Such a
-    # line must pass unchanged: the repair removes text, it never moves a
-    # position by a fixed amount.
+    # The repair removes text; it never shifts a position by a fixed amount.
     stats = Counter()
     rows = walk(tmp_path, "m.rs", b"fn main\n",
                 "begin_unit|revision:0.0.1;language:Rust;cregit-version:0.0.1",
