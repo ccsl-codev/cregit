@@ -461,66 +461,6 @@ def sql_literal(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-# Joined per row from person_domain through --firm-map, kept a file so the
-# attribution stays reviewable. Columns: generate_dataset/DATASET.md.
-FIRM_FIELDS = ("firm_raw", "firm", "firm_source")
-
-
-def read_csv_column(path, column):
-    """One CSV column, as a list. csv, not duckdb: it runs before Phase 1."""
-    import csv
-
-    with open(path, newline="") as fh:
-        return [(row.get(column) or "") for row in csv.DictReader(fh)]
-
-
-def check_key_is_unique(path, column, what) -> int:
-    """Refuse a lookup table with a repeated key; return the row count. Through
-    the LEFT JOIN a repeated key silently duplicates token rows."""
-    keys = [k.strip().lower() for k in read_csv_column(path, column)]
-    if len(keys) != len(set(keys)):
-        seen, dupes = set(), []
-        for k in keys:
-            if k in seen and k not in dupes:
-                dupes.append(k)
-            seen.add(k)
-        raise SystemExit(
-            f"{path}: {what} repeats {len(dupes)} key(s) in `{column}`: "
-            f"{', '.join(dupes[:5])}{' …' if len(dupes) > 5 else ''}. "
-            "A repeated key multiplies token rows through the LEFT JOIN.")
-    return len(keys)
-
-
-def firm_sql(firm_map, firm_canonical) -> tuple[str, str]:
-    """(SELECT lines, JOIN lines) for the firm columns. Without --firm-map they
-    are empty strings and no join is added, so the schema stays the same."""
-    if not firm_map:
-        return ("".join(f"                '' AS {f},\n" for f in FIRM_FIELDS), "")
-    firm_expr = ("coalesce(fc.firm, fm.company, '')" if firm_canonical
-                 else "coalesce(fm.company, '')")
-    select = (
-        "                coalesce(fm.company, '')          AS firm_raw,\n"
-        f"                {firm_expr} AS firm,\n"
-        "                coalesce(fm.source, '')           AS firm_source,\n"
-    )
-    # persons.db keeps the e-mail's case, hence lower(). all_varchar stops a
-    # company like '1&1' or '360' being sniffed as a number.
-    join = (
-        "            LEFT JOIN (SELECT lower(domain) AS domain, company, source\n"
-        f"                       FROM read_csv_auto({sql_literal(firm_map)},\n"
-        "                                          header=true, all_varchar=true)) fm\n"
-        "                   ON fm.domain = lower(e.domain)\n"
-    )
-    if firm_canonical:
-        join += (
-            "            LEFT JOIN (SELECT firm_raw, firm\n"
-            f"                       FROM read_csv_auto({sql_literal(firm_canonical)},\n"
-            "                                          header=true, all_varchar=true)) fc\n"
-            "                   ON fc.firm_raw = fm.company\n"
-        )
-    return (select, join)
-
-
 def load_project_meta(meta_path, project_key) -> dict:
     """The project's constants, or empty strings when no sidecar was given.
 
@@ -593,22 +533,6 @@ def main():
         help="key into --project-meta (the manifest name). Defaults to --repo-name.",
     )
     parser.add_argument(
-        "--firm-map",
-        default="",
-        metavar="PATH",
-        help="CSV of domain,company,kind,source (cregit-token-pipeline/"
-        "data/affiliation.merged.csv). Joined per row against person_domain to "
-        "fill firm_raw and firm_source. Empty: the three firm columns are empty.",
-    )
-    parser.add_argument(
-        "--firm-canonical",
-        default="",
-        metavar="PATH",
-        help="CSV of firm_raw,firm,... — the REVIEWED canonical-name table that "
-        "fills the `firm` column. Needs --firm-map. Without it `firm` repeats "
-        "`firm_raw`.",
-    )
-    parser.add_argument(
         "--memory-limit",
         default=DEFAULT_MEMORY_LIMIT,
         metavar="SIZE",
@@ -665,24 +589,6 @@ def main():
     # Resolve before Phase 1: a bad key must not surface after the inserts.
     project_meta = load_project_meta(
         args.project_meta, args.project_key or args.repo_name)
-
-    if args.firm_canonical and not args.firm_map:
-        parser.error("--firm-canonical needs --firm-map: there is no firm_raw to "
-                     "canonicalise without a map to read it from")
-    if args.firm_map:
-        if not Path(args.firm_map).is_file():
-            print(f"ERROR: firm-map not found: {args.firm_map}", file=sys.stderr)
-            sys.exit(1)
-        n = check_key_is_unique(args.firm_map, "domain", "the firm map")
-        print(f"Firm map:  {args.firm_map} ({n} domains)")
-    if args.firm_canonical:
-        if not Path(args.firm_canonical).is_file():
-            print(f"ERROR: firm-canonical not found: {args.firm_canonical}",
-                  file=sys.stderr)
-            sys.exit(1)
-        n = check_key_is_unique(args.firm_canonical, "firm_raw",
-                                "the canonical-name table")
-        print(f"Firm canon: {args.firm_canonical} ({n} names)")
 
     blame_files = sorted(blame_root.rglob("*.blame"))
     if not blame_files:
@@ -805,7 +711,6 @@ def main():
     con.execute(f"CALL sqlite_attach('{args.persons_db}')")
 
     meta_sql = project_meta_sql(project_meta)
-    firm_select, firm_join = firm_sql(args.firm_map, args.firm_canonical)
 
     query = f"""
         COPY (
@@ -836,7 +741,6 @@ def main():
                 e.emailaddr                   AS person_email,
                 e.domain                      AS person_domain,
 
-{firm_select}
                 coalesce(m.repo, '')          AS repo_tag,
 
                 coalesce(ftr.footer_signed_off_by, [])        AS footer_signed_off_by,
@@ -861,7 +765,7 @@ def main():
             LEFT JOIN emails e            ON (c.autname = e.emailname
                                          AND c.autemail = e.emailaddr)
             LEFT JOIN persons p           ON e.personid = p.personid
-{firm_join}            LEFT JOIN (
+            LEFT JOIN (
                 SELECT
                     f.cid,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'signed-off-by')       AS footer_signed_off_by,

@@ -4,19 +4,19 @@
 
 `generate_dataset.py` produces a unified Parquet dataset containing every token from a
 tokenized git repository, annotated with commit metadata, authorship information,
-person identity, firm attribution, and the commit's git trailers.  It is the final
+person identity, and the commit's git trailers.  It is the final
 output of the CreGit pipeline (Step 10).
 
-**The schema is 70 columns**, in this order:
+**The schema is 67 columns**, in this order:
 
 | Block | Columns | # |
 |-------|---------|---|
 | [Token data](#token-data) | `repo_name`, then `file_path` … `is_structural` | 1 + 8 |
 | [Per-project provenance](#per-project-provenance) | `clone_url` … `file_mask` | 29 |
 | [Git commit metadata](#git-commit-metadata) | `cregit_commit_sha` … `commit_summary` | 9 |
-| [Person identity](#person-identity) | `personid` … `repo_tag`, including the three [firm](#firm-attribution) columns | 8 |
+| [Person identity](#person-identity) | `personid` … `repo_tag` | 5 |
 | [Commit trailers](#commit-trailers-footers) | `footer_*` | 15 |
-| | **total** | **70** |
+| | **total** | **67** |
 
 `repo_name` is column 1 and the 29 provenance columns are 2-30, so `file_path` is
 column 31.
@@ -114,25 +114,7 @@ numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
 | `person_name` | `TEXT` | persons | Canonical display name for this person. Derived via `coalesce(p.personname, e.personid)`. If neither is available, this is `NULL`. |
 | `person_email` | `TEXT` | emails | Email address that matched this commit's author name/email pair. |
 | `person_domain` | `TEXT` | emails | Domain part of the email address. |
-| `firm_raw` | `TEXT` | `--firm-map` | The map's `company` for `person_domain`, verbatim. `''` when the domain is not in the map. |
-| `firm` | `TEXT` | `--firm-canonical` | Canonical firm name: `firm_raw` unless the canonical table renames it. |
-| `firm_source` | `TEXT` | `--firm-map` | The map's `source`: `patch`, `gitdm`, `rich`, `builtin`, `correction` (hand-curated), `cncf-gitdm`, `cncf-gitdm-single` (single-person inference, 2,771 of 4,049 rows), `spinellis[-sec]`. `''` when the domain is not in the map. |
 | `repo_tag` | `TEXT` | commitmap | Repository tag indicating the origin repository. Values: `'p'` (pre-history), `'b'` (BitKeeper), `'l'` (Linux), or `''` (unknown/single repo). |
-
-### Firm attribution
-
-Firm is resolved **per row** from `person_domain` by a LEFT JOIN against
-`--firm-map` (`cregit-token-pipeline/data/affiliation.merged.csv`); `firm` comes
-from `--firm-canonical`. A repeated key in either file would multiply token rows,
-so the generator refuses it before Phase 1.
-
-```sql
--- Firm-level token counts, excluding single-person inferences
-SELECT firm, COUNT(*) AS tokens
-FROM 'dataset.parquet'
-WHERE is_structural = 0 AND firm <> '' AND firm_source <> 'cncf-gitdm-single'
-GROUP BY firm ORDER BY tokens DESC;
-```
 
 ### Commit trailers (footers)
 
@@ -384,7 +366,6 @@ Join `token_map` with the three SQLite databases:
 - `commits` — commit metadata (author, committer, dates, summary)
 - `commitmap` — cregit → original commit SHA mapping
 - `emails` / `persons` — person identity resolution
-- `--firm-map` / `--firm-canonical` — firm attribution, when given
 
 Output is written as ZSTD-compressed Parquet.
 
@@ -413,8 +394,6 @@ uv run python generate_dataset/generate_dataset.py \
 | `--repo-name` | no | Repository name. Default: inferred from output filename. |
 | `--project-meta` | no | JSON sidecar of per-project provenance, from `project_meta.py`. Omit and those columns are written empty. |
 | `--project-key` | no | Which key of the sidecar this project is. Default: `--repo-name`. A key the sidecar does not hold is an error, not a blank row. |
-| `--firm-map` | no | CSV of `domain,company,kind,source`. Omit and the three firm columns are written empty. A repeated `domain` is an error. |
-| `--firm-canonical` | no | CSV of `firm_raw,firm,…` that fills `firm`. Needs `--firm-map`. Omit and `firm` repeats `firm_raw`. |
 | `--verbose` | no | Enable info-level logging to stderr. |
 
 ## Cross-reference: Perl ↔ Python
