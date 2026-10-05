@@ -352,8 +352,7 @@ tokenize_gate() {
             summary="$stage hit a parser crash: deterministic, so --blob-timeout will not help.
      Fix srcML, or denylist the diagnosed blob." ;;
         7) die "$stage refused --retokenize, which would have invalidated nothing (exit 7).
-     Check the extension spelling (as in tokenize/CregitLanguages.pm) and that
-     --memo-dir names this project's memo ($MEMO_DIR). Nothing in $WORK changed." ;;
+     Check the extension spelling and that --memo-dir is this project's memo ($MEMO_DIR)." ;;
         *) die "$stage failed (exit $status)" ;;
     esac
 
@@ -414,59 +413,37 @@ if [ -z "$MASK" ]; then
 fi
 
 if [ "$MASK_WIDENED" = 1 ] && [ "$FROM_STEP" = "1" ]; then
-    echo "--mask-widened needs FROM_STEP>=2. A step-1 run starts by deleting $WORK, so the
-     blob map it would reuse and the cregit.git its new_blob ids live in are both
-     gone before blobExec starts, and the flag would preserve nothing.
-     Resume instead:
-       runner:  $0 --repo-url <url> --work $WORK --mask-widened [same flags] 2
-       ctp.py:  python3 ./ctp.py run [same flags] --mask-widened --from-step 2" >&2
+    echo "--mask-widened needs FROM_STEP>=2: step 1 deletes $WORK and the blob map it reuses.
+     Resume with: $0 [same flags] --mask-widened 2  (ctp.py: --mask-widened --from-step 2)" >&2
     exit 2
 fi
 
 if [ "$MASK_WIDENED" = 1 ] && [ "$MODE" = "sharded" ]; then
-    echo "--mask-widened is not available with --mode sharded: every shard builds a fresh
-     blob map, so no recorded mask exists to widen. Reuse a prior run's
-     tokenizations with shard_build.sh --warm-db instead." >&2
+    echo "--mask-widened is not available with --mode sharded: shards keep no mask to widen.
+     Reuse a prior run's tokenizations with shard_build.sh --warm-db instead." >&2
     exit 2
 fi
 
 if [ -n "$RETOKENIZE" ] && [ "$FROM_STEP" != "2" ]; then
-    echo "--retokenize needs FROM_STEP=2 exactly (got $FROM_STEP).
-     Step 1 deletes $WORK, so the blob map and memo whose poisoned entries this flag
-     removes are gone before blobExec starts — and a from-scratch run re-tokenizes
-     everything anyway, with the current tokenizer, which is the same outcome at
-     full cost.
-     Step 3 or later never reaches the invalidation at all: it lives in step 2, so
-     the flag would be skipped, steps 3-10 would run over the poisoned tokens, and
-     the run would exit 0.
-     Resume at step 2:
-       runner:  $0 --repo-url <url> --work $WORK --retokenize $RETOKENIZE [same flags] 2
-       ctp.py:  python3 ./ctp.py run [same flags] --from-step 2" >&2
+    echo "--retokenize needs FROM_STEP=2 exactly (got $FROM_STEP): step 1 deletes the cache, 3+ skip it.
+     Resume with: $0 [same flags] --retokenize $RETOKENIZE 2  (ctp.py: --from-step 2)" >&2
     exit 2
 fi
 
 if [ "$REBLAME" = 1 ] && [ "$FROM_STEP" -gt 7 ]; then
-    echo "--reblame needs FROM_STEP<=7 (got $FROM_STEP). The re-blame happens inside
-     step 7. From step 8 onward the flag is skipped, step 10 rebuilds the Parquet from
-     the blame files already on disk, and the run exits 0 having changed nothing.
-     Resume at step 7:
-       runner:  $0 --repo-url <url> --work $WORK --reblame [same flags] 7
-       ctp.py:  python3 ./ctp.py run [same flags] --reblame --from-step 7" >&2
+    echo "--reblame needs FROM_STEP<=7 (got $FROM_STEP): later steps skip the re-blame.
+     Resume with: $0 [same flags] --reblame 7  (ctp.py: --reblame --from-step 7)" >&2
     exit 2
 fi
 
 if [ -n "$RETOKENIZE" ] && [ "$MODE" = "sharded" ]; then
-    echo "--retokenize is not available with --mode sharded: every shard builds a fresh
-     blob map, so there are no cached tokenizations for it to invalidate. Retokenize
-     the merged result in a non-sharded step-2 resume, or drop the shards' warm db." >&2
+    echo "--retokenize is not available with --mode sharded: shards keep no cached tokens." >&2
     exit 2
 fi
 
 if [ -n "$RETOKENIZE" ] && [ "$MASK_WIDENED" = 1 ]; then
-    echo "--mask-widened and --retokenize cannot be used in the same run. Each verifies its
-     own precondition against the blob map's rows, and together each would verify
-     against a state the other is about to change.
-     Do them one at a time: widen first, then resume again with --retokenize." >&2
+    echo "--mask-widened and --retokenize cannot be used in the same run.
+     Widen first, then resume again with --retokenize." >&2
     exit 2
 fi
 
@@ -474,9 +451,8 @@ if [ -n "$RETOKENIZE" ]; then
     for _ext in ${RETOKENIZE//,/ }; do
         case "$_ext" in
             ''|*[!a-z0-9+]*)
-                echo "invalid --retokenize: '$_ext' is not an extension. Want lowercase names
-     without a leading dot, comma-separated, as spelled in tokenize/CregitLanguages.pm:
-     --retokenize rs   --retokenize c,h" >&2
+                echo "invalid --retokenize: '$_ext'. Want lowercase extensions without a dot,
+     as in tokenize/CregitLanguages.pm: --retokenize rs or --retokenize c,h" >&2
                 exit 2 ;;
         esac
     done
@@ -666,13 +642,10 @@ needs_build() {
     NEEDS_BUILD_REASON=""
     [ $# -gt 0 ] || die "needs_build: no sources declared for $artifact (a source list is missing)"
     local p
+    # A missing source path would silently stop guarding the artifact.
     for p in "$@"; do
-        [ -e "$p" ] || die \
-"declared source path does not exist: $p
-     (it guards $artifact). Either the checkout is incomplete or the source list
-     in this script is wrong. Refusing to guess: an unreadable source list
-     silently stops guarding that artifact, which is how a 16-day-old
-     rustTokenizer binary shipped a corpus of shifted token columns."
+        [ -e "$p" ] || die "declared source path does not exist: $p (it guards $artifact).
+     The checkout is incomplete or the source list in this script is wrong."
     done
     if [ ! -e "$artifact" ]; then
         NEEDS_BUILD_REASON="missing"
@@ -813,10 +786,8 @@ echo ""
 # dir and step 7 would keep blame of the old shas. Keeps the bare repos, blob map
 # and memo. Named paths only, never a glob or $WORK itself.
 drop_refold_derived_artifacts() {  # $1 = which flag is asking, for the log
-    log "$1: dropping the artifacts derived from the tokenized repo,"
-    log "  because the re-fold gives every cregit commit a new sha."
-    log "  KEEPING: $REPO_PATH_ORIGINAL_BARE, $REPO_PATH_CREGIT_BARE,"
-    log "           $DB_PATH_BLOBMAP, $MEMO_DIR"
+    log "$1: dropping what derives from the tokenized repo (the re-fold changes every sha)."
+    log "  KEEPING: $REPO_PATH_ORIGINAL_BARE, $REPO_PATH_CREGIT_BARE, $DB_PATH_BLOBMAP, $MEMO_DIR"
     local _stale
     for _stale in \
         "$WORK/blame" \
@@ -876,8 +847,7 @@ TOKENIZER_IDENTITY=$(perl "${CREGIT}/tokenize/tokenizerIdentity.pl" \
     --srcml2token="${SRCML2TOKEN}" \
     --ctags="$(which ctags)") \
   || die "cannot compute the tokenizer identity (tokenize/tokenizerIdentity.pl).
-     blobExec needs it to tell a cache built by this tokenizer from one built by a
-     different one. Build the artifacts first: $0 --ensure-artifacts"
+     Build the artifacts first: $0 --ensure-artifacts"
 [ -n "$TOKENIZER_IDENTITY" ] \
   || die "tokenize/tokenizerIdentity.pl printed nothing; refusing to run with no tokenizer identity"
 log "tokenizer identity: $TOKENIZER_IDENTITY"
@@ -897,9 +867,8 @@ if [ "$MODE" = "sharded" ]; then
     ${BLOB_TIMEOUT:+--blob-timeout "$BLOB_TIMEOUT"} \
     ${STALL_TIMEOUT:+--stall-timeout "$STALL_TIMEOUT"} || TOKENIZE_RC=$?
   tokenize_gate "$TOKENIZE_RC" "sharded tokenize (shard_build.sh)"
-  log "note: --mode sharded does not record a tokenizer identity in the merged blob map."
-  log "      A later resume cannot detect a tokenizer change against it. Non-sharded"
-  log "      modes record and check it; see --retokenize."
+  log "note: --mode sharded records no tokenizer identity in the merged blob map,"
+  log "      so a later resume cannot detect a tokenizer change against it."
 else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
