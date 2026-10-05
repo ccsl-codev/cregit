@@ -196,12 +196,11 @@ object Main {
       |                    process is killed with status ${Walker.StalledExitStatus}. The memo is
       |                    durable, so re-running resumes.
       |
-      |  Blobs on the shipped denylist (${BlobDenylist.ResourcePath} inside this
-      |  jar) are never handed to <command>: they are dropped from the rewritten
-      |  trees, counted as blobsDenylisted, named with their reason and citation on
-      |  an EXCLUDED line, and they do NOT change the exit status. srcML 1.1.0 does
-      |  not terminate on the listed blobs, and the defect is diagnosed and cited
-      |  upstream, so the list saves the --blob-timeout each run would spend.
+      |  Blobs on the shipped denylist (${BlobDenylist.EntriesSource}) are never
+      |  handed to <command>: they are dropped from the rewritten trees, counted as
+      |  blobsDenylisted, named with their reason and citation on an EXCLUDED line,
+      |  and they do NOT change the exit status. srcML 1.1.0 does not terminate on
+      |  the listed blobs, so the list saves the --blob-timeout each run would spend.
       |
       |  A blob whose tokenizer times out or reports a parser crash is excluded
       |  the same way: dropped from the rewritten trees, counted as blobsTimedOut
@@ -453,14 +452,7 @@ object Main {
     val dbParent = dbPath.getParent
     if (dbParent != null && !Files.isDirectory(dbParent)) Files.createDirectories(dbParent)
 
-    // Eager, so a missing or malformed denylist stops the run now, not mid-walk.
-    val denylist =
-      try BlobDenylist.shipped
-      catch {
-        case e: Exception =>
-          System.err.println(s"Error: cannot read the blob denylist: ${e.getMessage}")
-          sys.exit(1)
-      }
+    val denylist = BlobDenylist.shipped
 
     val incremental = Files.isDirectory(dstPath)
     val shardStr = shard.map { case (k, n) => s"$k/$n" }.getOrElse("none")
@@ -596,10 +588,10 @@ object Main {
     if (stats.blobsDenylisted > 0) {
       System.err.println(
         s"blobExec: ${stats.blobsDenylisted} blob(s) were excluded by the blob denylist " +
-          s"(${BlobDenylist.ResourcePath} in this jar, ${denylist.size} entr" +
+          s"(${BlobDenylist.EntriesSource}, ${denylist.size} entr" +
           s"${if (denylist.size == 1) "y" else "ies"}). Each one is named with its sha, path, " +
           "reason and upstream citation on an 'EXCLUDED denylisted blob' line above; those " +
-          "lines and that file are the record of what this project's dataset does not contain. " +
+          "lines and that list are the record of what this project's dataset does not contain. " +
           "The files are absent from the tokenized repository, not present as raw source, so " +
           "they produce no blame and no dataset row. This is not a failure and does not affect " +
           "the exit status."

@@ -1014,7 +1014,7 @@ final class Walker(
           "row, and the file is absent from the tokenized repository rather than present as raw " +
           "source. The exclusion is deterministic and cited; the walk carries on and the run " +
           "still exits 0. See " +
-          s"${BlobDenylist.ResourcePath} in the blobExec jar for the list itself."
+          s"${BlobDenylist.EntriesSource} in blobExec for the list itself."
       )
     }
   }
