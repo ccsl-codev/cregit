@@ -186,13 +186,9 @@ returns without invoking `srcml` at all. Put it out of reach with `--memo-dir`,
 names neither repository nor extension). The runner refuses a step-1 wipe that
 would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 
-209 blobs are on a **blob denylist**
-(`blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv`): 12 on which
-srcML 1.1.0 does not terminate (8 Java, srcML/srcML#2361; 4 C), and 197 C and C++
-blobs on which it crashes under `--position`. The file header cites each defect.
-Denylisted blobs never reach the tokenizer, are dropped from the rewritten trees,
-are counted as `blobsDenylisted`, and do **not** change the exit status. Adding an
-entry means editing that file and rebuilding the jar.
+12 blobs on which srcML 1.1.0 does not terminate (8 Java, srcML/srcML#2361; 4 C) are
+on a **blob denylist** (`BlobDenylistEntries.scala`). They never reach the tokenizer,
+are dropped from the rewritten trees, and are counted as `blobsDenylisted`.
 
 A blob whose tokenizer times out or reports a parser crash is excluded the same
 way without an entry: it is named on an `EXCLUDED failed blob` line, tried once

@@ -300,7 +300,7 @@ produces no blame and no dataset row rather than rows of unparsed text:
 
 | Mechanism | Recorded as | Effect here |
 |---|---|---|
-| the **blob denylist**, `blobExec/src/main/resources/cregit/blobexec/blob-denylist.tsv` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list ships in the jar; nothing at run time can extend or override it |
+| the **blob denylist**, `BlobDenylistEntries.scala` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list is compiled into the jar |
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
 | a blob the tokenizer **timed out** or **crashed** on | `blobsTimedOut` or `blobsParserCrashed`, plus one `EXCLUDED failed blob` line each with `reason=timeout` or `reason=parser-crash` | no rows for those blobs. The run still exits 0 |
 
