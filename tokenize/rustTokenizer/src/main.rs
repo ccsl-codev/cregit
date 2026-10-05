@@ -21,7 +21,7 @@ static KEYWORDS: phf::Set<&'static str> = phf::phf_set! {
 };
 
 fn main() {
-    let (path, emit_positions) = parse_args();
+    let (path, position) = parse_args();
     let src = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -29,15 +29,18 @@ fn main() {
             exit(1);
         }
     };
-    print_pipe_separated_tokens(&src, emit_positions);
+    tokenize_source(&src, position);
 }
 
 fn parse_args() -> (String, bool) {
     let mut path: Option<String> = None;
-    let mut emit_positions = false;
+    // Positions are OFF unless asked for, exactly as tokenizeSrcMl.pl gates them. This
+    // flag used to be swallowed and positions emitted unconditionally; see
+    // tokenize_source for why that corrupted every downstream row.
+    let mut position = false;
     for arg in env::args().skip(1) {
         if arg == "--position" {
-            emit_positions = true;
+            position = true;
             continue;
         }
         if arg.starts_with("--language=") || arg == "--verbose" {
@@ -58,19 +61,38 @@ fn parse_args() -> (String, bool) {
         eprintln!("Usage: rust_tokenizer [--language=Rust] [--position] <source.rs>");
         exit(2);
     });
-    (path, emit_positions)
+    (path, position)
 }
 
-fn print_pipe_separated_tokens(src: &str, emit_positions: bool) {
-    let print_positionless_line = |body: &str| {
-        if emit_positions {
+// Emits the cregit FINAL token format. That format is defined by tokenizeSrcMl.pl -- the
+// only other tokenizer the pipeline actually routes to (CregitLanguages.pm
+// %LANG_PARSER_REL: C/C++/Java -> tokenizeSrcMl.pl, Rust -> here; Go is unrouted and M4
+// is excluded from the file mask) -- and it is PIPE-separated with NO position prefix
+// unless --position is given:
+//
+//   tokenize/t/expected/main.c.nopos.token   begin_unit|revision:...   comment|/* ... */
+//   tokenize/t/expected/main.c.token         -:-|begin_unit|...        1:1|comment|/* ... */
+//
+// Do NOT copy the TAB form in tokenize/srcMLtoken/tests/expected/*.token: that is
+// srcml2token's INTERMEDIATE output, which tokenizeSrcMl.pl:120 consumes with
+// /^([0-9]+|-):([0-9]+|-)\s+(.+)$/ and re-emits with `|`. It never reaches a consumer.
+//
+// The consumers both split on `|`:
+//   generate_dataset/generate_dataset.py:243  re.match(r"^(.+?)\|(.+)$", token_content)
+//   prettyPrint/prettyPrint-author.pl:976     split('\|', $value)
+// The first group is NON-GREEDY, so any extra leading `line:col<TAB>` field lands whole
+// in token_type and shifts token_value, source_text and is_structural by one.
+fn tokenize_source(src: &str, position: bool) {
+    // A line with no source position of its own: `-:-|` under --position, bare otherwise.
+    let marker = |body: &str| {
+        if position {
             println!("-:-|{}", body);
         } else {
             println!("{}", body);
         }
     };
 
-    print_positionless_line(&format!(
+    marker(&format!(
         "begin_unit|revision:{};language:Rust;cregit-version:{}",
         REVISION, CREGIT_VERSION
     ));
@@ -84,7 +106,7 @@ fn print_pipe_separated_tokens(src: &str, emit_positions: bool) {
         let slice = &src[byte..end];
 
         if let Some(out) = classify(&tok.kind, slice) {
-            if emit_positions {
+            if position {
                 println!("{}:{}|{}", line, col, out);
             } else {
                 println!("{}", out);
@@ -103,8 +125,11 @@ fn print_pipe_separated_tokens(src: &str, emit_positions: bool) {
         byte = end;
     }
 
-    print_positionless_line("end_unit");
-    print_positionless_line("");
+    marker("end_unit");
+    // tokenizeSrcMl.pl:143 prints a bare marker line after every `end_*` token, so the
+    // stream ends `end_unit` + blank (or `-:-|end_unit` + `-:-|`). generate_dataset.py
+    // classifies that blank as token_type `blank`, is_structural 1.
+    marker("");
 }
 
 // None skips output (whitespace / Eof); the caller still advances the cursor. Every

@@ -85,11 +85,38 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
       // Empty by default: a fixture blob must never be excluded because it happens
       // to collide with the shipped list, and the shipped list must never be
       // exercised by accident. The denylist tests pass their own.
-      denylist: BlobDenylist = BlobDenylist.empty
+      denylist: BlobDenylist = BlobDenylist.empty,
+      maskWidened: Boolean = false,
+      tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
+      retokenizeExtensions: Set[String] = Set.empty,
+      memoDir: Option[Path] = None
   ): WalkStats = {
     val destinationMayContainObjects = Files.isDirectory(dstPath)
     val dst = openBare(dstPath)
-    val mapping = Mapping.open(dbPath, command, mask)
+    val resolvesInDst: String => Boolean = id => {
+      val r = dst.newObjectReader()
+      try r.has(ObjectId.fromString(id)) finally r.close()
+    }
+    val widening =
+      if (!maskWidened) None
+      else Some(Mapping.MaskWidening(newBlobResolves = resolvesInDst, report = _ => ()))
+    val retokenize =
+      if (retokenizeExtensions.isEmpty) None
+      else Some(Mapping.Retokenize(
+        extensions = retokenizeExtensions,
+        newBlobResolves = resolvesInDst,
+        purgeMemo = blobs => memoDir match {
+          case None => TokenizerMemo.PurgeReport(blobs.size.toLong, blobs.size.toLong, 0L, 0L)
+          case Some(root) => TokenizerMemo.purge(root, blobs, sha => {
+            val r = srcRepo.newObjectReader()
+            try Some(r.open(ObjectId.fromString(sha), OBJ_BLOB).getBytes)
+            catch { case _: Exception => None }
+            finally r.close()
+          })
+        },
+        report = _ => ()
+      ))
+    val mapping = Mapping.open(dbPath, command, mask, None, widening, tokenizerIdentity, retokenize)
     try {
       val walker = new Walker(
         srcRepo, dst, mapping, mask.r, command, abortOnError, parallelism,
@@ -640,10 +667,10 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
 
   // -- shared dir helpers ----------------------------------------------------
 
+
   // -- large pass-through blob (regression) ----------------------------------
-  //
-  // Lowering the threshold lets a small blob cross it, so the regression
-  // reproduces in milliseconds instead of needing a 50 MB fixture.
+  // getBytes refuses blobs above JGit's stream threshold, so the verbatim copy
+  // must stream. The threshold is lowered so a small blob reproduces it.
   private def withStreamFileThreshold[T](bytes: Int)(body: => T): T = {
     val lowered = new WindowCacheConfig
     lowered.setStreamFileThreshold(bytes)
@@ -703,7 +730,20 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- oversized MASK-MATCHED blob (regression) -------------------------------
+  // Streaming cannot help here: the tokenizer cannot take it, so it is excluded.
 
+  test("the oversized limit is jgit's own threshold, not a constant above it") {
+    val jgitDefault = new WindowCacheConfig().getStreamFileThreshold.toLong
+    // Read from jgit, so the two cannot drift.
+    Walker.MaxBlobBytes shouldEqual jgitDefault
+    jgitDefault shouldEqual 50L * 1024 * 1024
+    Walker.isOversized(200L * 1024 * 1024) shouldBe true
+    Walker.isOversized(55L * 1024 * 1024) shouldBe true
+    Walker.isOversized(4096L) shouldBe false
+  }
+
+  /** The 78 KB fixture is below Walker.MaxBlobBytes, so only the LargeObjectException
+    * catch (under a lowered jgit threshold) can exclude it. */
   private def checkOversizedExclusion(label: String, pipeline: Boolean, pipelineTrees: Boolean): Unit = {
     val dir = freshWorkDir("oversized-masked-" + label)
     val git = initSrc(dir.resolve("src"))
@@ -714,6 +754,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
         Map("keep.c" -> "int main(){}\n", "generated/excel.c" -> generated),
         "add a normal source file and a generated one")
     } finally git.close()
+
+    Walker.isOversized(generated.length.toLong) shouldBe false
 
     val srcRepo = openBare(dir.resolve("src/.git"))
     val stats = try {
@@ -762,17 +804,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- DENYLISTED mask-matched blob -------------------------------------------
-  //
-  // srcML 1.1.0 does not terminate on the denylisted blobs: 0 bytes of output, one
-  // core busy, at any budget. Upstream srcML/srcML#2361 is open with no patch and
-  // v1.1.0 is the latest release, so there is nothing to upgrade to. The timeout
-  // path contains the hang but answers it with exit 4, "incomplete, do not
-  // publish", which holds the project back for a diagnosed third-party defect.
-  //
-  // So a denylisted blob takes Task 5's EXCLUSION path instead: dropped in
-  // microseconds, never handed to the tokenizer, counted on its own, and NOT
-  // gating the exit status. A timeout still gates it, because a timeout is a hang
-  // nobody has explained yet.
+  // srcML 1.1.0 never terminates on these (srcML/srcML#2361). A denylisted blob is
+  // excluded and does not gate the exit status; an unexplained timeout still does.
 
   /** The git blob id of `content`, computed the way git computes it, so a fixture
     * can be denylisted without first asking the repository what its sha is. */
@@ -793,8 +826,8 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     } finally git.close()
 
     val denied = blobIdOf(hangs)
-    val denylist = BlobDenylist(Map(denied.name ->
-      BlobDenylist.Entry("srcML/srcML#2361", "srcML 1.1.0 does not terminate on it")))
+    val denylist = BlobDenylist(Map(
+      denied.name -> BlobDenylist.Entry("srcML/srcML#2361", "srcML 1.1.0 does not terminate on it")))
 
     // Every invocation of the tokenizer records the blob it was given. "Excluded in
     // milliseconds, never handed to the tokenizer" is only checkable from the
@@ -880,6 +913,183 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
     val dst = openBare(dir.resolve("dst.git"))
     try fileAtHead(dst, "master", "keep.c") shouldBe Some("int main(){}\n")
     finally dst.close()
+  }
+
+  // -- --mask-widened, end to end ---------------------------------------------
+  // Trap: a newly selected file already has an identity row; serving it as a cache
+  // hit would put raw source in the tokenized repository.
+
+  test("a widened mask reuses the tokenized rows and still tokenizes the newly selected ones") {
+    val w = freshWorkDir("mask-widened")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val cmd    = shellScript(w, "tr a-z A-Z")
+    val narrow = """\.[ch]$"""
+    val wide   = """\.(c|cpp|h)$"""
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map(
+      "a.c"       -> "int a;\n",
+      "b.h"       -> "int b;\n",
+      "c.cpp"     -> "int c;\n",
+      "README.md" -> "leave-me-alone\n"
+    ), "only commit")
+
+    val first = runWalker(git.getRepository, dstDir, db, cmd, narrow)
+    first.blobCommandExecutions shouldEqual 2L
+    locally {
+      val dst = openBare(dstDir)
+      try {
+        fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+        fileAtHead(dst, "master", "c.cpp") shouldBe Some("int c;\n")
+      } finally dst.close()
+    }
+
+    val second = runWalker(git.getRepository, dstDir, db, cmd, wide, maskWidened = true)
+
+    second.blobCommandExecutions shouldEqual 1L
+    second.blobsCacheHit shouldEqual 2
+
+    val dst = openBare(dstDir)
+    try {
+      fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+      fileAtHead(dst, "master", "b.h") shouldBe Some("INT B;\n")
+      // Without the identity-row purge this would be the raw "int c;\n".
+      fileAtHead(dst, "master", "c.cpp") shouldBe Some("INT C;\n")
+      fileAtHead(dst, "master", "README.md") shouldBe Some("leave-me-alone\n")
+    } finally dst.close()
+  }
+
+  test("without the opt-in the same second run refuses, and dst is left alone") {
+    val w = freshWorkDir("mask-widened-refused")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val cmd    = shellScript(w, "tr a-z A-Z")
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map("a.c" -> "int a;\n", "c.cpp" -> "int c;\n"), "only commit")
+    runWalker(git.getRepository, dstDir, db, cmd, """\.[ch]$""")
+
+    intercept[Mapping.MetaMismatchException] {
+      runWalker(git.getRepository, dstDir, db, cmd, """\.(c|cpp|h)$""")
+    }
+
+    val dst = openBare(dstDir)
+    try fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n") finally dst.close()
+  }
+
+  // -- tokenizer identity ----------------------------------------------------
+  // `command` is a constant path, so a corrected tokenizer must be detected by its
+  // identity, and --retokenize must redo only the affected extension.
+
+  test("a changed tokenizer identity refuses the incremental run instead of reusing its tokens") {
+    val w = freshWorkDir("tokid-refuse")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val mask   = """\.(c|rs)$"""
+    val v1     = shellScript(w, "tr a-z A-Z")
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map("a.c" -> "int a;\n", "b.rs" -> "fn b() {}\n"), "only commit")
+    runWalker(git.getRepository, dstDir, db, v1, mask,
+      tokenizerIdentity = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "1111111111")))
+
+    // Only the Rust tokenizer's identity moved.
+    val ex = intercept[Mapping.TokenizerChangedException] {
+      runWalker(git.getRepository, dstDir, db, v1, mask,
+        tokenizerIdentity = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "2222222222")))
+    }
+    ex.getMessage should include("--retokenize=rs")
+
+    val dst = openBare(dstDir)
+    try fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+    finally dst.close()
+  }
+
+  test("--retokenize on one extension re-tokenizes that extension's files and reuses the rest") {
+    val w = freshWorkDir("tokid-retokenize")
+    val srcDir = w.resolve("src")
+    val dstDir = w.resolve("dst.git")
+    val db     = w.resolve("map.sqlite")
+    val memo   = w.resolve("memo")
+    Files.createDirectories(memo)
+    val mask   = """\.(c|rs)$"""
+
+    // One command path for both runs, as in the pipeline (tokenBySha.pl): a second
+    // path would trip the `command` meta check and prove nothing.
+    val cmd = w.resolve("tokenize.sh")
+    def writeTokenizer(rustBody: String): String = {
+      Files.writeString(cmd,
+        s"""#!/bin/sh
+           |case "$$BFG_FILENAME" in
+           |  *.rs) $rustBody ;;
+           |  *)    tr a-z A-Z ;;
+           |esac
+           |""".stripMargin)
+      cmd.toFile.setExecutable(true)
+      cmd.toAbsolutePath.toString
+    }
+    // v1 emits the buggy `line:col<TAB>` prefix; v2 does not.
+    val v1 = writeTokenizer("""sed 's/^/1:1\t/'""")
+
+    val git = initSrc(srcDir)
+    writeAndCommit(git, Map(
+      "a.c"       -> "int a;\n",
+      "b.rs"      -> "fn b() {}\n",
+      "c.rs"      -> "fn c() {}\n",
+      "README.md" -> "leave-me-alone\n"
+    ), "only commit")
+
+    val idV1 = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "1111111111"))
+    val idV2 = TokenizerIdentity(Map("c" -> "cccccccccccc", "rs" -> "2222222222"))
+
+    val first = runWalker(git.getRepository, dstDir, db, v1, mask, tokenizerIdentity = idV1)
+    first.blobCommandExecutions shouldEqual 3L
+    locally {
+      val dst = openBare(dstDir)
+      try {
+        fileAtHead(dst, "master", "b.rs") shouldBe Some("1:1\tfn b() {}\n")
+        fileAtHead(dst, "master", "a.c") shouldBe Some("INT A;\n")
+      } finally dst.close()
+    }
+
+    // The entries tokenBySha.pl would have written.
+    val memoEntries = Map(
+      "fn b() {}\n"      -> "1:1\tfn b() {}\n",
+      "fn c() {}\n"      -> "1:1\tfn c() {}\n",
+      "int a;\n"         -> "INT A;\n"
+    ).map { case (content, tokens) =>
+      val p = TokenizerMemo.entryFor(memo, TokenizerMemo.sha1Hex(content.getBytes(UTF_8)))
+      Files.createDirectories(p.getParent)
+      Files.writeString(p, tokens)
+      content -> p
+    }
+
+    val v2 = writeTokenizer("cat")
+    v2 shouldEqual v1
+
+    val second = runWalker(git.getRepository, dstDir, db, v2, mask,
+      tokenizerIdentity = idV2, retokenizeExtensions = Set("rs"), memoDir = Some(memo))
+
+    // Only the .rs files are re-tokenized; a.c stays a cache hit.
+    second.blobCommandExecutions shouldEqual 2L
+    second.blobsCacheHit shouldEqual 1
+
+    val dst = openBare(dstDir)
+    try {
+      fileAtHead(dst, "master", "b.rs") shouldBe Some("fn b() {}\n")
+      fileAtHead(dst, "master", "c.rs") shouldBe Some("fn c() {}\n")
+      fileAtHead(dst, "master", "a.c")  shouldBe Some("INT A;\n")
+      fileAtHead(dst, "master", "README.md") shouldBe Some("leave-me-alone\n")
+    } finally dst.close()
+
+    // An unpurged memo would serve the same stale tokens by sha1(contents).
+    Files.exists(memoEntries("fn b() {}\n")) shouldBe false
+    Files.exists(memoEntries("fn c() {}\n")) shouldBe false
+    Files.exists(memoEntries("int a;\n")) shouldBe true
   }
 
   private def deleteRecursive(p: Path): Unit = {

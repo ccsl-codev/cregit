@@ -300,18 +300,15 @@ produces no blame and no dataset row rather than rows of unparsed text:
 
 | Mechanism | Recorded as | Effect here |
 |---|---|---|
-| the **blob denylist**, `blobExec/src/main/scala/cregit/blobexec/BlobDenylistEntries.scala` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list ships in the jar; nothing at run time can extend or override it |
+| the **blob denylist**, `BlobDenylistEntries.scala` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list is compiled into the jar |
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
-| a blob the tokenizer **timed out** on | `blobsTimedOut`, exit 4 | **no Parquet at all**: steps 3-10 never run, so this generator is never reached and the project cannot publish while a timeout is unexplained |
+| a blob the tokenizer **timed out** or **crashed** on | `blobsTimedOut` or `blobsParserCrashed`, plus one `EXCLUDED failed blob` line each with `reason=timeout` or `reason=parser-crash` | no rows for those blobs. The run still exits 0 |
 
-One example, so the shape is clear: [`2ee2673a`](https://github.com/tencent/tencentkona-21/blob/2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65/test/langtools/tools/javac/annotations/typeAnnotations/newlocations/TestNewCastArray.java)
-— srcML 1.1.0's Java parser does not terminate on type-annotated array types
-(upstream [`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361), closed by the
-revision `nix/srcml.nix` pins).
-The list is keyed by content, not path: this file moved in a repository
-reorganisation, so its four revisions at two paths are four entries. Failure is
-non-termination, not slowness — 0 bytes out, one core at 100%, at every budget
-from 5 s to 600 s.
+The denylist holds 209 blob ids, keyed by content, in three srcML 1.1.0 defects:
+8 Java blobs that do not terminate (upstream
+[`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361)), 4 C blobs that do
+not terminate (no upstream issue), and 197 C and C++ blobs on which srcML crashes
+under `--position`. The header of the file carries the reproducers and citations.
 
 Also outside the dataset, by mask rather than by exclusion: M4 (`.am`, `.ac`),
 whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,
@@ -355,9 +352,13 @@ persons.db ─────────────┤
 
 For each `.blame` file:
 1. Parse each line as `commit_sha;token_content`
-2. Walk through the original source file character-by-character to match tokens
-3. Classify each token (structural vs content, type, value)
-4. Insert into SQLite `token_map`
+2. Repair the token line: drop the Rust tokenizer's `line:col<TAB>` prefix and,
+   in a strict UTF-8, non-`.rs` file without a byte-order mark, undo srcML
+   1.1.0's Latin-1 misreading (`Ã¶` becomes `ö`). The source is read as
+   `utf-8-sig`, so a BOM does not shift the walk. Counts go to a `Repaired:` line.
+3. Walk through the original source file character-by-character to match tokens
+4. Classify each token (structural vs content, type, value)
+5. Insert into SQLite `token_map`
 
 ### Phase 2: DuckDB JOIN → Parquet
 

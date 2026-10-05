@@ -17,10 +17,15 @@ use strict;
 use File::Basename;
 use FindBin;
 use lib $FindBin::Bin;
+# The extension table and the language->parser table both come from here, and so
+# does tokenizeByBlobId/tokenBySha.pl's. They used to be separate literals that
+# disagreed; see CregitLanguages.pm.
 use CregitLanguages;
 
 my %declarations;
 my %listDeclarations;
+
+my %extensions = CregitLanguages::extensions_by_dot();
 
 my $basedir = dirname($0);
 $basedir = "." if ($basedir eq "");
@@ -75,7 +80,7 @@ if ($language eq "") {
     # autodetect
     Usage("File has no extension. You must provide one [$filename]") unless $filename =~ /(\.[a-z0-9\+]+)$/i;
     my $ext = lc($1);
-    $language = CregitLanguages::language_for_ext( substr($1, 1) );
+    $language = $extensions{$ext};
     Usage("Unknown extension [$ext] in file [$filename]. You must provide language using --language option") unless defined $language and $language ne "";
     Usage("Unknown parser for extension [$ext] in file [$filename]. You must provide language using --language option") unless defined($parsers{$language});
 } else {
@@ -147,6 +152,11 @@ sub Tokenize {
     my $status = execute_command(@command);
     return if $status == 0;
 
+    # Propagate the parser's own exit status instead of die-ing, which would
+    # collapse every failure onto 255. tokenizeSrcMl.pl signals "srcML died / the
+    # tokenization is unusable" with a specific status, and blobExec counts that
+    # status separately from an ordinary error -- so flattening it here would put
+    # the crash back into the untraceable bucket it came from.
     if ($status == -1) {
         die "Unable to execute command @command: $!";
     }

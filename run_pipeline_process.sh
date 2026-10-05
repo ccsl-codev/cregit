@@ -12,6 +12,8 @@ artifacts (jars, tokenizers) are built automatically first — run inside
 
 Build:
   --build-only      build all pipeline artifacts and exit, running nothing
+  --ensure-artifacts
+                    build missing artifacts and a stale Rust tokenizer, then exit
 
 Target repository:
   --repo-url URL    git URL (or local path) of the repository to process (REQUIRED)
@@ -20,9 +22,13 @@ Target repository:
   --commit-url URL  base URL for the commit links in the generated HTML
                     (default: derived from --repo-url as <url minus .git>/commit/,
                     which is correct for GitHub/GitLab-style hosts)
-  --mask REGEX      regex selecting the files to tokenize; quote it
-                    (default: `perl tokenize/fileMask.pl`, every extension
-                    cregit can parse). A different mask forces a full rebuild.
+  --mask REGEX      regex selecting the files to tokenize; quote it (default:
+                    `perl tokenize/fileMask.pl`, every extension cregit parses).
+                    A different mask forces a full rebuild, unless --mask-widened.
+  --mask-widened    resume across a wider mask, keeping blob_map's tokenizations.
+                    Needs FROM_STEP>=2, not with --mode sharded.
+  --retokenize EXTS redo the cached tokens of these extensions (e.g. rs or c,h)
+                    after their tokenizer changed. Needs FROM_STEP=2, not sharded.
   --work DIR        working/output directory (default: ../cregit-files).
                     NOTE: a full run (FROM_STEP=1) starts by deleting this
                     directory; use one directory per target repository.
@@ -46,12 +52,8 @@ Target repository:
                     A step-1 wipe that would delete a memo holding 10,000 entries
                     or more (MEMO_KEEP_THRESHOLD, overridable as
                     CREGIT_MEMO_KEEP_THRESHOLD) is refused; see --force-clean.
-  --blob-timeout N  wall-clock budget in seconds for one blob's tokenizer
-                    (blobExec default: 600). A child that exceeds it is killed,
-                    that blob is left untokenized, step 2 stops with exit 4 and
-                    a step-2 resume retries exactly those blobs. Also settable
-                    as CREGIT_BLOB_TIMEOUT in the environment, which is how to
-                    reach it through ctp.py.
+  --blob-timeout N  seconds before one blob's tokenizer is killed and the blob
+                    excluded (blobExec default: 600; env CREGIT_BLOB_TIMEOUT).
   --stall-timeout N watchdog window in seconds (blobExec default: 1800). If no
                     blob, tree, commit or blob copy completes anywhere in this
                     window the run is killed with exit 5. Must be larger than
@@ -72,6 +74,7 @@ Output:
                     should skip them. NOTE: the HTML views are the fallback
                     output when python3+duckdb is missing, so --skip-html
                     without duckdb leaves the run with no final artifact.
+  --reblame         re-blame every file in step 7, overwriting its .blame output
   --gc MODE         how to pack the generated cregit repo after tokenizing
                     (default: plain)
                       none        do not pack at all. Fastest, but every later
@@ -111,6 +114,9 @@ Tokenizer:
                                   for repos too large to tokenize in one process;
                                   delegates to blobExec/shard_build.sh
   --shards N    shard count for --mode sharded (default: 4)
+  --tokenizer-worker
+                tokenize through a pool of persistent tokenizer processes; same
+                output. Needs --mode pipeline or pipeline-trees (default: off)
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck. Each file is independent, so the output does not
@@ -189,6 +195,8 @@ DEFAULT_JOBS=4
 JOBS=${CREGIT_JOBS:-$DEFAULT_JOBS}
 FROM_STEP=1
 BUILD_ONLY=0
+# Unlike --build-only, runs exactly the guard a normal run runs (and tests it).
+ENSURE_ARTIFACTS_ONLY=0
 REPO_GIT_URL=""
 REPO_NAME=""
 REPO_COMMIT_URL=""
@@ -197,6 +205,7 @@ WORK="../cregit-files"
 # Empty means "<work>/memo"; resolved after parsing because it depends on --work.
 MEMO_DIR=""
 SKIP_HTML=0
+REBLAME=0
 GC_MODE="plain"
 MEMORY_LIMIT=""
 DUCKDB_THREADS=""
@@ -206,10 +215,13 @@ DUCKDB_THREADS=""
 PROJECT_META=""
 PROJECT_KEY=""
 FORCE_CLEAN=0
+MASK_WIDENED=0
+RETOKENIZE=""
 # Empty means "do not pass the flag". The CREGIT_* fallbacks are how ctp.py,
 # which has no passthrough of its own, reaches these values.
 BLOB_TIMEOUT="${CREGIT_BLOB_TIMEOUT:-}"
 STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
+TOKENIZER_WORKER=0
 
 KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED TOKENIZE-PARSER-CRASHES"
 
@@ -339,6 +351,8 @@ tokenize_gate() {
             marker="TOKENIZE-PARSER-CRASHES"
             summary="$stage hit a parser crash: deterministic, so --blob-timeout will not help.
      Fix srcML, or denylist the diagnosed blob." ;;
+        7) die "$stage refused --retokenize, which would have invalidated nothing (exit 7).
+     Check the extension spelling and that --memo-dir is this project's memo ($MEMO_DIR)." ;;
         *) die "$stage failed (exit $status)" ;;
     esac
 
@@ -356,6 +370,7 @@ need_val() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-only) BUILD_ONLY=1; shift ;;
+        --ensure-artifacts) ENSURE_ARTIFACTS_ONLY=1; shift ;;
         --repo-url)   need_val "$@"; REPO_GIT_URL="$2"; shift 2 ;;
         --repo-name)  need_val "$@"; REPO_NAME="$2"; shift 2 ;;
         --commit-url) need_val "$@"; REPO_COMMIT_URL="$2"; shift 2 ;;
@@ -363,8 +378,12 @@ while [ $# -gt 0 ]; do
         --work)       need_val "$@"; WORK="$2"; shift 2 ;;
         --memo-dir)   need_val "$@"; MEMO_DIR="$2"; shift 2 ;;
         --skip-html)  SKIP_HTML=1; shift ;;
+        --reblame)    REBLAME=1; shift ;;
         --force-clean) FORCE_CLEAN=1; shift ;;
+        --mask-widened) MASK_WIDENED=1; shift ;;
+        --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
+        --tokenizer-worker) TOKENIZER_WORKER=1; shift ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
@@ -391,6 +410,52 @@ if [ -z "$MASK" ]; then
         exit 2
     }
     [ -n "$MASK" ] || { echo "${SELF_DIR}/tokenize/fileMask.pl printed nothing" >&2; exit 2; }
+fi
+
+if [ "$MASK_WIDENED" = 1 ] && [ "$FROM_STEP" = "1" ]; then
+    echo "--mask-widened needs FROM_STEP>=2: step 1 deletes $WORK and the blob map it reuses.
+     Resume with: $0 [same flags] --mask-widened 2  (ctp.py: --mask-widened --from-step 2)" >&2
+    exit 2
+fi
+
+if [ "$MASK_WIDENED" = 1 ] && [ "$MODE" = "sharded" ]; then
+    echo "--mask-widened is not available with --mode sharded: shards keep no mask to widen.
+     Reuse a prior run's tokenizations with shard_build.sh --warm-db instead." >&2
+    exit 2
+fi
+
+if [ -n "$RETOKENIZE" ] && [ "$FROM_STEP" != "2" ]; then
+    echo "--retokenize needs FROM_STEP=2 exactly (got $FROM_STEP): step 1 deletes the cache, 3+ skip it.
+     Resume with: $0 [same flags] --retokenize $RETOKENIZE 2  (ctp.py: --from-step 2)" >&2
+    exit 2
+fi
+
+if [ "$REBLAME" = 1 ] && [ "$FROM_STEP" -gt 7 ]; then
+    echo "--reblame needs FROM_STEP<=7 (got $FROM_STEP): later steps skip the re-blame.
+     Resume with: $0 [same flags] --reblame 7  (ctp.py: --reblame --from-step 7)" >&2
+    exit 2
+fi
+
+if [ -n "$RETOKENIZE" ] && [ "$MODE" = "sharded" ]; then
+    echo "--retokenize is not available with --mode sharded: shards keep no cached tokens." >&2
+    exit 2
+fi
+
+if [ -n "$RETOKENIZE" ] && [ "$MASK_WIDENED" = 1 ]; then
+    echo "--mask-widened and --retokenize cannot be used in the same run.
+     Widen first, then resume again with --retokenize." >&2
+    exit 2
+fi
+
+if [ -n "$RETOKENIZE" ]; then
+    for _ext in ${RETOKENIZE//,/ }; do
+        case "$_ext" in
+            ''|*[!a-z0-9+]*)
+                echo "invalid --retokenize: '$_ext'. Want lowercase extensions without a dot,
+     as in tokenize/CregitLanguages.pm: --retokenize rs or --retokenize c,h" >&2
+                exit 2 ;;
+        esac
+    done
 fi
 
 # Validate early: pack_cregit_repo runs only once tokenizing has finished.
@@ -486,6 +551,9 @@ case "$MODE" in
     serial|pipeline|pipeline-trees|sharded) ;;
     *) echo "invalid --mode: $MODE (serial|pipeline|pipeline-trees|sharded)" >&2; exit 2 ;;
 esac
+if [ "$TOKENIZER_WORKER" = 1 ] && [ "$MODE" != pipeline ] && [ "$MODE" != pipeline-trees ]; then
+    echo "--tokenizer-worker needs --mode pipeline or pipeline-trees" >&2; exit 2
+fi
 if [ "$MODE" = "sharded" ]; then
     [ "$SHARDS" -ge 1 ] 2>/dev/null || { echo "--shards must be a positive integer" >&2; exit 2; }
 fi
@@ -561,30 +629,45 @@ build_all() {
     log "build complete"
 }
 
-# needs_build <artifact> <source path>...: true when the artifact is missing, or
-# when any source is newer than it. Staleness has to count, not just absence: a
-# jar left behind by another branch's checkout is reused otherwise, and the
-# pipeline then runs that branch's code without saying so.
+RUST_TOKENIZER_SOURCES=(
+    "$CREGIT/tokenize/rustTokenizer/Makefile"
+    "$CREGIT/tokenize/rustTokenizer/Cargo.toml"
+    "$CREGIT/tokenize/rustTokenizer/Cargo.lock"
+    "$CREGIT/tokenize/rustTokenizer/src"
+)
+
+NEEDS_BUILD_REASON=""
 needs_build() {
-    artifact=$1
-    shift
-    [ -e "$artifact" ] || return 0
-    [ -n "$(find "$@" -type f -newer "$artifact" -print -quit 2>/dev/null)" ]
+    local artifact=$1; shift
+    NEEDS_BUILD_REASON=""
+    [ $# -gt 0 ] || die "needs_build: no sources declared for $artifact (a source list is missing)"
+    local p
+    # A missing source path would silently stop guarding the artifact.
+    for p in "$@"; do
+        [ -e "$p" ] || die "declared source path does not exist: $p (it guards $artifact).
+     The checkout is incomplete or the source list in this script is wrong."
+    done
+    if [ ! -e "$artifact" ]; then
+        NEEDS_BUILD_REASON="missing"
+        return 0
+    fi
+    local newer
+    newer=$(find "$@" -newer "$artifact" -print -quit 2>/dev/null) || true
+    [ -n "$newer" ] || return 1
+    NEEDS_BUILD_REASON="$newer"
+    return 0
 }
 
-# Build only what is missing or out of date, so an up-to-date checkout starts
-# instantly. Each list names sources only, never a target/ directory: build
-# output is newer than the artifact by definition and would always look stale.
 ensure_artifacts() {
-    S="$CREGIT/tokenize/srcMLtoken"
-    R="$CREGIT/tokenize/rustTokenizer"
-    needs_build "$SRCML2TOKEN"      "$S"/*.cpp "$S"/*.hpp "$S/Makefile"          && build_srcml2token
-    needs_build "$RUST_TOKENIZER"   "$R/src" "$R/Cargo.toml" "$R/Cargo.lock"     && build_rust_tokenizer
-    needs_build "$BFG"              "$CREGIT/blobExec/src" "$CREGIT/blobExec/build.sbt" "$CREGIT/blobExec/project" && build_blobexec
-    needs_build "$SLICKGITLOG_JAR"  "$CREGIT/slickGitLog/src" "$CREGIT/slickGitLog/build.sbt"   && build_legacy_jar slickGitLog
-    needs_build "$PERSONS_JAR"      "$CREGIT/persons/src" "$CREGIT/persons/build.sbt"           && build_legacy_jar persons
-    needs_build "$REMAPCOMMITS_JAR" "$CREGIT/remapCommits/src" "$CREGIT/remapCommits/build.sbt" && build_legacy_jar remapCommits
-    return 0   # a false needs_build above must not fail the function under `set -e`
+    [ -x "$SRCML2TOKEN" ]      || build_srcml2token
+    if needs_build "$RUST_TOKENIZER" "${RUST_TOKENIZER_SOURCES[@]}"; then
+        log "artifact out of date ($NEEDS_BUILD_REASON): $RUST_TOKENIZER"
+        build_rust_tokenizer
+    fi
+    [ -f "$BFG" ]              || build_blobexec
+    [ -f "$SLICKGITLOG_JAR" ]  || build_legacy_jar slickGitLog
+    [ -f "$PERSONS_JAR" ]      || build_legacy_jar persons
+    [ -f "$REMAPCOMMITS_JAR" ] || build_legacy_jar remapCommits
 }
 
 if [ "$BUILD_ONLY" = 1 ]; then
@@ -592,9 +675,13 @@ if [ "$BUILD_ONLY" = 1 ]; then
     exit 0
 fi
 
-# Auto-build any missing artifact BEFORE the work directory is touched, so a
-# build failure never disturbs the outputs of a previous run.
+# Before the work directory is touched, so a failed build keeps earlier outputs.
 ensure_artifacts
+
+if [ "$ENSURE_ARTIFACTS_ONLY" = 1 ]; then
+    log "artifacts up to date"
+    exit 0
+fi
 
 REPO_PATH_ORIGINAL="${WORK}/${REPO_NAME}-original"
 REPO_PATH_CREGIT="${WORK}/${REPO_NAME}-cregit"
@@ -695,6 +782,40 @@ echo "  Log: $LOG_FILE"
 echo "████████████████████████████████████████████████████████████████████████"
 echo ""
 
+# A re-fold gives every cregit commit a new sha: step 6 cannot clone over its old
+# dir and step 7 would keep blame of the old shas. Keeps the bare repos, blob map
+# and memo. Named paths only, never a glob or $WORK itself.
+drop_refold_derived_artifacts() {  # $1 = which flag is asking, for the log
+    log "$1: dropping what derives from the tokenized repo (the re-fold changes every sha)."
+    log "  KEEPING: $REPO_PATH_ORIGINAL_BARE, $REPO_PATH_CREGIT_BARE, $DB_PATH_BLOBMAP, $MEMO_DIR"
+    local _stale
+    for _stale in \
+        "$WORK/blame" \
+        "$WORK/html" \
+        "$REPO_PATH_ORIGINAL" \
+        "$REPO_PATH_CREGIT" \
+        "$DB_PATH_ORIGINAL" \
+        "$DB_PATH_CREGIT" \
+        "$DB_PATH_PERSONS" \
+        "$XLS_PATH_PERSONS" \
+        "$DATASET_PATH" \
+        "${WORK}/${REPO_NAME}.validated"
+    do
+        if [ -e "$_stale" ]; then
+            log "  dropping $_stale"
+            rm -rf -- "$_stale"
+        fi
+    done
+    mkdir -p "$WORK/blame"
+    [ "$SKIP_HTML" = 1 ] || mkdir -p "$WORK/html"
+}
+
+if [ "$MASK_WIDENED" = 1 ]; then
+    drop_refold_derived_artifacts "--mask-widened"
+fi
+
+# --retokenize drops them at the end of step 2 instead.
+
 # ---------------------------------------------------------------------------
 # Step 1 — clone bare original repo
 # ---------------------------------------------------------------------------
@@ -716,13 +837,20 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 
 export BFG_MEMO_DIR="$MEMO_DIR"
 
-# Route through the tokenize.pl dispatcher (not tokenizeSrcMl.pl directly) so it can
-# fan out by language: srcML for .c/.h, rustTokenizer for .rs, etc. The --srcml* /
-# --ctags paths are forwarded only to the srcML parser. Behavior-preserving for C.
+# tokenize.pl dispatches by language; --srcml2token/--ctags reach only srcML.
 export BFG_TOKENIZE_CMD="${CREGIT}/tokenize/tokenize.pl \
   --srcml2token=${SRCML2TOKEN} \
-  --srcml=$(which srcml) \
   --ctags=$(which ctags)"
+
+# Fatal when empty: an empty identity turns blobExec's cache check off.
+TOKENIZER_IDENTITY=$(perl "${CREGIT}/tokenize/tokenizerIdentity.pl" \
+    --srcml2token="${SRCML2TOKEN}" \
+    --ctags="$(which ctags)") \
+  || die "cannot compute the tokenizer identity (tokenize/tokenizerIdentity.pl).
+     Build the artifacts first: $0 --ensure-artifacts"
+[ -n "$TOKENIZER_IDENTITY" ] \
+  || die "tokenize/tokenizerIdentity.pl printed nothing; refusing to run with no tokenizer identity"
+log "tokenizer identity: $TOKENIZER_IDENTITY"
 
 TOKENIZE_RC=0
 if [ "$MODE" = "sharded" ]; then
@@ -739,11 +867,24 @@ if [ "$MODE" = "sharded" ]; then
     ${BLOB_TIMEOUT:+--blob-timeout "$BLOB_TIMEOUT"} \
     ${STALL_TIMEOUT:+--stall-timeout "$STALL_TIMEOUT"} || TOKENIZE_RC=$?
   tokenize_gate "$TOKENIZE_RC" "sharded tokenize (shard_build.sh)"
+  log "note: --mode sharded records no tokenizer identity in the merged blob map,"
+  log "      so a later resume cannot detect a tokenizer change against it."
 else
   MODE_FLAG=""
   [ "$MODE" = "pipeline" ]       && MODE_FLAG="--pipeline"
   [ "$MODE" = "pipeline-trees" ] && MODE_FLAG="--pipeline-trees"
-  java -jar "$BFG" $MODE_FLAG \
+  WIDENED_FLAG=""
+  [ "$MASK_WIDENED" = 1 ] && WIDENED_FLAG="--mask-widened"
+  WORKER_FLAG=""
+  [ "$TOKENIZER_WORKER" = 1 ] && WORKER_FLAG="--tokenizer-worker=${CREGIT}/tokenizeByBlobId/tokenWorker.pl"
+  # blobExec refuses --retokenize without --memo-dir: the memo caches the same tokens.
+  RETOKENIZE_FLAGS=()
+  if [ -n "$RETOKENIZE" ]; then
+      RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
+  fi
+  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} \
+    "--tokenizer-identity=$TOKENIZER_IDENTITY" \
+    ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
     ${STALL_TIMEOUT:+--stall-timeout=$STALL_TIMEOUT} \
     "$REPO_PATH_ORIGINAL_BARE" \
@@ -764,6 +905,11 @@ for _m in $KEEP_MARKERS; do
         rm -f "${WORK}/${_m}"
     fi
 done
+
+# Only after blobExec accepted it: a refused one (exit 7) must not cost the blame.
+if [ -n "$RETOKENIZE" ]; then
+    drop_refold_derived_artifacts "--retokenize $RETOKENIZE"
+fi
 
 pack_cregit_repo
 fi
@@ -821,9 +967,14 @@ end_step
 step "blame"
 if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 [ -d "$REPO_PATH_CREGIT" ] || die "step 6 did not produce $REPO_PATH_CREGIT"
+# Without --overwrite, a re-blame skips every file that has .blame output.
+REBLAME_OPTS=()
+[ "$REBLAME" = 1 ] && REBLAME_OPTS+=(--overwrite)
+[ "$REBLAME" = 1 ] && log "--reblame: replacing every .blame file, not resuming"
 perl $CREGIT/blameRepo/blameRepoFiles.pl \
   --jobs="$JOBS" \
   --formatBlame=$CREGIT/blameRepo/formatBlame.pl \
+  ${REBLAME_OPTS[@]+"${REBLAME_OPTS[@]}"} \
   $REPO_PATH_CREGIT $WORK/blame "$MASK"
 fi
 end_step

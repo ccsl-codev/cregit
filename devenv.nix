@@ -47,7 +47,6 @@ in
     pkgs.gcc
     pkgs.sqlite
     pkgs.git-filter-repo
-    pkgs.shellcheck
 
     srcml
     pkgs.universal-ctags
@@ -66,14 +65,15 @@ in
   languages.rust.enable = true;
 
   env.LEGACY_JAVA_HOME = "${legacyJdk}";
+  env.SRCML_PREFIX = "${srcml}";
 
   cachix.pull = [ "ccslcodevcregit" ];
 
-  # `devenv test` gates every tracked shell script. The threshold is `error`
-  # because the two scripts already carry 31 lower findings; raise it to
-  # `warning` once those are fixed.
+  # `devenv test` gates every tracked shell script at `error`. shellcheck is not
+  # in `packages`: that would change the shell env in srcml2token's RUNPATH, and
+  # so the tokenizer identity of every C, C++, Java and Rust blob.
   enterTest = ''
-    git ls-files -z '*.sh' | xargs -0 --no-run-if-empty shellcheck -S error
+    git ls-files -z '*.sh' | xargs -0 --no-run-if-empty ${pkgs.shellcheck}/bin/shellcheck -S error
     echo "shellcheck: no errors"
     pytest -q
     prove -r $(git ls-files '*/t/*.t' | xargs -n1 dirname | sort -u)

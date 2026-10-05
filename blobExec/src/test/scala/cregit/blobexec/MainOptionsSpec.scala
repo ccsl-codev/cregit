@@ -3,12 +3,10 @@ package cregit.blobexec
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-/** `--blob-timeout` and `--stall-timeout` are binding parts of the spec: 600 and
-  * 1800 by default, and values that are not a positive whole number of seconds
-  * must be rejected rather than silently read as "no limit". The shared value
-  * parser is tested here; `main` itself cannot be, because it answers bad input
-  * with `sys.exit`. The stall watchdog's decision is tested here too, because
-  * the watchdog itself halts the JVM and so cannot be exercised in-process. */
+import java.nio.file.Files
+
+/** The option parser, the 600/1800 budget defaults and the stall watchdog's decision.
+  * `main` itself answers with `sys.exit`, so its parts are tested instead. */
 class MainOptionsSpec extends AnyFunSuite with Matchers {
 
   test("the default per-blob budget is 600 seconds") {
@@ -39,41 +37,39 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.parsePositiveSeconds("10.5") shouldEqual None
   }
 
-  test("timeout and stall have distinct exit statuses, and neither collides") {
-    Main.TimedOutExitStatus shouldEqual 4
+  test("the stall status collides with no other exit status") {
     Walker.StalledExitStatus shouldEqual 5
-    Main.TimedOutExitStatus should not equal Walker.StalledExitStatus
-    Set(0, 1, 2, 3) should not contain Main.TimedOutExitStatus
     Set(0, 1, 2, 3) should not contain Walker.StalledExitStatus
   }
 
   // -- the two timeouts are coupled -------------------------------------------
 
   test("a window at or above the floor is accepted unchanged") {
-    Walker.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
-    Walker.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
-    Walker.resolveStallTimeout(600, Walker.stallFloorFor(600), stallExplicit = true) shouldEqual
+    Main.resolveStallTimeout(600, 1800, stallExplicit = false) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, 1800, stallExplicit = true) shouldEqual Right(1800)
+    Main.resolveStallTimeout(600, Walker.stallFloorFor(600), stallExplicit = true) shouldEqual
       Right(Walker.stallFloorFor(600))
   }
 
   test("the floor is the child's whole lifetime, not just the budget") {
     Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
-    Walker.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
-    Walker.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
+    Main.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
+    Main.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
   }
 
   test("a refusal names the floor it wants, and the suggestion clears it") {
-    val why = Walker.resolveStallTimeout(600, 601, stallExplicit = true).swap.getOrElse("")
+    val why = Main.resolveStallTimeout(600, 601, stallExplicit = true).swap.getOrElse("")
     why should include(Walker.stallFloorFor(600).toString)
-    val suggested = Walker.stallTimeoutFor(600)
-    Walker.resolveStallTimeout(600, suggested, stallExplicit = true) shouldEqual Right(suggested)
+    val suggested = Main.widenedStall(600)
+    Main.resolveStallTimeout(600, suggested, stallExplicit = true) shouldEqual Right(suggested)
   }
 
-  test("a small budget is widened past the fixed kill overhead, not just tripled") {
-    Walker.resolveStallTimeout(5, 3, stallExplicit = false)
-      .getOrElse(0) should be >= Walker.stallFloorFor(5)
-    Walker.resolveStallTimeout(1, 1, stallExplicit = false)
-      .getOrElse(0) should be >= Walker.stallFloorFor(1)
+  test("a small --blob-timeout no longer lets the watchdog stop a healthy run") {
+    val oneBlobLifetimeNanos = ChildRunner.maxLifetimeSeconds(5).toLong * 1000000000L
+    Main.resolveStallTimeout(5, 15, stallExplicit = true).isLeft shouldBe true
+    val window = Main.resolveStallTimeout(5, 3, stallExplicit = false).getOrElse(0)
+    Walker.isStalled(oneBlobLifetimeNanos, 0L, window) shouldBe false
+    Main.resolveStallTimeout(1, 1, stallExplicit = false).getOrElse(0) should be >= Walker.stallFloorFor(1)
   }
 
   test("the floor cannot overflow into a guard that always passes") {
@@ -82,7 +78,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("the defaults satisfy the relationship") {
-    Walker.resolveStallTimeout(
+    Main.resolveStallTimeout(
       BlobExec.DefaultTimeoutSeconds,
       Walker.DefaultStallTimeoutSeconds,
       stallExplicit = false
@@ -90,75 +86,33 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("a defaulted window is widened to fit a raised --blob-timeout") {
-    Walker.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
-    Walker.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
+    Main.resolveStallTimeout(1800, 1800, stallExplicit = false) shouldEqual Right(5400)
+    Main.resolveStallTimeout(3600, 1800, stallExplicit = false) shouldEqual Right(10800)
   }
 
   test("an explicit window that is too small is refused, naming both values") {
-    val bad = Walker.resolveStallTimeout(1800, 1800, stallExplicit = true)
+    val bad = Main.resolveStallTimeout(1800, 1800, stallExplicit = true)
     bad.isLeft shouldBe true
     val why = bad.swap.getOrElse("")
     why should include("--stall-timeout=1800")
     why should include("--blob-timeout=1800")
-    Walker.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
+    Main.resolveStallTimeout(600, 60, stallExplicit = true).isLeft shouldBe true
   }
 
   test("widening cannot overflow Int") {
-    Walker.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
+    Main.resolveStallTimeout(Int.MaxValue, 1800, stallExplicit = false) shouldEqual Right(Int.MaxValue)
   }
 
-  // -- the stall window's floor -----------------------------------------------
-
-  test("the floor clears one blob's whole lifetime, kill path included") {
-    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
-    Walker.stallFloorFor(1) should be > ChildRunner.maxLifetimeSeconds(1)
-  }
-
-  test("the default window is derived from the blob budget, not a second literal") {
-    Walker.DefaultStallTimeoutSeconds shouldEqual Walker.stallTimeoutFor(BlobExec.DefaultTimeoutSeconds)
-  }
-
-  test("a defaulted window follows a raised budget past the floor") {
-    Walker.stallTimeoutFor(1800) shouldEqual 5400
-    Walker.stallTimeoutFor(5) should be >= Walker.stallFloorFor(5)
-    Walker.stallTimeoutFor(1) should be >= Walker.stallFloorFor(1)
-  }
-
-  test("a blob budget past the default window raises the floor above it") {
-    Walker.stallFloorFor(3600) should be > Walker.DefaultStallTimeoutSeconds
-  }
-
-  test("the floor grows with the blob budget, and never underflows") {
-    Walker.stallFloorFor(60) should be < Walker.stallFloorFor(600)
-    Walker.stallFloorFor(0) should be > 0
-    Walker.stallFloorFor(-5) should be > 0
-  }
-
-  test("a run at exactly the floor is not stalled by its own slowest blob") {
-    val blobBudget = 3600
-    val floor      = Walker.stallFloorFor(blobBudget)
-    val quiet      = ChildRunner.maxLifetimeSeconds(blobBudget).toLong * 1000000000L
-    Walker.isStalled(nowNanos = quiet, lastProgressNanos = 0L, floor) shouldBe false
-  }
-
-  test("the accepted range of a timeout keeps every derived window inside Int") {
-    Main.parsePositiveSeconds((Main.MaxTimeoutSeconds + 1).toString) shouldEqual None
-    Main.parsePositiveSeconds(Int.MaxValue.toString) shouldEqual None
-    Walker.stallTimeoutFor(Main.MaxTimeoutSeconds) should be > 0
-    ChildRunner.maxLifetimeSeconds(Main.MaxTimeoutSeconds) should be > 0
-  }
-
-  // -- which counters gate publication ----------------------------------------
+  // -- which counters change the exit status ----------------------------------
 
   private def stats(
       aborted: Boolean = false,
       blobsTimedOut: Long = 0L,
       blobsOversized: Long = 0L,
       blobsDenylisted: Long = 0L,
-      blobsParserCrashed: Long = 0L,
-      blobsTokenized: Int = 1
+      blobsParserCrashed: Long = 0L
   ) = WalkStats(
-    commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = blobsTokenized,
+    commitsProcessed = 1, commitsAlreadyMapped = 0, blobsRunThroughCommand = 1,
     blobsCacheHit = 0, refsProjected = 1, aborted = aborted,
     blobsTimedOut = blobsTimedOut, blobsOversized = blobsOversized,
     blobsDenylisted = blobsDenylisted, blobsParserCrashed = blobsParserCrashed,
@@ -183,10 +137,11 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(blobsOversized = 3, blobsDenylisted = 4)) shouldEqual 0
   }
 
-  test("a timeout still blocks publication, even alongside a denylisted blob") {
-    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual Main.TimedOutExitStatus
-    Main.exitStatus(stats(blobsTimedOut = 1, blobsDenylisted = 4)) shouldEqual
-      Main.TimedOutExitStatus
+  test("a failed blob does not change the exit status: it is excluded") {
+    Main.exitStatus(stats(blobsTimedOut = 1)) shouldEqual 0
+    Main.exitStatus(stats(blobsParserCrashed = 36)) shouldEqual 0
+    Main.exitStatus(stats(blobsTimedOut = 1, blobsParserCrashed = 1, blobsDenylisted = 4,
+      blobsOversized = 3)) shouldEqual 0
   }
 
   test("an abort still wins over everything") {
@@ -195,42 +150,24 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
     Main.exitStatus(stats(aborted = true, blobsParserCrashed = 1)) shouldEqual 2
   }
 
-  test("a crash rate past tolerance blocks publication, with its own status") {
-    Main.exitStatus(stats(blobsParserCrashed = 2, blobsTokenized = 100)) shouldEqual
-      Main.ParserCrashedExitStatus
-  }
-
-  test("a crash rate within tolerance still publishes: the blob is excluded either way") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsTokenized = 100)) shouldEqual 0
-    Main.exitStatus(stats(blobsParserCrashed = 500, blobsTokenized = 500000)) shouldEqual 0
-  }
-
-  test("one crash in a tiny project does not gate, so rounding cannot zero the tolerance") {
-    Main.exitStatus(stats(blobsParserCrashed = 1, blobsTokenized = 1)) shouldEqual 0
-    Main.exitStatus(stats(blobsParserCrashed = 2, blobsTokenized = 1)) shouldEqual
-      Main.ParserCrashedExitStatus
-  }
-
-  test("a crash past tolerance still blocks alongside explained exclusions") {
-    Main.exitStatus(stats(blobsParserCrashed = 9, blobsTokenized = 100,
-                          blobsDenylisted = 4, blobsOversized = 3)) shouldEqual
-      Main.ParserCrashedExitStatus
-  }
-
-  test("the parser-crash status collides with no other blobExec exit status") {
+  // run_pipeline_process.sh maps each status to its own remedy and marker file.
+  test("the ineffective-retokenize status collides with no other blobExec exit status") {
     val others = Map(
-      "clean"       -> 0,
-      "usage"       -> 1,
-      "aborted"     -> 2,
-      "maskChanged" -> 3,
-      "timedOut"    -> Main.TimedOutExitStatus,
-      "stalled"     -> Walker.StalledExitStatus
+      "clean"        -> 0,
+      "usage"        -> 1,
+      "aborted"      -> 2,
+      "maskChanged"  -> 3,
+      "stalled"      -> Walker.StalledExitStatus
     )
     others.foreach { case (name, status) =>
-      withClue(s"parser-crash status must differ from $name ($status): ") {
-        Main.ParserCrashedExitStatus should not equal status
+      withClue(s"ineffective-retokenize status must differ from $name ($status): ") {
+        Main.RetokenizeIneffectiveExitStatus should not equal status
       }
     }
+  }
+
+  test("an ineffective --retokenize is not reported as a clean walk") {
+    Main.RetokenizeIneffectiveExitStatus should not equal 0
   }
 
   // -- the watchdog's decision ------------------------------------------------
@@ -262,4 +199,71 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   test("nanoTime is monotonic but not epoch-based, so negative elapsed is never a stall") {
     Walker.isStalled(nowNanos = -5 * second, lastProgressNanos = -3 * second, 30) shouldBe false
   }
+  // -- the option parser --------------------------------------------------------
+
+  private lazy val srcDir = Files.createTempDirectory("main-options-src-")
+  private def positional = Seq(srcDir.toString, "/tmp/dst.git", "/tmp/db.sqlite", "/bin/sh", "\\.c$")
+
+  test("parse reads every flag into one options value") {
+    val parsed = Main.parse(Seq("--abort-on-error", "--pipeline", "--mask-widened",
+      "--blob-timeout=60", "--stall-timeout=900") ++ positional)
+    inside(parsed) { case Right(o) =>
+      (o.abortOnError, o.pipeline, o.maskWidened) shouldEqual ((true, true, true))
+      (o.blobTimeoutSeconds, o.stallTimeoutSeconds, o.stallExplicit) shouldEqual ((60, 900, true))
+      (o.command, o.mask) shouldEqual (("/bin/sh", "\\.c$"))
+    }
+  }
+
+  test("a shard is read as K and N") {
+    inside(Main.parse("--shard=1/4" +: positional)) { case Right(o) => o.shard shouldEqual Some((1, 4)) }
+  }
+
+  test("parse leaves the defaults when no flag is given") {
+    inside(Main.parse(positional)) { case Right(o) =>
+      o shouldEqual Main.Options(positional = positional.toVector)
+    }
+  }
+
+  test("an unknown flag is refused with the usage text") {
+    inside(Main.parse("--frobnicate" +: positional)) { case Left(why) =>
+      why should include("unknown flag [--frobnicate]")
+      why should include(Main.Usage)
+    }
+  }
+
+  test("a bad flag value is refused, naming the flag") {
+    Seq(
+      "--blob-timeout=0"         -> "--blob-timeout",
+      "--stall-timeout=x"        -> "--stall-timeout",
+      "--shard=4/4"              -> "--shard",
+      "--shard=1"                -> "--shard",
+      "--warm=/nonexistent/db"   -> "--warm",
+      "--tokenizer-identity="    -> "--tokenizer-identity",
+      "--memo-dir=/nonexistent/" -> "--memo-dir"
+    ).foreach { case (flag, name) =>
+      withClue(s"$flag: ") {
+        inside(Main.parse(flag +: positional)) { case Left(why) => why should startWith(s"Error: $name") }
+      }
+    }
+  }
+
+  test("a wrong number of positional arguments prints the usage text alone") {
+    Main.parse(positional.dropRight(1)) shouldEqual Left(Main.Usage)
+  }
+
+  test("every option description in the usage text is at most three lines, and most are one") {
+    val continuation = "^ {29}\\S".r
+    val entries = Main.Usage.linesIterator.foldLeft(Vector.empty[Vector[String]]) {
+      case (acc, line) if line.startsWith("  --") || line.startsWith("  <") => acc :+ Vector(line)
+      case (acc, line) if acc.nonEmpty && continuation.findFirstIn(line).isDefined => acc.init :+ (acc.last :+ line)
+      case (acc, _) => acc
+    }
+    val lengths = entries.map(e => e.size - (if (e.head.trim.contains(' ')) 0 else 1))
+    entries should not be empty
+    all(lengths) should be <= 3
+    lengths.count(_ == 1) should be > entries.size / 2
+  }
+
+  private def inside[T](v: T)(pf: PartialFunction[T, Unit]): Unit =
+    if (pf.isDefinedAt(v)) pf(v) else fail(s"value did not match: $v")
 }

@@ -207,7 +207,7 @@ blameRepoFiles.pl: create the "blame" of files in a git repository
   blameRepoFiles.pl [options] <repository> <outputDirectory> <fileNameRegexp>
 
      Options:
-       --override         overwrite existing files
+       --overwrite        re-blame files whose .blame output already exists
        --help             brief help message
        --man              full documentation
        --jobs=N           maximum concurrent blame processes (default 1)
@@ -228,9 +228,9 @@ blameRepoFiles.pl: create the "blame" of files in a git repository
 
     Prints the manual page and exits.
 
-=item B<--override>
+=item B<--overwrite>
 
-    By default, if an output file exists it is skipped. This changes that behaviour.
+    Re-blame files whose output already exists (by default they are skipped).
 
 =back
 

@@ -203,11 +203,12 @@ OUT=$(STUB_RC=0 run_step2 "$W" --stall-timeout abc); RC=$?
 rm -rf "$W"
 
 echo "case 10: the runner exits with blobExec's own status, not a flat 1"
-for rc in 4 5; do
+for rc in 4 5 6; do
     W=$(fixture)
     STUB_RC=$rc run_step2 "$W" > /dev/null 2>&1
     GOT=$?
     [ "$GOT" -eq "$rc" ]; check "blobExec $rc makes the runner exit $rc (got $GOT)" $?
+    [ -n "$(ls "$W"/TOKENIZE-* 2>/dev/null)" ]; check "and the marker is still written" $?
     rm -rf "$W"
 done
 W=$(fixture)
