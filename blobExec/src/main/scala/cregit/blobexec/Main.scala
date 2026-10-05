@@ -70,7 +70,7 @@ object Main {
 
   private[blobexec] def widenedStall(blobTimeoutSeconds: Int): Int =
     math.max(
-      math.min(math.max(1, blobTimeoutSeconds).toLong * StallTimeoutMultiple, Int.MaxValue.toLong).toInt,
+      Saturating.product(math.max(1, blobTimeoutSeconds), StallTimeoutMultiple),
       Walker.stallFloorFor(blobTimeoutSeconds)
     )
 
@@ -181,7 +181,7 @@ object Main {
       |  --blob-timeout=<seconds>
       |                    wall-clock budget for one <command> invocation
       |                    (default ${BlobExec.DefaultTimeoutSeconds}). A child that exceeds it is
-      |                    killed (whole process group) and that blob is
+      |                    killed (whole process tree) and that blob is
       |                    excluded as failed (see below); the run continues.
       |  --stall-timeout=<seconds>
       |                    watchdog window (default ${Walker.DefaultStallTimeoutSeconds}); must clear one

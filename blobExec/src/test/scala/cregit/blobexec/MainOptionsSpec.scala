@@ -54,7 +54,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("the floor is the child's whole lifetime, not just the budget") {
-    Walker.stallFloorFor(600) should be > BlobExec.maxChildLifetimeSeconds(600)
+    Walker.stallFloorFor(600) should be > ChildRunner.maxLifetimeSeconds(600)
     Main.resolveStallTimeout(600, 601, stallExplicit = true).isLeft shouldBe true
     Main.resolveStallTimeout(600, 630, stallExplicit = true).isLeft shouldBe true
   }
@@ -67,7 +67,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
   }
 
   test("a small --blob-timeout no longer lets the watchdog stop a healthy run") {
-    val oneBlobLifetimeNanos = BlobExec.maxChildLifetimeSeconds(5).toLong * 1000000000L
+    val oneBlobLifetimeNanos = ChildRunner.maxLifetimeSeconds(5).toLong * 1000000000L
     Main.resolveStallTimeout(5, 15, stallExplicit = true).isLeft shouldBe true
     val window = Main.resolveStallTimeout(5, 3, stallExplicit = false).getOrElse(0)
     Walker.isStalled(oneBlobLifetimeNanos, 0L, window) shouldBe false
@@ -76,7 +76,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
 
   test("the floor cannot overflow into a guard that always passes") {
     Walker.stallFloorFor(Int.MaxValue) should be > 0
-    BlobExec.maxChildLifetimeSeconds(Int.MaxValue) should be > 0
+    ChildRunner.maxLifetimeSeconds(Int.MaxValue) should be > 0
   }
 
   test("the defaults satisfy the relationship") {

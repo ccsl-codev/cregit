@@ -59,9 +59,10 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   }
 
   private def stdout(pool: TokenizerWorkerPool, filename: String, body: String, timeoutSeconds: Int = 2) = {
-    val (exit, out, _) = pool.invoke(body.getBytes(UTF_8), filename, timeoutSeconds)
-    exit shouldEqual 0
-    new String(out, UTF_8)
+    pool.invoke(body.getBytes(UTF_8), filename, timeoutSeconds) match {
+      case ChildRunner.Outcome.Exited(0, out, _) => new String(out, UTF_8)
+      case other                                 => fail(s"expected exit 0, got $other")
+    }
   }
 
   test("returns the worker's output and sends each request's own budget") {
@@ -93,7 +94,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
   test("kills a wedged worker with its children, replaces it, and serves the next request") {
     withPool(1) { pool =>
       val started = System.nanoTime()
-      pool.invoke("x".getBytes(UTF_8), "hang.c", 1)._1 shouldEqual BlobExec.TimeoutExitCode
+      pool.invoke("x".getBytes(UTF_8), "hang.c", 1) shouldBe a[ChildRunner.Outcome.Killed]
       (System.nanoTime() - started).nanos should be < 15.seconds
       eventuallyStopped(Seq(Files.readString(grandchildPidFile).trim.toLong)) shouldBe true
       stdout(pool, "next.c", "next") shouldEqual "NEXT"
@@ -102,7 +103,9 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
 
   test("a worker that dies in a request fails that blob only") {
     withPool(1) { pool =>
-      pool.invoke("x".getBytes(UTF_8), "die.c", 2)._1 should not equal 0
+      pool.invoke("x".getBytes(UTF_8), "die.c", 2) should not matchPattern {
+        case ChildRunner.Outcome.Exited(0, _, _) =>
+      }
       stdout(pool, "ok.c", "ok") shouldEqual "OK"
     }
   }

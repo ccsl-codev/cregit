@@ -23,27 +23,19 @@ final class TokenizerWorkerPool(workerPath: String, size: Int) extends AutoClose
   try (0 until size).foreach(addWorker)
   catch { case failure: Throwable => close(); throw failure }
 
-  /** Same result as [[BlobExec.invoke]]: (exit, stdout, stderr), and
-    * [[BlobExec.TimeoutExitCode]] for a blob that ran out of time. */
-  def invoke(
-      bytes: Array[Byte],
-      filename: String,
-      timeoutSeconds: Int
-  ): (Int, Array[Byte], String) = {
-    val worker = idle.take()
-    val backstop = timeoutSeconds + BackstopSlackSeconds
-    within(backstop)(request(worker, bytes, filename, timeoutSeconds)) match {
+  def invoke(bytes: Array[Byte], filename: String, timeoutSeconds: Int): ChildRunner.Outcome = {
+    val worker   = idle.take()
+    val backstop = ChildRunner.maxLifetimeSeconds(timeoutSeconds)
+    within(backstop.toLong)(request(worker, bytes, filename, timeoutSeconds)) match {
       case None =>
-        System.err.println(
-          s"blobExec: tokenizer worker ${worker.index} gave no response within ${backstop}s; replacing it")
         replace(worker)
-        Timeout
+        ChildRunner.Outcome.Killed(s"tokenizer worker ${worker.index} gave no response within ${backstop}s; replaced it")
       case Some(Left(failure)) =>
         replace(worker)
-        (1, Array.emptyByteArray, s"tokenizer worker ${worker.index} failed: $failure\n")
+        ChildRunner.Outcome.Exited(1, Array.emptyByteArray, s"tokenizer worker ${worker.index} failed: $failure\n")
       case Some(Right(response)) =>
         if (worker.process.isAlive) idle.put(worker) else replace(worker)
-        if (response._1 == WorkerTimeoutExitCode) Timeout else response
+        response
     }
   }
 
@@ -85,7 +77,9 @@ final class TokenizerWorkerPool(workerPath: String, size: Int) extends AutoClose
     readLine(worker.stdout).split(' ') match {
       case Array("RES", exit, outLength, errLength) =>
         val out = readBytes(worker.stdout, outLength.toInt)
-        (exit.toInt, out, new String(readBytes(worker.stdout, errLength.toInt), UTF_8))
+        val err = new String(readBytes(worker.stdout, errLength.toInt), UTF_8)
+        if (exit.toInt == WorkerTimeoutExitCode) ChildRunner.Outcome.Killed(s"no exit within ${timeoutSeconds}s")
+        else ChildRunner.Outcome.Exited(exit.toInt, out, err)
       case header => throw new IOException(s"malformed response header [${header.mkString(" ")}]")
     }
   }
@@ -94,19 +88,11 @@ final class TokenizerWorkerPool(workerPath: String, size: Int) extends AutoClose
 object TokenizerWorkerPool {
   /** What a worker answers when it killed the tokenizer for running out of time. */
   val WorkerTimeoutExitCode = 124
-  private val Timeout = (BlobExec.TimeoutExitCode, Array.emptyByteArray, "")
-  /** The worker kills its own tokenizer at the budget. This only catches a wedged worker. */
-  private val BackstopSlackSeconds = 5L
   private val ReadySeconds = 30L
   private val CloseSeconds = 2L
   private val MaxHeaderBytes = 8192
 
-  /** Kill the children first: once the worker is gone they are no longer its descendants. */
-  private def kill(process: Process): Unit = {
-    process.descendants().forEach(child => { child.destroyForcibly(); () })
-    process.destroyForcibly()
-    ()
-  }
+  private def kill(process: Process): Unit = { ChildRunner.killTree(process); () }
 
   /** Runs `read` on a daemon thread, so that a worker which never answers cannot block the caller. */
   private def within[A](seconds: Long)(read: => A): Option[Either[Throwable, A]] = {

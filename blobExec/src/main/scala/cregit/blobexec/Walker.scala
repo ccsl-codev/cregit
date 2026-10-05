@@ -1459,7 +1459,7 @@ object Walker {
   /** Smallest stall window that cannot fire while one blob is still inside its own
     * lifetime: a commit whose last blob is slow completes nothing until it ends. */
   private[blobexec] def stallFloorFor(blobTimeoutSeconds: Int): Int =
-    math.min(BlobExec.maxChildLifetimeSeconds(blobTimeoutSeconds).toLong + StallFloorMarginSeconds, Int.MaxValue.toLong).toInt
+    Saturating.sum(ChildRunner.maxLifetimeSeconds(blobTimeoutSeconds), StallFloorMarginSeconds)
 
   /** Pure form of the watchdog's decision, so it can be tested without halting
     * a JVM: has more than `stallTimeoutSeconds` passed with no progress? */
