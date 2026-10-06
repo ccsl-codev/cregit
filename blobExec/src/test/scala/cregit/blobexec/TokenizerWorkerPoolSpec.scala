@@ -42,6 +42,7 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
          |    sleep 2 if $name eq 'slow.c';
          |    if    ($name eq 'crash.c')   { reply(33, '') }
          |    elsif ($name eq 'timeout.c') { reply(124, '') }
+         |    elsif ($name eq 'error.c')   { reply(1, $body) }
          |    elsif ($name eq 'budget.c')  { reply(0, $timeout) }
          |    else                         { reply(0, uc $body) }
          |}
@@ -73,22 +74,31 @@ class TokenizerWorkerPoolSpec extends AnyFunSuite with Matchers with BeforeAndAf
     }
   }
 
-  test("a worker's timeout and parser crash take BlobExec's timeout and crash paths") {
+  private def runBlob(pool: TokenizerWorkerPool, filename: String, abortOnError: Boolean = true) = {
     val inserter = new InMemoryRepository(new DfsRepositoryDescription("pool-spec")).newObjectInserter()
+    var called = "none"
+    val outcome = BlobExec.run(
+      "body".getBytes(UTF_8), "a" * 40, filename, s"src/$filename", "tokenBySha.pl",
+      abortOnError = abortOnError, inserter = inserter,
+      onTimeout = () => called = "timeout", onParserCrash = () => called = "parser-crash",
+      onTokenizerError = () => called = "tokenizer-error",
+      workerPool = Some(pool))
+    (outcome, called)
+  }
+
+  test("a worker's timeout and parser crash take BlobExec's timeout and crash paths") {
     withPool(1) { pool =>
-      def run(filename: String): (BlobExec.Outcome, String) = {
-        var called = "none"
-        val outcome = BlobExec.run(
-          "body".getBytes(UTF_8), "a" * 40, filename, s"src/$filename", "tokenBySha.pl",
-          abortOnError = true, inserter = inserter,
-          onTimeout = () => called = "timeout", onParserCrash = () => called = "parser-crash",
-          workerPool = Some(pool))
-        (outcome, called)
-      }
-      run("timeout.c") shouldEqual ((BlobExec.Outcome.Skip, "timeout"))
-      run("crash.c") shouldEqual ((BlobExec.Outcome.Skip, "parser-crash"))
-      run("die.c") shouldEqual ((BlobExec.Outcome.Skip, "timeout"))
-      run("ok.c")._1 shouldBe a[BlobExec.Outcome.Replace]
+      runBlob(pool, "timeout.c") shouldEqual ((BlobExec.Outcome.Skip, "timeout"))
+      runBlob(pool, "crash.c") shouldEqual ((BlobExec.Outcome.Skip, "parser-crash"))
+      runBlob(pool, "die.c") shouldEqual ((BlobExec.Outcome.Skip, "timeout"))
+      runBlob(pool, "ok.c")._1 shouldBe a[BlobExec.Outcome.Replace]
+    }
+  }
+
+  test("a worker's exit 1 with output excludes the blob, or aborts with --abort-on-error") {
+    withPool(1) { pool =>
+      runBlob(pool, "error.c", abortOnError = false) shouldEqual ((BlobExec.Outcome.Skip, "tokenizer-error"))
+      runBlob(pool, "error.c")._1 shouldBe a[BlobExec.Outcome.Abort]
     }
   }
 

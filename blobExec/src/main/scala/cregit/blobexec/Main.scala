@@ -58,7 +58,7 @@ object Main {
   private[blobexec] val Usage =
     raw"""Usage: blobExec [options] <src.git> <dst.git> <db.sqlite> <command> <fileMaskRegex>
       |
-      |  --abort-on-error           exit 2 on the first error from <command> instead of skipping the blob
+      |  --abort-on-error           exit 2 on the first error from <command> instead of excluding the blob
       |  --pipeline                 look-ahead pipelined walker; same output as the serial walker
       |  --pipeline-trees           as --pipeline, and also assemble trees on the worker pool
       |  --shard=K/N                tree-only run of shard K (0-based) of N commit ranges, no commits or
@@ -85,8 +85,8 @@ object Main {
       |  <fileMaskRegex>            regex matched against each blob's filename (e.g. '\.[ch]$$')
       |
       |  Denylisted (${BlobDenylist.EntriesSource}) and oversized blobs, and blobs whose tokenizer
-      |  times out or crashes, are left out of the trees and named on an EXCLUDED line; they do not
-      |  change the exit status.
+      |  times out, crashes or exits non-zero, are left out of the trees and named on an EXCLUDED
+      |  line; they do not change the exit status.
       |
       |  Exit status: 0 clean, 1 usage, 2 aborted on a command error, 3 cache mismatch,
       |  ${Walker.StalledExitStatus} stalled, ${RetokenizeIneffectiveExitStatus} --retokenize would invalidate nothing.
@@ -200,11 +200,12 @@ object Main {
         "not contain. The files are absent from the tokenized repository, not present as raw source, " +
         "so they produce no blame and no dataset row. This is not a failure and does not affect the exit status."
 
-    def failed(timedOut: Long, crashed: Long, blobTimeoutSeconds: Int): String =
-      s"blobExec: ${timedOut + crashed} blob(s) were excluded because their tokenizer failed " +
-        s"($timedOut timed out after ${blobTimeoutSeconds}s, $crashed reported a parser crash). Each " +
-        "one is named on an 'EXCLUDED failed blob' line above; those lines are the record of what " +
-        "this project's dataset does not contain. This does not affect the exit status."
+    def failed(timedOut: Long, crashed: Long, errored: Long, blobTimeoutSeconds: Int): String =
+      s"blobExec: ${timedOut + crashed + errored} blob(s) were excluded because their tokenizer failed " +
+        s"($timedOut timed out after ${blobTimeoutSeconds}s, $crashed reported a parser crash, " +
+        s"$errored exited non-zero). Each one is named on an 'EXCLUDED failed blob' line above; " +
+        "those lines are the record of what this project's dataset does not contain. This does " +
+        "not affect the exit status."
   }
 
   /** `--name=<value>` as a pattern: `case Flag(value) =>`. */
@@ -460,6 +461,7 @@ object Main {
       s"blobsOversized=${stats.blobsOversized} " +
       s"blobsDenylisted=${stats.blobsDenylisted} " +
       s"blobsParserCrashed=${stats.blobsParserCrashed} " +
+      s"blobsTokenizerFailed=${stats.blobsTokenizerFailed} " +
       s"aborted=${stats.aborted}"
 
   private def reportExclusions(stats: WalkStats, blobTimeoutSeconds: Int): Unit = {
@@ -467,8 +469,10 @@ object Main {
       System.err.println(Messages.denylisted(stats.blobsDenylisted, BlobDenylist.shipped.size))
     if (stats.blobsOversized > 0)
       System.err.println(Messages.oversized(stats.blobsOversized))
-    if (stats.blobsTimedOut + stats.blobsParserCrashed > 0)
-      System.err.println(Messages.failed(stats.blobsTimedOut, stats.blobsParserCrashed, blobTimeoutSeconds))
+    val failed = stats.blobsTimedOut + stats.blobsParserCrashed + stats.blobsTokenizerFailed
+    if (failed > 0)
+      System.err.println(
+        Messages.failed(stats.blobsTimedOut, stats.blobsParserCrashed, stats.blobsTokenizerFailed, blobTimeoutSeconds))
   }
 
   private def openSrc(path: Path): FileRepository = {

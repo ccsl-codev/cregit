@@ -37,6 +37,12 @@ class FailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   private val hang  = "sleep 300 & sleep 300"
   private val crash = s"cat >/dev/null; exit ${BlobExec.ParserCrashExitCode}"
+  private val error = "cat; exit 1"
+
+  private val failures = Seq[(String, String, WalkStats => Long)](
+    ("timed-out", hang, _.blobsTimedOut),
+    ("crashed", crash, _.blobsParserCrashed),
+    ("errored", error, _.blobsTokenizerFailed))
 
   private def run(src: Repository, dstPath: Path, dbPath: Path, command: String, mode: String): WalkStats = {
     val dst = FileRepositoryBuilder.create(dstPath.toFile).asInstanceOf[FileRepository]
@@ -82,7 +88,7 @@ class FailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   for (mode <- Seq("serial", "pipeline", "pipeline-trees")) {
-    for ((kind, onB) <- Seq("timed-out" -> hang, "crashed" -> crash))
+    for ((kind, onB, counted) <- failures)
       test(s"[$mode] a $kind blob is excluded and the commit is still folded") {
         val f = fixture(extraCommitInDeep = false)
         val dstPath = f.dir.resolve("dst.git")
@@ -93,7 +99,8 @@ class FailedBlobSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
         stats.aborted shouldBe false
         stats.commitsProcessed shouldEqual 1
-        (stats.blobsTimedOut + stats.blobsParserCrashed) shouldEqual 1
+        (stats.blobsTimedOut + stats.blobsParserCrashed + stats.blobsTokenizerFailed) shouldEqual 1
+        counted(stats) shouldEqual 1
         Main.exitStatus(stats) shouldEqual 0
         val m = Mapping.open(dbPath, command, """\.c$""")
         try {

@@ -38,6 +38,7 @@ object BlobExec {
       timeoutSeconds: Int = DefaultTimeoutSeconds,
       onTimeout: () => Unit = () => (),
       onParserCrash: () => Unit = () => (),
+      onTokenizerError: () => Unit = () => (),
       workerPool: Option[TokenizerWorkerPool] = None
   ): Outcome = {
     val env = Seq("BFG_BLOB" -> origSha, "BFG_FILENAME" -> filename, "BFG_PATH" -> fullPath)
@@ -77,9 +78,15 @@ object BlobExec {
         onParserCrash()
         Outcome.Skip
 
-      case ChildRunner.Outcome.Exited(status, _, stderr) if status != 0 =>
+      case ChildRunner.Outcome.Exited(status, _, stderr) if status != 0 && abortOnError =>
         logError(command, origSha, fullPath, status, stderr)
-        if (abortOnError) Outcome.Abort(stderr, status) else Outcome.Skip
+        Outcome.Abort(stderr, status)
+
+      case ChildRunner.Outcome.Exited(status, _, stderr) if status != 0 =>
+        System.err.println(tokenizerErrorExcluded(command, origSha, fullPath, status))
+        printStderr(command, origSha, fullPath, stderr)
+        onTokenizerError()
+        Outcome.Skip
 
       case ChildRunner.Outcome.Exited(_, stdout, _) if stdout.isEmpty && bytes.nonEmpty =>
         System.err.println(
@@ -97,6 +104,10 @@ object BlobExec {
         Outcome.Replace(inserter.insert(OBJ_BLOB, stdout))
     }
   }
+
+  private def tokenizerErrorExcluded(command: String, origSha: String, fullPath: String, status: Int): String =
+    s"Warning: command [$command] exited $status on blob $origSha at path [$fullPath]: blob excluded, " +
+      "so its source never goes into the tokenized tree"
 
   private def logError(
       command: String,

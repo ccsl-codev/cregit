@@ -36,6 +36,6 @@ worker -> JVM:  RES <exit> <outLength> <errLength>\n<out><err>
   timeout it kills the group and the helpers, and answers `124`.
 - If no answer comes in `timeoutSeconds + 5` seconds, blobExec kills the
   worker and its children, starts a new worker, and reports a timeout.
-- If the worker stops in a request, blobExec reports a tokenizer error for
-  that blob and starts a new worker.
+- If the worker stops in a request, blobExec reports a timeout for that
+  blob and starts a new worker.
 - At EOF on stdin, the worker exits 0. A malformed request makes it exit 2.
