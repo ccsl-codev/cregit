@@ -186,9 +186,9 @@ returns without invoking `srcml` at all. Put it out of reach with `--memo-dir`,
 names neither repository nor extension). The runner refuses a step-1 wipe that
 would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 
-12 blobs on which srcML 1.1.0 does not terminate (8 Java, srcML/srcML#2361; 4 C) are
-on a **blob denylist** (`BlobDenylistEntries.scala`). They never reach the tokenizer,
-are dropped from the rewritten trees, and are counted as `blobsDenylisted`.
+4 C blobs on which srcML does not terminate (`eden/fs/utils/StatTimes.h`, no upstream
+issue) are on a **blob denylist** (`BlobDenylistEntries.scala`). They never reach the
+tokenizer, are dropped from the rewritten trees, and are counted as `blobsDenylisted`.
 
 A blob whose tokenizer times out, reports a parser crash or exits non-zero is
 excluded the same way without an entry: it is named on an `EXCLUDED failed blob`

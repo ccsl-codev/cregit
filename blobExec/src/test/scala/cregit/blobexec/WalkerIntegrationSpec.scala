@@ -804,7 +804,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   }
 
   // -- DENYLISTED mask-matched blob -------------------------------------------
-  // srcML 1.1.0 never terminates on these (srcML/srcML#2361). A denylisted blob is
+  // srcML never terminates on these (eden/fs/utils/StatTimes.h). A denylisted blob is
   // excluded and does not gate the exit status; an unexplained timeout still does.
 
   /** The git blob id of `content`, computed the way git computes it, so a fixture
@@ -815,7 +815,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
   private def checkDenylistExclusion(label: String, pipeline: Boolean, pipelineTrees: Boolean): Unit = {
     val dir = freshWorkDir("denylisted-" + label)
     val keep = "int main(){}\n"
-    // Stands in for TestNewCastArray.java. Its content is irrelevant: the point is
+    // Stands in for a blob that hangs srcML. Its content is irrelevant: the point is
     // that the tokenizer is never asked about it, so a fixture that would hang is
     // not needed and would make the test itself hang.
     val hangs = "String @A [] [] s = new String @A [2] [2];\n"
@@ -827,7 +827,7 @@ class WalkerIntegrationSpec extends AnyFunSuite with Matchers with BeforeAndAfte
 
     val denied = blobIdOf(hangs)
     val denylist = BlobDenylist(Map(
-      denied.name -> BlobDenylist.Entry("srcML/srcML#2361", "srcML 1.1.0 does not terminate on it")))
+      denied.name -> BlobDenylist.Entry("no upstream issue", "srcML does not terminate on it")))
 
     // Every invocation of the tokenizer records the blob it was given. "Excluded in
     // milliseconds, never handed to the tokenizer" is only checkable from the
