@@ -51,8 +51,8 @@ HTML views land in the sibling directory `../cregit-files/html`. See
 ## Preliminaries
 
 - Code is written in Scala, C++, Rust and Perl.
-- Platform: Linux x86_64 or macOS arm64 — `devenv` builds the pinned `srcml`
-  1.1.0 parser from its release tag (`nix/srcml.nix`).
+- Platform: Linux x86_64 or macOS arm64 — `devenv` builds the `srcml` parser
+  from a pinned develop revision (`nix/srcml.nix`).
 
 ## Prerequisites
 
