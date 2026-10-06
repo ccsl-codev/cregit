@@ -354,8 +354,10 @@ For each `.blame` file:
 1. Parse each line as `commit_sha;token_content`
 2. Repair the token line: drop the Rust tokenizer's `line:col<TAB>` prefix and,
    in a strict UTF-8, non-`.rs` file without a byte-order mark, undo srcML
-   1.1.0's Latin-1 misreading (`Ã¶` becomes `ö`). The source is read as
-   `utf-8-sig`, so a BOM does not shift the walk. Counts go to a `Repaired:` line.
+   1.1.0's Latin-1 misreading (`Ã¶` becomes `ö`). A token that the source
+   holds as is stays as is: srcML develop reads UTF-8 right. The source is
+   read as `utf-8-sig`, so a BOM does not shift the walk. Counts go to a
+   `Repaired:` line.
 3. Walk through the original source file character-by-character to match tokens
 4. Classify each token (structural vs content, type, value)
 5. Insert into SQLite `token_map`
