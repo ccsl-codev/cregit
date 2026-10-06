@@ -190,9 +190,9 @@ would delete a memo of 10,000 entries or more; `--force-clean` overrides it.
 on a **blob denylist** (`BlobDenylistEntries.scala`). They never reach the tokenizer,
 are dropped from the rewritten trees, and are counted as `blobsDenylisted`.
 
-A blob whose tokenizer times out or reports a parser crash is excluded the same
-way without an entry: it is named on an `EXCLUDED failed blob` line, tried once
-per run, and the run exits 0. An entry still saves the `--blob-timeout` (600 s by
+A blob whose tokenizer times out, reports a parser crash or exits non-zero is
+excluded the same way without an entry: it is named on an `EXCLUDED failed blob`
+line, tried once per run, and the run exits 0. An entry still saves the `--blob-timeout` (600 s by
 default) that a known hang costs on each run.
 
 Example run (cregit run on itself):

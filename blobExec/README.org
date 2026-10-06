@@ -38,7 +38,7 @@ java -jar blobExec-0.1.0-assembly.jar [--abort-on-error] \
 | =<db.sqlite>=      | SQLite mapping file. Created with schema if absent                         |
 | =<command>=        | Absolute path to the per-blob script                                       |
 | =<fileMaskRegex>=  | Regex matched against each blob's filename, e.g. ='\.[ch]$'=               |
-| =--abort-on-error= | Exit 2 on the first non-zero =<command>= exit (default: skip the blob)     |
+| =--abort-on-error= | Exit 2 on the first non-zero =<command>= exit (default: exclude the blob)  |
 
 For each blob whose filename matches =<fileMaskRegex>=, =<command>= is
 invoked with:
@@ -48,8 +48,9 @@ invoked with:
 - env =BFG_FILENAME= = blob's basename in the tree
 - env =BFG_PATH=     = blob's full repo-root relative path (e.g. =src/lib/foo.c=)
 
-The command's stdout replaces the blob's bytes. Non-zero exit or
-identical-to-input output leaves the blob unchanged. Every rewritten commit
+The command's stdout replaces the blob's bytes. Identical-to-input output
+leaves the blob unchanged. A non-zero exit excludes the blob from the tree
+and names it on an =EXCLUDED failed blob= line. Every rewritten commit
 gets =Former-commit-id: <orig-sha>= appended to its message (byte-for-byte
 compatible with BFG's =FormerCommitFooter=, which the cregit =remapCommits=
 step parses from each commit's last line).

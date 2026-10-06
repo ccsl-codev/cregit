@@ -26,6 +26,8 @@ final case class WalkStats(
     blobsDenylisted: Long,
     /** Tokenizer exited [[BlobExec.ParserCrashExitCode]]. */
     blobsParserCrashed: Long = 0L,
+    /** Tokenizer exited non-zero for any other reason, without `--abort-on-error`. */
+    blobsTokenizerFailed: Long = 0L,
     blobCommandExecutions: Long,
     originalBlobCopyRequests: Long,
     originalBlobCopies: Long,
@@ -69,6 +71,7 @@ final class Walker(
   private val blobsOversized                 = new LongAdder
   private val blobsDenylisted                = new LongAdder
   private val blobsParserCrashed             = new LongAdder
+  private val blobsTokenizerFailed           = new LongAdder
   private val originalBlobCopyRequests       = new LongAdder
   private val originalBlobCopies             = new LongAdder
   private val originalBlobAlreadyPresent     = new LongAdder
@@ -204,6 +207,7 @@ final class Walker(
         blobsOversized         = blobsOversized.sum(),
         blobsDenylisted        = blobsDenylisted.sum(),
         blobsParserCrashed     = blobsParserCrashed.sum(),
+        blobsTokenizerFailed   = blobsTokenizerFailed.sum(),
         blobCommandExecutions       = blobCommandExecutions.sum(),
         originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
         originalBlobCopies          = originalBlobCopies.sum(),
@@ -243,6 +247,7 @@ final class Walker(
       blobsOversized         = blobsOversized.sum(),
       blobsDenylisted        = blobsDenylisted.sum(),
       blobsParserCrashed     = blobsParserCrashed.sum(),
+      blobsTokenizerFailed   = blobsTokenizerFailed.sum(),
       blobCommandExecutions       = blobCommandExecutions.sum(),
       originalBlobCopyRequests    = originalBlobCopyRequests.sum(),
       originalBlobCopies          = originalBlobCopies.sum(),
@@ -778,6 +783,7 @@ final class Walker(
         timeoutSeconds = blobTimeoutSeconds,
         onTimeout      = () => { blobsTimedOut.increment(); failure.set("timeout") },
         onParserCrash  = () => { blobsParserCrashed.increment(); failure.set("parser-crash") },
+        onTokenizerError = () => { blobsTokenizerFailed.increment(); failure.set("tokenizer-error") },
         workerPool     = workerPool
       )
       val res = outcome match {
@@ -926,7 +932,8 @@ final class Walker(
               inserter     = workerInserter,
               timeoutSeconds = blobTimeoutSeconds,
               onTimeout      = () => { blobsTimedOut.increment(); failure.set("timeout") },
-              onParserCrash  = () => { blobsParserCrashed.increment(); failure.set("parser-crash") }
+              onParserCrash  = () => { blobsParserCrashed.increment(); failure.set("parser-crash") },
+              onTokenizerError = () => { blobsTokenizerFailed.increment(); failure.set("tokenizer-error") }
             )
             val failed = Option(failure.get())
             failed.foreach(noteFailed(task, _))
@@ -957,7 +964,7 @@ final class Walker(
         case (task, BlobExec.Outcome.Replace(newId)) =>
           (task.origId.name, task.fullPath) -> newId
         case (task, BlobExec.Outcome.Skip) =>
-          // identical, or non-zero-exit (with abortOnError=false)
+          // identical output: `flatten` dropped every failed blob
           (task.origId.name, task.fullPath) -> task.origId
       }.toMap
       MissResolution(ids, abort = false)
