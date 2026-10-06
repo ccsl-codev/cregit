@@ -141,6 +141,20 @@ class BlobExecSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     crashes.get shouldEqual 1
   }
 
+  test("a tokenizer that exits 1 with output is excluded and never kept as source") {
+    val errors  = new java.util.concurrent.atomic.AtomicInteger(0)
+    val others  = new java.util.concurrent.atomic.AtomicInteger(0)
+    val cmd = shellScript("echo 'partial tokens'; exit 1")
+    BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
+                 abortOnError = false, inserter,
+                 onTimeout        = () => { others.incrementAndGet(); () },
+                 onParserCrash    = () => { others.incrementAndGet(); () },
+                 onTokenizerError = () => { errors.incrementAndGet(); () }
+    ) shouldBe BlobExec.Outcome.Skip
+    errors.get shouldEqual 1
+    others.get shouldEqual 0
+  }
+
   test("a parser crash skips one blob even with abortOnError, like a timeout") {
     val cmd = shellScript(s"exit ${BlobExec.ParserCrashExitCode}")
     BlobExec.run("int main(){}".getBytes(UTF_8), sampleSha, "x.c", "src/x.c", cmd,
