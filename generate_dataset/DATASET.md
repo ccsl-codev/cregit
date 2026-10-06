@@ -302,7 +302,7 @@ produces no blame and no dataset row rather than rows of unparsed text:
 |---|---|---|
 | the **blob denylist**, `BlobDenylistEntries.scala` | `blobsDenylisted`, plus one `EXCLUDED denylisted blob` line per blob naming its sha, path and cited reason | no rows for those blobs. The list is compiled into the jar |
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
-| a blob the tokenizer **timed out** or **crashed** on | `blobsTimedOut` or `blobsParserCrashed`, plus one `EXCLUDED failed blob` line each with `reason=timeout` or `reason=parser-crash` | no rows for those blobs. The run still exits 0 |
+| a blob the tokenizer **timed out**, **crashed** or **failed** on | `blobsTimedOut`, `blobsParserCrashed` or `blobsTokenizerFailed`, plus one `EXCLUDED failed blob` line each with `reason=timeout`, `reason=parser-crash` or `reason=tokenizer-error` | no rows for those blobs. The run still exits 0 |
 
 The denylist holds 209 blob ids, keyed by content, in three srcML 1.1.0 defects:
 8 Java blobs that do not terminate (upstream
