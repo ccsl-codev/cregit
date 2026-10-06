@@ -304,11 +304,11 @@ produces no blame and no dataset row rather than rows of unparsed text:
 | **oversized** blobs (at or above JGit's stream-file threshold) | `blobsOversized`, plus one `EXCLUDED oversized blob` line each | no rows for those blobs |
 | a blob the tokenizer **timed out**, **crashed** or **failed** on | `blobsTimedOut`, `blobsParserCrashed` or `blobsTokenizerFailed`, plus one `EXCLUDED failed blob` line each with `reason=timeout`, `reason=parser-crash` or `reason=tokenizer-error` | no rows for those blobs. The run still exits 0 |
 
-The denylist holds 209 blob ids, keyed by content, in three srcML 1.1.0 defects:
-8 Java blobs that do not terminate (upstream
-[`srcML/srcML#2361`](https://github.com/srcML/srcML/issues/2361)), 4 C blobs that do
-not terminate (no upstream issue), and 197 C and C++ blobs on which srcML crashes
-under `--position`. The header of the file carries the reproducers and citations.
+The denylist holds 4 blob ids, keyed by content: 4 blobs of
+`eden/fs/utils/StatTimes.h`. srcML's C parser does not terminate on the C++ in this
+`.h` file (no upstream issue). This is true for srcML 1.1.0 and for develop
+d38271916, which devenv builds. The entry in the file carries the reproducer and
+the citation.
 
 Also outside the dataset, by mask rather than by exclusion: M4 (`.am`, `.ac`),
 whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,

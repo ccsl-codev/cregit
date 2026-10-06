@@ -8,6 +8,7 @@ import org.scalatest.matchers.should.Matchers
 class BlobDenylistSpec extends AnyFunSuite with Matchers {
 
   // TestNewCastArray.java (4) and CheckErrorsForSource7.java (4): srcML/srcML#2361.
+  // srcML develop d38271916 parses them, so they must not be on the list.
   private val JavaAnnotationShas = Set(
     "2ee2673ad0a8ff2cef0254e7bfdc488cc1d61a65",
     "303c1a109f1fdc4b9d84e15111c56931202844ac",
@@ -29,10 +30,16 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
 
   private val shipped = BlobDenylistEntries.NonTerminating
 
-  test("the shipped list holds exactly the twelve known hangs, so an addition is deliberate") {
+  test("the shipped list holds exactly the four known hangs, so an addition is deliberate") {
     // Also catches a sha written twice: a Map literal silently keeps the last.
-    shipped.keySet shouldEqual JavaAnnotationShas ++ CParserShas
-    BlobDenylist.shipped.size shouldEqual 12
+    shipped.keySet shouldEqual CParserShas
+    BlobDenylist.shipped.size shouldEqual 4
+  }
+
+  test("the Java blobs that srcML develop parses are not denylisted") {
+    JavaAnnotationShas.foreach { sha =>
+      withClue(s"$sha: ") { BlobDenylist.shipped.entryFor(sha) shouldEqual None }
+    }
   }
 
   test("every key is a 40-character lowercase hex git blob id") {
@@ -44,10 +51,9 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   test("every entry carries a one-line reason and the citation of its own defect") {
     shipped.foreach { case (sha, e) =>
       withClue(s"$sha: ") {
-        if (JavaAnnotationShas.contains(sha)) e.citation shouldEqual "srcML/srcML#2361"
-        else e.citation should include("srcml-nontermination-analysis.md")
+        e.citation should include("srcml-nontermination-analysis.md")
         e.reason should not include "\n"
-        e.reason should include("srcML 1.1.0")
+        e.reason should include("1.1.0 and develop d38271916")
       }
     }
   }
@@ -64,7 +70,7 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
   }
 
   test("lookup is by git blob id, in either case, and misses everything else") {
-    val sha = JavaAnnotationShas.head
+    val sha = CParserShas.head
     BlobDenylist.shipped.entryFor(sha) should not be empty
     BlobDenylist.shipped.entryFor(sha.toUpperCase) should not be empty
     BlobDenylist.shipped.entryFor("0" * 40) shouldEqual None
@@ -78,6 +84,6 @@ class BlobDenylistSpec extends AnyFunSuite with Matchers {
 
   test("an empty list matches nothing, so a test fixture cannot exclude by accident") {
     BlobDenylist.empty.isEmpty shouldBe true
-    BlobDenylist.empty.entryFor(JavaAnnotationShas.head) shouldEqual None
+    BlobDenylist.empty.entryFor(CParserShas.head) shouldEqual None
   }
 }
