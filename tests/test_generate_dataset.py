@@ -582,10 +582,50 @@ def test_a_correct_token_is_not_changed(tmp_path):
     ("a.c", b"/* H\xc3\xb6 \xff */\nint x;\n"),
     # The Rust tokenizer does not use srcML.
     ("a.rs", "/* HÃ¶ */\nint x;\n".encode()),
+    # The source holds the pair, so the tokenizer read it right.
+    ("a.c", "/* HÃ¶ */\nint x;\n".encode()),
 ])
 def test_the_gate_keeps_a_matching_token_as_it_is(tmp_path, name, source):
     rows = walk(tmp_path, name, source, "comment|/* HÃ¶ */", "keyword|int")
     assert rows[0][1] == "/* HÃ¶ */"
+
+
+@pytest.mark.parametrize("source, text, held", [
+    ("  /* a\n * b */ x", "/* a  * b */", True),
+    ("/* Hö */", "/* HÃ¶ */", False),
+    ("ab", "abc", False),
+    ("ab", "", False),
+])
+def test_holds_next_compares_the_non_whitespace_text(source, text, held):
+    assert reader(source).holds_next(text) is held
+
+
+def test_holds_next_sees_an_unread_char():
+    r = reader("xab")
+    r.unread_char(r.read_char())
+    assert r.holds_next("xa")
+
+
+MIXED_SOURCE = '/* café */\nchar *s = u8"cafÃ©";\n'
+MIXED_TOKENS = ("comment|/* café */", "name|char", "operator|*", "name|s",
+                "operator|=", 'literal|u8"cafÃ©"', "operator|;")
+
+
+def misread_as_latin1(token: str) -> str:
+    return token.encode().decode("latin-1")
+
+
+@pytest.mark.parametrize("tokens, repaired", [
+    (MIXED_TOKENS, 0),
+    (tuple(map(misread_as_latin1, MIXED_TOKENS)), 2),
+], ids=["srcml-develop", "srcml-1.1.0"])
+def test_both_srcml_versions_give_the_source_text(tmp_path, tokens, repaired):
+    stats = Counter()
+    rows = walk(tmp_path, "a.c", MIXED_SOURCE.encode(), *tokens, stats=stats)
+    assert [r[1] for r in rows] == [t.split("|", 1)[1] for t in MIXED_TOKENS]
+    assert rows[5][3:5] == (2, 11)
+    assert rows[6][3:5] == (2, 20)
+    assert stats["mojibake_tokens"] == repaired
 
 
 def test_a_rust_line_loses_its_position_prefix(tmp_path):
@@ -656,4 +696,5 @@ def test_a_line_from_the_fixed_rust_tokenizer_is_kept(tmp_path):
     ("12:5|keyword|fn", False, "12:5|keyword|fn"),  # --position form: a pipe
 ])
 def test_repair_token_line(line, repairable, expected):
-    assert repair_token_line(line, repairable, Counter()) == expected
+    assert repair_token_line(line, repairable, Counter(),
+                             reader("")) == expected

@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import io
+import itertools
 import logging
 import os
 import re
@@ -80,6 +81,15 @@ class SourceReader:
 
     def location(self) -> tuple[int, int]:
         return (self.line, self.col)
+
+    def holds_next(self, text: str) -> bool:
+        """True when the next non-whitespace characters are those of `text`."""
+        wanted = "".join(itertools.filterfalse(is_ws, text))
+        ahead = itertools.chain(self._last_char or "", (
+            self.source[i] for i in range(self.pos, len(self.source))))
+        upcoming = itertools.islice(itertools.filterfalse(is_ws, ahead),
+                                    len(wanted))
+        return bool(wanted) and "".join(upcoming) == wanted
 
 
 # ===================================================================
@@ -329,8 +339,15 @@ def read_source(source_path: Path) -> tuple[str, bool, bool]:
     return text, has_bom, repairable
 
 
+def misread_by_srcml(token_content: str, reader: SourceReader) -> bool:
+    """srcML develop decodes UTF-8 right, so a pair the source holds as is
+    (as in `u8"cafÃ©"`) is true text, not mojibake."""
+    return (_MOJIBAKE.search(token_content) is not None
+            and not reader.holds_next(token_content.partition("|")[2]))
+
+
 def repair_token_line(token_content: str, repairable: bool,
-                      stats: Counter) -> str:
+                      stats: Counter, reader: SourceReader) -> str:
     """Strip the Rust position prefix and, if `repairable`, undo srcML mojibake,
     counting each in `stats`. Run before classify_and_skip: a wrong token
     length shifts every later position in the file."""
@@ -338,7 +355,7 @@ def repair_token_line(token_content: str, repairable: bool,
     if prefix:
         stats["position_prefix"] += 1
         token_content = token_content[prefix.end():]
-    if repairable and _MOJIBAKE.search(token_content):
+    if repairable and misread_by_srcml(token_content, reader):
         fixed = undo_mojibake(token_content)
         if fixed != token_content:
             stats["mojibake_tokens"] += 1
@@ -370,7 +387,8 @@ def process_blame_file(
                 continue
             commit_sha, token_content = parsed
 
-            token_content = repair_token_line(token_content, repairable, stats)
+            token_content = repair_token_line(token_content, repairable,
+                                              stats, reader)
             info = classify_and_skip(token_content, reader)
             counted[0] += 1
             yield (
