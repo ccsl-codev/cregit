@@ -355,7 +355,20 @@ object Main {
     } yield full
   }
 
+  /** JGit hashes with its own Java SHA-1, which also runs collision detection
+    * (SHA1DC); the JDK's intrinsic one is faster (-5% on psi-probe). Both give the
+    * same id for every input that is not a crafted SHA-1 collision; on one of
+    * those the Java one throws instead. Set before JGit hashes anything, and only
+    * when the operator did not choose: -Dorg.eclipse.jgit.util.sha1.implementation=java
+    * keeps the old one. JGit reads the property on every new hasher. */
+  private[blobexec] val Sha1ImplementationProperty = "org.eclipse.jgit.util.sha1.implementation"
+
+  private[blobexec] def defaultSha1Implementation(): Unit =
+    if (System.getProperty(Sha1ImplementationProperty) == null)
+      System.setProperty(Sha1ImplementationProperty, "jdkNative")
+
   def main(args: Array[String]): Unit = {
+    defaultSha1Implementation()
     val options = parse(args.toVector) match {
       case Right(o)  => o
       case Left(why) => exit(why, UsageExitStatus)
@@ -416,7 +429,7 @@ object Main {
       s"memoDir=${orNone(o.memoDir)} tokenizerWorker=${orNone(o.tokenizerWorker)} " +
       s"alternates=${o.alternates} commitsPerTransaction=${o.commitsPerTransaction} " +
       s"sqliteCacheMiB=${o.sqlite.cacheMiB} sqliteMmapMiB=${o.sqlite.mmapMiB} " +
-      s"looseCompression=${o.looseCompression}"
+      s"looseCompression=${o.looseCompression} sha1=${System.getProperty(Sha1ImplementationProperty)}"
   }
 
   private final case class Refusal(status: Int, message: String)
