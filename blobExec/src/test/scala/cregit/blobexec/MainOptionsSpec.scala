@@ -220,8 +220,9 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
 
   test("the step-2 speed flags are read, and default to on") {
     inside(Main.parse(Seq("--alternates", "--commits-per-transaction=1", "--sqlite-cache-mb=0",
-      "--sqlite-mmap-mb=0") ++ positional)) { case Right(o) =>
+      "--sqlite-mmap-mb=0", "--loose-compression=-1") ++ positional)) { case Right(o) =>
       o.alternates shouldBe true
+      o.looseCompression shouldBe -1
       o.commitsPerTransaction shouldBe 1
       o.sqlite shouldEqual Mapping.UntunedSqlite
     }
@@ -229,6 +230,7 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
       o.alternates shouldBe false  // the caller must repack, so the caller asks for it
       o.commitsPerTransaction shouldBe Walker.DefaultCommitsPerTransaction
       o.sqlite shouldEqual Mapping.Tuning(Mapping.DefaultCacheMiB, Mapping.DefaultMmapMiB)
+      o.looseCompression shouldBe 1
     }
   }
 
@@ -262,7 +264,8 @@ class MainOptionsSpec extends AnyFunSuite with Matchers {
       "--memo-dir=/nonexistent/" -> "--memo-dir",
       "--commits-per-transaction=0" -> "--commits-per-transaction",
       "--sqlite-cache-mb=-1"     -> "--sqlite-cache-mb",
-      "--sqlite-mmap-mb=lots"    -> "--sqlite-mmap-mb"
+      "--sqlite-mmap-mb=lots"    -> "--sqlite-mmap-mb",
+      "--loose-compression=10"   -> "--loose-compression"
     ).foreach { case (flag, name) =>
       withClue(s"$flag: ") {
         inside(Main.parse(flag +: positional)) { case Left(why) => why should startWith(s"Error: $name") }

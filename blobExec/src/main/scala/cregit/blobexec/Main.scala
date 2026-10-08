@@ -14,6 +14,11 @@ object Main {
   /** Not 3 (memo mismatch): a no-op request must be told apart from a refusal. */
   private[blobexec] val RetokenizeIneffectiveExitStatus = 7
 
+  /** zlib level 1 for dst's loose objects: they are temporary, because the pack
+    * after step 2 re-deflates every one at git's pack.compression. Measured -11%
+    * consumer CPU on psi-probe against JGit's default level. */
+  private[blobexec] val DefaultLooseCompression = 1
+
   private val UsageExitStatus   = 1
   private val RefusedExitStatus = 3
 
@@ -82,6 +87,8 @@ object Main {
       |                             (default ${Walker.DefaultCommitsPerTransaction}; 1 = one per commit)
       |  --sqlite-cache-mb=<n>      SQLite page cache for the mapping DB (default ${Mapping.DefaultCacheMiB}; 0 = SQLite's 2 MB)
       |  --sqlite-mmap-mb=<n>       memory-map up to this much of the mapping DB (default ${Mapping.DefaultMmapMiB}; 0 = off)
+      |  --loose-compression=<n>    zlib level of the loose objects written to <dst.git>, in memory only
+      |                             (default ${DefaultLooseCompression}; -1 = JGit's default, 6). git repacks them anyway
       |  --blob-timeout=<seconds>   budget for one <command> run (default ${BlobExec.DefaultTimeoutSeconds}); then its process
       |                             tree is killed and the blob excluded
       |  --stall-timeout=<seconds>  exit ${Walker.StalledExitStatus} after this long with no progress (default ${Walker.DefaultStallTimeoutSeconds});
@@ -114,6 +121,7 @@ object Main {
       alternates: Boolean = false,
       commitsPerTransaction: Int = Walker.DefaultCommitsPerTransaction,
       sqlite: Mapping.Tuning = Mapping.Tuning(),
+      looseCompression: Int = DefaultLooseCompression,
       blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
       stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
       stallExplicit: Boolean = false,
@@ -238,6 +246,7 @@ object Main {
   private val CommitsPerTxFlag      = new ValuedFlag("--commits-per-transaction")
   private val SqliteCacheFlag       = new ValuedFlag("--sqlite-cache-mb")
   private val SqliteMmapFlag        = new ValuedFlag("--sqlite-mmap-mb")
+  private val LooseCompressionFlag  = new ValuedFlag("--loose-compression")
 
   private def flagValue[A](flag: ValuedFlag, spec: String)(parse: String => Either[String, A]): Either[String, A] =
     parse(spec).left.map(Messages.badFlagValue(flag.name, _))
@@ -247,6 +256,9 @@ object Main {
 
   private def mebibytes(spec: String): Either[String, Int] =
     spec.toIntOption.filter(_ >= 0).toRight(s"must be a whole number of MiB, 0 or more [$spec]")
+
+  private def level(spec: String): Either[String, Int] =
+    spec.toIntOption.filter(n => n >= -1 && n <= 9).toRight(s"must be a zlib level, -1 to 9 [$spec]")
 
   private def seconds(spec: String): Either[String, Int] =
     parsePositiveSeconds(spec).toRight(Messages.secondsWanted(spec))
@@ -294,6 +306,8 @@ object Main {
       flagValue(SqliteCacheFlag, spec)(mebibytes).map(n => o.copy(sqlite = o.sqlite.copy(cacheMiB = n)))
     case SqliteMmapFlag(spec) =>
       flagValue(SqliteMmapFlag, spec)(mebibytes).map(n => o.copy(sqlite = o.sqlite.copy(mmapMiB = n)))
+    case LooseCompressionFlag(spec) =>
+      flagValue(LooseCompressionFlag, spec)(level).map(n => o.copy(looseCompression = n))
     case StallTimeoutFlag(spec) =>
       flagValue(StallTimeoutFlag, spec)(seconds).map(secs => o.copy(stallTimeoutSeconds = secs, stallExplicit = true))
     case other => Left(Messages.unknownFlag(other))
@@ -370,6 +384,7 @@ object Main {
 
     val src = openSrc(o.src)
     val dst = openOrInitDst(o.dst, borrowFrom = Option.when(o.alternates)(src.getObjectsDirectory.toPath))
+    setLooseCompression(dst, o.looseCompression)
     val mapping = openMapping(o, src, dst) match {
       case Right(m) => m
       case Left(refusal) =>
@@ -400,7 +415,8 @@ object Main {
       s"retokenize=${if (o.retokenize.isEmpty) "none" else o.retokenize.toVector.sorted.mkString(",")} " +
       s"memoDir=${orNone(o.memoDir)} tokenizerWorker=${orNone(o.tokenizerWorker)} " +
       s"alternates=${o.alternates} commitsPerTransaction=${o.commitsPerTransaction} " +
-      s"sqliteCacheMiB=${o.sqlite.cacheMiB} sqliteMmapMiB=${o.sqlite.mmapMiB}"
+      s"sqliteCacheMiB=${o.sqlite.cacheMiB} sqliteMmapMiB=${o.sqlite.mmapMiB} " +
+      s"looseCompression=${o.looseCompression}"
   }
 
   private final case class Refusal(status: Int, message: String)
@@ -532,6 +548,15 @@ object Main {
         writeAlternates(info.resolve("alternates"), objects)
         FileRepositoryBuilder.create(path.toFile).asInstanceOf[FileRepository]
     }
+  }
+
+  /** In memory only: dst's config file is not touched, so nothing that reads dst
+    * later (git repack, steps 3+) can see it. Object ids do not depend on it. JGit
+    * reads it when an inserter is created; a reload of the file would only bring
+    * back the default level, a speed loss, never a different object. */
+  private[blobexec] def setLooseCompression(dst: FileRepository, level: Int): Unit = {
+    val config = dst.getConfig  // loads the file first, if it changed
+    config.setInt("core", null, "compression", level)
   }
 
   /** One absolute line, replacing whatever was there: a resume writes the same
