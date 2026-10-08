@@ -77,6 +77,11 @@ object Main {
       |  --alternates               write <dst.git>/objects/info/alternates naming <src.git>'s objects
       |                             and copy no original blob; the caller must then repack <dst.git>
       |                             without -l and delete that file. Not with --shard
+      |  --commits-per-transaction=<n>
+      |                             commits whose mapping rows share one SQLite transaction
+      |                             (default ${Walker.DefaultCommitsPerTransaction}; 1 = one per commit)
+      |  --sqlite-cache-mb=<n>      SQLite page cache for the mapping DB (default ${Mapping.DefaultCacheMiB}; 0 = SQLite's 2 MB)
+      |  --sqlite-mmap-mb=<n>       memory-map up to this much of the mapping DB (default ${Mapping.DefaultMmapMiB}; 0 = off)
       |  --blob-timeout=<seconds>   budget for one <command> run (default ${BlobExec.DefaultTimeoutSeconds}); then its process
       |                             tree is killed and the blob excluded
       |  --stall-timeout=<seconds>  exit ${Walker.StalledExitStatus} after this long with no progress (default ${Walker.DefaultStallTimeoutSeconds});
@@ -107,6 +112,8 @@ object Main {
       memoDir: Option[Path] = None,
       tokenizerWorker: Option[Path] = None,
       alternates: Boolean = false,
+      commitsPerTransaction: Int = Walker.DefaultCommitsPerTransaction,
+      sqlite: Mapping.Tuning = Mapping.Tuning(),
       blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
       stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
       stallExplicit: Boolean = false,
@@ -228,9 +235,18 @@ object Main {
   private val TokenizerWorkerFlag   = new ValuedFlag("--tokenizer-worker")
   private val BlobTimeoutFlag       = new ValuedFlag("--blob-timeout")
   private val StallTimeoutFlag      = new ValuedFlag("--stall-timeout")
+  private val CommitsPerTxFlag      = new ValuedFlag("--commits-per-transaction")
+  private val SqliteCacheFlag       = new ValuedFlag("--sqlite-cache-mb")
+  private val SqliteMmapFlag        = new ValuedFlag("--sqlite-mmap-mb")
 
   private def flagValue[A](flag: ValuedFlag, spec: String)(parse: String => Either[String, A]): Either[String, A] =
     parse(spec).left.map(Messages.badFlagValue(flag.name, _))
+
+  private def positive(spec: String): Either[String, Int] =
+    spec.toIntOption.filter(_ > 0).toRight(s"must be a positive whole number [$spec]")
+
+  private def mebibytes(spec: String): Either[String, Int] =
+    spec.toIntOption.filter(_ >= 0).toRight(s"must be a whole number of MiB, 0 or more [$spec]")
 
   private def seconds(spec: String): Either[String, Int] =
     parsePositiveSeconds(spec).toRight(Messages.secondsWanted(spec))
@@ -272,6 +288,12 @@ object Main {
       Right(o.copy(tokenizerWorker = Some(Paths.get(spec))))
     case BlobTimeoutFlag(spec) =>
       flagValue(BlobTimeoutFlag, spec)(seconds).map(secs => o.copy(blobTimeoutSeconds = secs))
+    case CommitsPerTxFlag(spec) =>
+      flagValue(CommitsPerTxFlag, spec)(positive).map(n => o.copy(commitsPerTransaction = n))
+    case SqliteCacheFlag(spec) =>
+      flagValue(SqliteCacheFlag, spec)(mebibytes).map(n => o.copy(sqlite = o.sqlite.copy(cacheMiB = n)))
+    case SqliteMmapFlag(spec) =>
+      flagValue(SqliteMmapFlag, spec)(mebibytes).map(n => o.copy(sqlite = o.sqlite.copy(mmapMiB = n)))
     case StallTimeoutFlag(spec) =>
       flagValue(StallTimeoutFlag, spec)(seconds).map(secs => o.copy(stallTimeoutSeconds = secs, stallExplicit = true))
     case other => Left(Messages.unknownFlag(other))
@@ -376,13 +398,16 @@ object Main {
       s"maskWidened=${o.maskWidened} denylistEntries=${BlobDenylist.shipped.size} " +
       s"tokenizerIdentity=${if (o.tokenizerIdentity.isEmpty) "none" else o.tokenizerIdentity.render} " +
       s"retokenize=${if (o.retokenize.isEmpty) "none" else o.retokenize.toVector.sorted.mkString(",")} " +
-      s"memoDir=${orNone(o.memoDir)} tokenizerWorker=${orNone(o.tokenizerWorker)}"
+      s"memoDir=${orNone(o.memoDir)} tokenizerWorker=${orNone(o.tokenizerWorker)} " +
+      s"alternates=${o.alternates} commitsPerTransaction=${o.commitsPerTransaction} " +
+      s"sqliteCacheMiB=${o.sqlite.cacheMiB} sqliteMmapMiB=${o.sqlite.mmapMiB}"
   }
 
   private final case class Refusal(status: Int, message: String)
 
   private def openMapping(o: Options, src: FileRepository, dst: FileRepository): Either[Refusal, Mapping] =
-    Try(Mapping.open(o.db, o.command, o.mask, o.warm, widening(o, dst), o.tokenizerIdentity, retokenize(o, src, dst)))
+    Try(Mapping.open(o.db, o.command, o.mask, o.warm, widening(o, dst), o.tokenizerIdentity, retokenize(o, src, dst),
+                     o.sqlite))
       .toEither
       .left.map(e => refusalFor(e, o).getOrElse(throw e))
 
@@ -448,6 +473,7 @@ object Main {
         blobTimeoutSeconds = o.blobTimeoutSeconds,
         stallTimeoutSeconds = stallSeconds,
         workerPool = workerPool,
+        commitsPerTransaction = o.commitsPerTransaction,
         denylist = BlobDenylist.shipped
       ).run()
     finally workerPool.foreach(_.close())

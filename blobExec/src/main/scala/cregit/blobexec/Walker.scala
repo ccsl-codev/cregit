@@ -62,6 +62,9 @@ final class Walker(
     blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
     stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
     workerPool: Option[TokenizerWorkerPool] = None,
+    // Commits whose mapping rows share one SQLite transaction (Mapping.inGroupedTx).
+    // 1 is one transaction per commit, as before.
+    commitsPerTransaction: Int = Walker.DefaultCommitsPerTransaction,
     // A parameter only so tests can supply a fixture.
     denylist: BlobDenylist = BlobDenylist.shipped
 ) {
@@ -71,6 +74,15 @@ final class Walker(
   // pipelined producer reads while the consumer writes. Tokenizer workers never
   // touch it, so the CPU-heavy path stays lock-free.
   private val dbLock = new AnyRef
+
+  /** On the way out of a walk: the group holds finished commits only (a failed
+    * body rolled it back), so keeping them is right, and a commit error here
+    * must not hide the one already propagating. */
+  private def commitGroupQuietly(): Unit =
+    dbLock.synchronized {
+      try mapping.commitGroup()
+      catch { case scala.util.control.NonFatal(e) => System.err.println(s"warning: mapping commit failed: ${e.getMessage}") }
+    }
 
   private val blobCommandExecutions          = new LongAdder
   private val blobsTimedOut                  = new LongAdder
@@ -441,7 +453,7 @@ final class Walker(
 
           val newCommit = buildCommit(rc, parents, newTreeId, commitInserter)
 
-          mapping.inTx {
+          mapping.inGroupedTx(commitsPerTransaction, TransactionMaxNanos) {
             // Matching blobs the cmd resolved (Replace or Skip outcomes).
             resolved.foreach { case ((origSha, path), newId) =>
               mapping.putBlob(origSha, path, newId.name)
@@ -464,9 +476,11 @@ final class Walker(
         }
       }
 
+      mapping.commitGroup()
       treeInserter.flush()
       commitInserter.flush()
     } finally {
+      commitGroupQuietly()
       treeInserter.close()
       commitInserter.close()
       pool.shutdown()
@@ -568,7 +582,7 @@ final class Walker(
                   }.map(ObjectId.fromString)
                   val newCommit = buildCommitFromData(data, parents, newTreeId, commitInserter)
                   dbLock.synchronized {
-                    mapping.inTx {
+                    mapping.inGroupedTx(commitsPerTransaction, TransactionMaxNanos) {
                       resolved.foreach { case ((origSha, path), newId) =>
                         mapping.putBlob(origSha, path, newId.name)
                       }
@@ -594,9 +608,11 @@ final class Walker(
         }
       }
 
+      dbLock.synchronized(mapping.commitGroup())
       treeInserter.flush()
       commitInserter.flush()
     } finally {
+      commitGroupQuietly()
       treeInserter.close()
       commitInserter.close()
       pool.shutdown()
@@ -701,7 +717,7 @@ final class Walker(
                   }.map(ObjectId.fromString)
                   val newCommit = buildCommitFromData(data, parents, newTreeId, commitInserter)
                   dbLock.synchronized {
-                    mapping.inTx {
+                    mapping.inGroupedTx(commitsPerTransaction, TransactionMaxNanos) {
                       resolved.foreach { case ((origSha, path), newId) =>
                         mapping.putBlob(origSha, path, newId.name)
                       }
@@ -725,8 +741,10 @@ final class Walker(
         }
       }
 
+      dbLock.synchronized(mapping.commitGroup())
       commitInserter.flush()
     } finally {
+      commitGroupQuietly()
       commitInserter.close()
       pool.shutdown()
       if (!pool.awaitTermination(1, TimeUnit.MINUTES)) { pool.shutdownNow(); () }
@@ -1408,6 +1426,13 @@ final class Walker(
 }
 
 object Walker {
+  /** Commits per SQLite transaction. A crash or a watchdog halt loses at most this
+    * many commits' rows (or [[TransactionMaxNanos]] of them), and resume re-walks
+    * them. */
+  val DefaultCommitsPerTransaction = 256
+  /** A group is also committed once this old, so a slow stretch keeps its rows. */
+  val TransactionMaxNanos: Long = 2L * 1000L * 1000L * 1000L
+
 
   /** JGit's default `core.streamFileThreshold`, at or above which `getBytes`
     * throws. Only a fast path: [[Walker#readBlob]] also catches the exception. */

@@ -69,13 +69,14 @@ class AlternatesSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   private def walk(src: FileRepository, dstPath: Path, db: Path, cmd: String,
-                   borrow: Boolean, abortOnError: Boolean = false): WalkStats = {
+                   borrow: Boolean, abortOnError: Boolean = false,
+                   commitsPerTransaction: Int = Walker.DefaultCommitsPerTransaction): WalkStats = {
     val incremental = Files.isDirectory(dstPath)
     val dst = Main.openOrInitDst(dstPath, Option.when(borrow)(src.getObjectsDirectory.toPath))
     val mapping = Mapping.open(db, cmd, Mask)
     try new Walker(src, dst, mapping, Mask.r, cmd, abortOnError, 2, pipeline = true,
                    destinationMayContainObjects = incremental, borrowOriginalObjects = borrow,
-                   denylist = BlobDenylist.empty).run()
+                   denylist = BlobDenylist.empty, commitsPerTransaction = commitsPerTransaction).run()
     finally { mapping.close(); dst.close() }
   }
 
@@ -155,7 +156,7 @@ class AlternatesSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     Files.readString(clone.resolve("a.c")) shouldBe "INT A = BOOM;\n"
   }
 
-  test("an interrupted borrowing walk resumes to the same result") {
+  test("an interrupted borrowing walk resumes to the same result, with grouped transactions") {
     val w = Files.createTempDirectory(workRoot, "resume-")
     val src = sourceRepo(w.resolve("src")).getRepository.asInstanceOf[FileRepository]
     val flag = w.resolve("flag")
@@ -163,20 +164,21 @@ class AlternatesSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     val dst = w.resolve("dst.git")
     val db = w.resolve("dst.db")
 
-    // c3's BOOM blob aborts the walk after c1 and c2.
-    val first = walk(src, dst, db, cmd, borrow = true, abortOnError = true)
+    // c3's BOOM blob aborts the walk: c1 and c2 are done and must be durable even
+    // though they share one still-open transaction group.
+    val first = walk(src, dst, db, cmd, borrow = true, abortOnError = true, commitsPerTransaction = 100)
     first.aborted shouldBe true
     table(db, "SELECT count(*) FROM commit_map") shouldBe Vector("2")
 
     Files.createFile(flag)
-    val second = walk(src, dst, db, cmd, borrow = true, abortOnError = true)
+    val second = walk(src, dst, db, cmd, borrow = true, abortOnError = true, commitsPerTransaction = 100)
     second.aborted shouldBe false
     second.commitsProcessed shouldBe 3
     dissolve(dst)
 
-    // Reference: one uninterrupted copying walk.
+    // Reference: one uninterrupted copying walk, one commit per transaction.
     val ref = w.resolve("ref.git")
-    walk(src, ref, w.resolve("ref.db"), cmd, borrow = false).aborted shouldBe false
+    walk(src, ref, w.resolve("ref.db"), cmd, borrow = false, commitsPerTransaction = 1).aborted shouldBe false
     reachable(dst) shouldBe reachable(ref)
     refs(dst) shouldBe refs(ref)
     for (q <- MappingQueries) table(db, q) shouldBe table(w.resolve("ref.db"), q)

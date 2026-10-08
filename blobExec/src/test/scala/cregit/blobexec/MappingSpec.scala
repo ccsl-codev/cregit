@@ -441,4 +441,106 @@ class MappingSpec extends AnyFunSuite with Matchers {
       m.allCommitOrigShas.toSet shouldEqual Set("a", "b", "c")
     }
   }
+
+  // -- grouped transactions ----------------------------------------------------
+
+  /** What a second connection (another process, or the DB after a crash) sees. */
+  private def committedCommits(db: java.nio.file.Path): Int = {
+    val c = java.sql.DriverManager.getConnection(s"jdbc:sqlite:$db")
+    try {
+      val rs = c.createStatement().executeQuery("SELECT count(*) FROM commit_map")
+      rs.next(); rs.getInt(1)
+    } finally c.close()
+  }
+
+  private val Forever = Long.MaxValue
+
+  test("a group commits once it holds maxBodies bodies, and not before") {
+    val db = Files.createTempFile("mapping-group-", ".db")
+    val m = Mapping.open(db, "/bin/cat", ".*")
+    try {
+      m.inGroupedTx(3, Forever)(m.putCommit("c1", "n1"))
+      m.inGroupedTx(3, Forever)(m.putCommit("c2", "n2"))
+      committedCommits(db) shouldBe 0
+      m.getCommit("c2") shouldBe Some("n2")  // the writer reads its own open group
+      m.inGroupedTx(3, Forever)(m.putCommit("c3", "n3"))
+      committedCommits(db) shouldBe 3
+    } finally m.close()
+  }
+
+  test("a group also commits once it is maxNanos old") {
+    val db = Files.createTempFile("mapping-group-age-", ".db")
+    val m = Mapping.open(db, "/bin/cat", ".*")
+    try {
+      m.inGroupedTx(1000, 0L)(m.putCommit("c1", "n1"))
+      committedCommits(db) shouldBe 1
+    } finally m.close()
+  }
+
+  test("a body that throws rolls back its whole group and nothing committed before") {
+    val db = Files.createTempFile("mapping-group-throw-", ".db")
+    val m = Mapping.open(db, "/bin/cat", ".*")
+    try {
+      m.inGroupedTx(2, Forever)(m.putCommit("c1", "n1"))
+      m.inGroupedTx(2, Forever)(m.putCommit("c2", "n2"))   // group of 2 committed
+      m.inGroupedTx(2, Forever)(m.putCommit("c3", "n3"))   // open group
+      an[IllegalStateException] should be thrownBy
+        m.inGroupedTx(2, Forever) { m.putTree("t4", "n4"); throw new IllegalStateException("boom") }
+      m.getCommit("c3") shouldBe None
+      m.getTree("t4") shouldBe None
+      m.getCommit("c2") shouldBe Some("n2")
+      // And the connection is usable afterwards.
+      m.inGroupedTx(2, Forever)(m.putCommit("c5", "n5"))
+      m.commitGroup()
+      committedCommits(db) shouldBe 3
+    } finally m.close()
+  }
+
+  test("inTx and close commit an open group first") {
+    val db = Files.createTempFile("mapping-group-close-", ".db")
+    val m = Mapping.open(db, "/bin/cat", ".*")
+    m.inGroupedTx(10, Forever)(m.putCommit("c1", "n1"))
+    m.inTx(m.setMeta("k", "v"))
+    committedCommits(db) shouldBe 1
+    m.inGroupedTx(10, Forever)(m.putCommit("c2", "n2"))
+    m.close()
+    committedCommits(db) shouldBe 2
+  }
+
+  test("a lost open group is all-or-nothing: no commit row without its trees and blobs") {
+    // A crash is a connection that never commits: simulate it by abandoning the
+    // process's view (a second connection reads only what was committed).
+    val db = Files.createTempFile("mapping-group-crash-", ".db")
+    val m = Mapping.open(db, "/bin/cat", ".*")
+    try {
+      m.inGroupedTx(5, Forever) { m.putBlob("b1", "a.c", "nb1"); m.putTree("t1", "nt1"); m.putCommit("c1", "n1") }
+      committedCommits(db) shouldBe 0
+      val c = java.sql.DriverManager.getConnection(s"jdbc:sqlite:$db")
+      try {
+        val rs = c.createStatement().executeQuery(
+          "SELECT (SELECT count(*) FROM blob_map) + (SELECT count(*) FROM tree_map)")
+        rs.next(); rs.getInt(1) shouldBe 0
+      } finally c.close()
+    } finally m.close()
+  }
+
+  test("maxBodies of 1 is a transaction per body, as before") {
+    val db = Files.createTempFile("mapping-group-one-", ".db")
+    val m = Mapping.open(db, "/bin/cat", ".*")
+    try {
+      m.inGroupedTx(1, Forever)(m.putCommit("c1", "n1"))
+      committedCommits(db) shouldBe 1
+    } finally m.close()
+  }
+
+  test("the SQLite sizes reach the connection") {
+    val db = Files.createTempFile("mapping-tuning-", ".db")
+    val m = Mapping.open(db, "/bin/cat", ".*", tuning = Mapping.Tuning(cacheMiB = 64, mmapMiB = 128))
+    try {
+      m.pragmaValue("cache_size") shouldBe -64L * 1024L
+      m.pragmaValue("mmap_size") shouldBe 128L * 1024L * 1024L
+    } finally m.close()
+    val u = Mapping.open(db, "/bin/cat", ".*", tuning = Mapping.UntunedSqlite)
+    try u.pragmaValue("mmap_size") shouldBe 0L finally u.close()
+  }
 }
