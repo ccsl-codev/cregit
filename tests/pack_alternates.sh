@@ -165,6 +165,18 @@ for how in flag env gcnone; do
 done
 
 # ---------------------------------------------------------------------------
+echo "case 2b: CREGIT_BLOBEXEC_OPTS and CREGIT_BLOBEXEC_JAVA_OPTS reach blobExec"
+W=$(fixture); ARGV="$W/argv.log"
+OUT=$(CREGIT_BLOBEXEC_OPTS="--commits-per-transaction=1 --loose-compression=-1" \
+      CREGIT_BLOBEXEC_JAVA_OPTS="-Dorg.eclipse.jgit.util.sha1.implementation=java -XX:ActiveProcessorCount=3" \
+      STUB_ARGV="$ARGV" run_from "$W" 2)
+grep blobExec "$ARGV" | grep -q -- '--commits-per-transaction=1 --loose-compression=-1 '
+check "the blobExec flags, before the positional arguments" $?
+grep blobExec "$ARGV" | grep -q -- '^-Dorg.eclipse.jgit.util.sha1.implementation=java -XX:ActiveProcessorCount=3 -jar '
+check "the JVM flags, before -jar" $?
+rm -rf "$W"
+
+# ---------------------------------------------------------------------------
 echo "case 3: a failed pack stops the run, resumably, and leaves dst readable"
 W=$(fixture)
 OUT=$(STUB_LOCK_PACK=1 run_from "$W" 2); RC=$?

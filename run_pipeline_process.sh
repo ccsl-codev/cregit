@@ -128,6 +128,12 @@ Tokenizer:
                 after step 2 (git repack -a -d, without -l) copies them in once
                 and deletes that file. Same objects, half the step-2 work.
                 --gc none and --mode sharded always copy.
+                blobExec's other step-2 speed-ups are its defaults; opt out of
+                one through env CREGIT_BLOBEXEC_OPTS (blobExec flags, e.g.
+                "--commits-per-transaction=1 --sqlite-cache-mb=0
+                --sqlite-mmap-mb=0 --loose-compression=-1") and
+                CREGIT_BLOBEXEC_JAVA_OPTS (JVM flags, e.g.
+                -Dorg.eclipse.jgit.util.sha1.implementation=java).
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck. Each file is independent, so the output does not
@@ -959,7 +965,10 @@ else
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
   fi
-  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} $ALTERNATES_FLAG \
+  # Word-split on purpose: each holds several flags.
+  # shellcheck disable=SC2086
+  java ${CREGIT_BLOBEXEC_JAVA_OPTS:-} -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} $ALTERNATES_FLAG \
+    ${CREGIT_BLOBEXEC_OPTS:-} \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
     ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
