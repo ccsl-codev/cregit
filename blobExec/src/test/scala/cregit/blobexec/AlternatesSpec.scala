@@ -184,6 +184,41 @@ class AlternatesSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     for (q <- MappingQueries) table(db, q) shouldBe table(w.resolve("ref.db"), q)
   }
 
+  test("a crash that loses the open group resumes to the same result") {
+    val w = Files.createTempDirectory(workRoot, "crash-")
+    val src = sourceRepo(w.resolve("src")).getRepository.asInstanceOf[FileRepository]
+    val flag = w.resolve("flag")
+    val cmd = command(w, flag)
+    val dst = w.resolve("dst.git")
+    val db = w.resolve("dst.db")
+    val snapshot = w.resolve("snapshot.db")
+
+    // The DB as the last committed group left it: c1 and c2.
+    walk(src, dst, db, cmd, borrow = true, abortOnError = true, commitsPerTransaction = 100).aborted shouldBe true
+    Files.copy(db, snapshot)
+
+    // The walk goes on and writes c3..c5's objects to dst, then dies before
+    // their group commits: the DB rolls back to the snapshot, and no ref is
+    // projected yet. That is what a kill or the watchdog's halt leaves.
+    Files.createFile(flag)
+    walk(src, dst, db, cmd, borrow = true, commitsPerTransaction = 100).aborted shouldBe false
+    for (suffix <- Seq("", "-wal", "-shm")) Files.deleteIfExists(w.resolve("dst.db" + suffix))
+    Files.copy(snapshot, db)
+    git(dst, "for-each-ref", "--format=%(refname)")._2.linesIterator.foreach(r => git(dst, "update-ref", "-d", r)._1 shouldBe 0)
+    table(db, "SELECT count(*) FROM commit_map") shouldBe Vector("2")
+
+    val resumed = walk(src, dst, db, cmd, borrow = true, commitsPerTransaction = 100)
+    resumed.aborted shouldBe false
+    resumed.commitsProcessed shouldBe 3
+    dissolve(dst)
+
+    val ref = w.resolve("ref.git")
+    walk(src, ref, w.resolve("ref.db"), cmd, borrow = false, commitsPerTransaction = 1).aborted shouldBe false
+    reachable(dst) shouldBe reachable(ref)
+    refs(dst) shouldBe refs(ref)
+    for (q <- MappingQueries) table(db, q) shouldBe table(w.resolve("ref.db"), q)
+  }
+
   test("a resume reuses the alternates file, rewriting it rather than appending") {
     val w = Files.createTempDirectory(workRoot, "rewrite-")
     val src = sourceRepo(w.resolve("src")).getRepository.asInstanceOf[FileRepository]

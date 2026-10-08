@@ -20,6 +20,7 @@ check() {  # $1 = description, $2 = condition result (0/1)
 # As blobExec: dst gets one new commit on src's tree. With --alternates it
 # borrows that tree and its blobs; without, it copies them (git fetch).
 # STUB_LOCK_PACK=1 then makes objects/pack read-only, so a repack fails.
+# STUB_KILL_WALK=1 drops the ref again and SIGKILLs itself, as a killed walk.
 make_stub_java() {  # $1 = bin dir
     cat > "$1/java" <<'STUB'
 #!/usr/bin/env bash
@@ -50,6 +51,11 @@ git --git-dir="$dst" update-ref refs/heads/master "$c"
 git --git-dir="$dst" for-each-ref --format='%(refname)' refs/remotes | while read -r r; do
     git --git-dir="$dst" update-ref -d "$r"; done
 [ "${STUB_LOCK_PACK:-0}" = 1 ] && chmod a-w "$dst/objects/pack"
+# A walk killed mid-way: dst borrows and holds a new object, but no ref yet.
+if [ "${STUB_KILL_WALK:-0}" = 1 ]; then
+    git --git-dir="$dst" update-ref -d refs/heads/master
+    kill -9 $$
+fi
 exit 0
 STUB
     chmod +x "$1/java"
@@ -214,6 +220,32 @@ OUT=$( cd "$REPO" && STUB_LOCK_PACK=1 PATH="$BIN:$PATH" LEGACY_JAVA_HOME=/nonexi
 [ "$RC" -ne 0 ] && [ -f "$W/work/PACK-FAILED" ] && [ -d "$W/work/$DST" ]
 check "the EXIT trap kept \$WORK: the marker says it is resumable (exit $RC)" $?
 chmod -R u+w "$W" "$S"; rm -rf "$W" "$S"
+
+# ---------------------------------------------------------------------------
+echo "case 6: --gc aggressive borrows too, and its repack leaves dst whole"
+W=$(fixture); ARGV="$W/argv.log"
+OUT=$(STUB_ARGV="$ARGV" run_from "$W" --gc aggressive 2)
+grep 'blobExec' "$ARGV" | grep -q -- '--alternates'; check "blobExec was given --alternates" $?
+grep -q 'no longer borrows any' <<<"$OUT" && grep -q 'Step 3' <<<"$OUT"
+check "the runner packed the borrowed objects in and moved on" $?
+self_contained "$W/$DST"; check "dst has no alternates file and fsck passes without it" $?
+! compgen -G "$W/$DST/objects/pack/*.bitmap" >/dev/null; check "and no bitmap index" $?
+rm -rf "$W"
+
+# ---------------------------------------------------------------------------
+echo "case 7: a walk killed mid-way leaves dst borrowing; a step-2 resume finishes it"
+W=$(fixture)
+OUT=$(STUB_KILL_WALK=1 run_from "$W" 2); RC=$?
+[ "$RC" -ne 0 ] && ! grep -q 'Step 3' <<<"$OUT"; check "the run failed in step 2 (exit $RC)" $?
+[ -f "$W/$DST/objects/info/alternates" ] && [ -d "$W/proj-original.git" ]
+check "dst still borrows, and src is kept" $?
+OUT=$(run_from "$W" 2)
+grep -q 'no longer borrows any' <<<"$OUT" && grep -q 'Step 3' <<<"$OUT"
+check "the resume ran step 2 again, packed, and moved on" $?
+self_contained "$W/$DST"; check "dst is whole on its own" $?
+git clone -q "$W/$DST" "$W/clone" && [ -f "$W/clone/README" ] && [ ! -e "$W/clone/.git/objects/info/alternates" ]
+check "a step-6 style clone reads every file and borrows nothing" $?
+rm -rf "$W"
 
 echo ""
 echo "pack_alternates: $PASS passed, $FAIL failed"
