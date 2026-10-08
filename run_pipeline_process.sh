@@ -134,6 +134,8 @@ Tokenizer:
                 --sqlite-mmap-mb=0 --loose-compression=-1") and
                 CREGIT_BLOBEXEC_JAVA_OPTS (JVM flags, e.g.
                 -Dorg.eclipse.jgit.util.sha1.implementation=java).
+                The pack of the cregit repo writes no bitmap index (nothing
+                reads one); env CREGIT_WRITE_BITMAPS=1 writes it again.
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck. Each file is independent, so the output does not
@@ -186,7 +188,7 @@ dissolve_alternates() {
     fi
     log "packing $dst with the objects it borrows from $(cat "$alt")"
     if git --git-dir="$dst" pack-refs --all \
-        && git -c repack.writeBitmaps=false --git-dir="$dst" repack "${repack_args[@]}" \
+        && git ${NO_BITMAP_CFG[@]+"${NO_BITMAP_CFG[@]}"} --git-dir="$dst" repack "${repack_args[@]}" \
         && mv "$alt" "$alt.packing" \
         && git --git-dir="$dst" fsck --connectivity-only --no-dangling; then
         rm -f "$alt.packing" "${WORK}/PACK-FAILED"
@@ -217,6 +219,7 @@ dissolve_alternates() {
 # No bitmap index, here or in dissolve_alternates: git writes one by default for
 # a bare repo, it serves only fetches and clones over a transport, and nothing
 # does one (step 6 clones locally). It cost 1.4 h of Linux's 14.4 h gc.
+# CREGIT_WRITE_BITMAPS=1 gives git its default back.
 pack_cregit_repo() {
     if borrowing_objects; then
         dissolve_alternates
@@ -233,7 +236,7 @@ pack_cregit_repo() {
     esac
 
     # shellcheck disable=SC2086
-    if git -c repack.writeBitmaps=false --git-dir="$REPO_PATH_CREGIT_BARE" gc $gc_args; then
+    if git ${NO_BITMAP_CFG[@]+"${NO_BITMAP_CFG[@]}"} --git-dir="$REPO_PATH_CREGIT_BARE" gc $gc_args; then
         log "gc ($GC_MODE) done"
     else
         log "warning: gc ($GC_MODE) failed; the object store is still readable"
@@ -299,6 +302,10 @@ STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
 TOKENIZER_WORKER=0
 # 1: step 2 copies the original blobs into dst instead of borrowing them.
 COPY_OBJECTS="${CREGIT_COPY_OBJECTS:-0}"
+# The packs of dst get no bitmap index (see pack_cregit_repo) unless
+# CREGIT_WRITE_BITMAPS=1 asks for git's default.
+NO_BITMAP_CFG=(-c repack.writeBitmaps=false)
+if [ "${CREGIT_WRITE_BITMAPS:-0}" = 1 ]; then NO_BITMAP_CFG=(); fi
 
 KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED TOKENIZE-PARSER-CRASHES PACK-FAILED"
 

@@ -244,6 +244,20 @@ self_contained "$W/$DST"; check "dst has no alternates file and fsck passes with
 rm -rf "$W"
 
 # ---------------------------------------------------------------------------
+echo "case 6b: CREGIT_WRITE_BITMAPS=1 brings the bitmap index back, on both paths"
+for how in borrow copy; do
+    W=$(fixture)
+    case $how in
+        borrow) OUT=$(CREGIT_WRITE_BITMAPS=1 run_from "$W" 2) ;;
+        copy)   OUT=$(CREGIT_WRITE_BITMAPS=1 run_from "$W" --copy-objects 2) ;;
+    esac
+    grep -q 'Step 3' <<<"$OUT" && compgen -G "$W/$DST/objects/pack/*.bitmap" >/dev/null
+    check "$how: the pack has a bitmap index" $?
+    git --git-dir="$W/$DST" cat-file -e 'master:README'; check "$how: dst reads its files" $?
+    rm -rf "$W"
+done
+
+# ---------------------------------------------------------------------------
 echo "case 7: a walk killed mid-way leaves dst borrowing; a step-2 resume finishes it"
 W=$(fixture)
 OUT=$(STUB_KILL_WALK=1 run_from "$W" 2); RC=$?
