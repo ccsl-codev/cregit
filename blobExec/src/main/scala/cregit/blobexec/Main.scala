@@ -74,6 +74,9 @@ object Main {
       |                             --tokenizer-identity and --memo-dir; a no-op is refused (status ${RetokenizeIneffectiveExitStatus})
       |  --memo-dir=<dir>           the tokenizer memo ($$BFG_MEMO_DIR) that --retokenize purges
       |  --tokenizer-worker=<path>  tokenize through a pool of persistent workers; needs --pipeline(-trees)
+      |  --alternates               write <dst.git>/objects/info/alternates naming <src.git>'s objects
+      |                             and copy no original blob; the caller must then repack <dst.git>
+      |                             without -l and delete that file. Not with --shard
       |  --blob-timeout=<seconds>   budget for one <command> run (default ${BlobExec.DefaultTimeoutSeconds}); then its process
       |                             tree is killed and the blob excluded
       |  --stall-timeout=<seconds>  exit ${Walker.StalledExitStatus} after this long with no progress (default ${Walker.DefaultStallTimeoutSeconds});
@@ -103,6 +106,7 @@ object Main {
       retokenize: Set[String] = Set.empty,
       memoDir: Option[Path] = None,
       tokenizerWorker: Option[Path] = None,
+      alternates: Boolean = false,
       blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
       stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
       stallExplicit: Boolean = false,
@@ -136,6 +140,8 @@ object Main {
         "into, or the invalidation would leave the real memo's stale entries in place."
 
     val PipelinesExclusive = withUsage("Error: --pipeline and --pipeline-trees are mutually exclusive")
+    val AlternatesUnderShard = withUsage(
+      "Error: --alternates cannot be used with --shard: shard_merge.py copies each shard's own objects")
     val ShardWithPipeline = withUsage(
       "Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
     val MaskWidenedUnderShard = withUsage(
@@ -249,6 +255,7 @@ object Main {
     case "--pipeline"       => Right(o.copy(pipeline = true))
     case "--pipeline-trees" => Right(o.copy(pipelineTrees = true))
     case "--mask-widened"   => Right(o.copy(maskWidened = true))
+    case "--alternates"     => Right(o.copy(alternates = true))
     case TokenizerIdentityFlag(spec) =>
       flagValue(TokenizerIdentityFlag, spec)(TokenizerIdentity.parse).map(id => o.copy(tokenizerIdentity = id))
     case RetokenizeFlag(spec) =>
@@ -285,6 +292,7 @@ object Main {
       (retokenizing && o.shard.isDefined)           -> (() => Messages.RetokenizeUnderShard),
       (!retokenizing && o.memoDir.isDefined)        -> (() => Messages.MemoDirWithoutRetokenize),
       (o.shard.isDefined && o.anyPipeline)          -> (() => Messages.ShardWithPipeline),
+      (o.shard.isDefined && o.alternates)           -> (() => Messages.AlternatesUnderShard),
       o.tokenizerWorker.exists(p => !Files.isRegularFile(p) || !Files.isExecutable(p)) ->
         (() => Messages.workerNotExecutable(o.tokenizerWorker.get)),
       (o.tokenizerWorker.isDefined && !o.anyPipeline) -> (() => Messages.WorkerNeedsPipeline)
@@ -339,7 +347,7 @@ object Main {
     println(startLine(o, stallSeconds, incremental))
 
     val src = openSrc(o.src)
-    val dst = openOrInitDst(o.dst)
+    val dst = openOrInitDst(o.dst, borrowFrom = Option.when(o.alternates)(src.getObjectsDirectory.toPath))
     val mapping = openMapping(o, src, dst) match {
       case Right(m) => m
       case Left(refusal) =>
@@ -436,6 +444,7 @@ object Main {
         src, dst, mapping, o.mask.r, o.command, o.abortOnError, parallelism,
         o.pipeline, o.pipelineTrees, o.shard,
         destinationMayContainObjects = incremental,
+        borrowOriginalObjects = o.alternates,
         blobTimeoutSeconds = o.blobTimeoutSeconds,
         stallTimeoutSeconds = stallSeconds,
         workerPool = workerPool,
@@ -456,6 +465,7 @@ object Main {
       s"originalBlobDestinationLookups=${stats.originalBlobDestinationLookups} " +
       s"originalBlobBytesCopied=${stats.originalBlobBytesCopied} " +
       s"originalBlobBytesAvoided=${stats.originalBlobBytesAvoided} " +
+      s"originalBlobsBorrowed=${stats.originalBlobsBorrowed} " +
       s"refsProjected=${stats.refsProjected} " +
       s"blobsTimedOut=${stats.blobsTimedOut} " +
       s"blobsOversized=${stats.blobsOversized} " +
@@ -480,10 +490,31 @@ object Main {
     FileRepositoryBuilder.create(gitDir).asInstanceOf[FileRepository]
   }
 
-  private def openOrInitDst(path: Path): FileRepository = {
+  /** `borrowFrom` names src's objects directory: it is written to dst's
+    * objects/info/alternates BEFORE dst is opened for the walk, because JGit reads
+    * that file once, and a walk that skipped a copy must find the object there. */
+  private[blobexec] def openOrInitDst(path: Path, borrowFrom: Option[Path] = None): FileRepository = {
     val exists = Files.isDirectory(path)
     val repo = FileRepositoryBuilder.create(path.toFile).asInstanceOf[FileRepository]
     if (!exists) repo.create(true)
-    repo
+    borrowFrom match {
+      case None => repo
+      case Some(objects) =>
+        val info = repo.getObjectsDirectory.toPath.resolve("info")
+        repo.close()
+        Files.createDirectories(info)
+        writeAlternates(info.resolve("alternates"), objects)
+        FileRepositoryBuilder.create(path.toFile).asInstanceOf[FileRepository]
+    }
+  }
+
+  /** One absolute line, replacing whatever was there: a resume writes the same
+    * file again. Written to a temporary file and renamed, so git never reads half. */
+  private[blobexec] def writeAlternates(file: Path, objects: Path): Unit = {
+    val line = objects.toAbsolutePath.normalize.toString + "\n"
+    val tmp  = file.resolveSibling(file.getFileName.toString + ".tmp")
+    Files.write(tmp, line.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+      java.nio.file.StandardCopyOption.ATOMIC_MOVE)
   }
 }

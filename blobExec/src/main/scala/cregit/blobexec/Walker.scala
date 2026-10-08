@@ -35,7 +35,9 @@ final case class WalkStats(
     originalBlobCacheHits: Long,
     originalBlobDestinationLookups: Long,
     originalBlobBytesCopied: Long,
-    originalBlobBytesAvoided: Long
+    originalBlobBytesAvoided: Long,
+    /** Original blobs left in src, which dst reads through objects/info/alternates. */
+    originalBlobsBorrowed: Long = 0L
 )
 
 /** Rebuild `src` history into `dst`, persisting mappings to `mapping`.
@@ -53,6 +55,10 @@ final class Walker(
     shard: Option[(Int, Int)] = None,
     deduplicateOriginalBlobs: Boolean = true,
     destinationMayContainObjects: Boolean = true,
+    // dst's objects/info/alternates names src's objects: an original blob is
+    // already readable from dst, so it is never copied. The caller must repack dst
+    // without -l before dropping the alternates file (run_pipeline_process.sh does).
+    borrowOriginalObjects: Boolean = false,
     blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
     stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
     workerPool: Option[TokenizerWorkerPool] = None,
@@ -79,6 +85,7 @@ final class Walker(
   private val originalBlobDestinationLookups = new LongAdder
   private val originalBlobBytesCopied        = new LongAdder
   private val originalBlobBytesAvoided       = new LongAdder
+  private val originalBlobsBorrowed          = new LongAdder
 
   // -- stall watchdog ------------------------------------------------------
   // `Await.result` is unbounded: a duration cannot tell a wedged run from a large
@@ -215,7 +222,8 @@ final class Walker(
         originalBlobCacheHits       = originalBlobCacheHits.sum(),
         originalBlobDestinationLookups = originalBlobDestinationLookups.sum(),
         originalBlobBytesCopied     = originalBlobBytesCopied.sum(),
-        originalBlobBytesAvoided    = originalBlobBytesAvoided.sum()
+        originalBlobBytesAvoided    = originalBlobBytesAvoided.sum(),
+        originalBlobsBorrowed       = originalBlobsBorrowed.sum()
       )
     } finally revWalk.close()
   }
@@ -1138,6 +1146,13 @@ final class Walker(
     originalBlobCopyRequests.increment()
     // Copying a 435 GB repository's unmasked blobs is work, not a stall.
     progress(s"original blob ${id.name}")
+
+    // Borrowed: src holds the blob and dst reads src's objects, so there is
+    // nothing to write. The pass-through copy was half the consumer's time.
+    if (borrowOriginalObjects) {
+      originalBlobsBorrowed.increment()
+      return
+    }
 
     if (!deduplicateOriginalBlobs) {
       val (_, size) = insertBlob(inserter)

@@ -85,6 +85,9 @@ Output:
                                   with millions of loose objects.
                     A failed pack never aborts the run: the Parquet dataset is
                     the product, and packing only makes later steps faster.
+                    Except while the cregit repo borrows objects (see
+                    --copy-objects): that pack is required, and a failed one
+                    stops the run, resumably, with a PACK-FAILED marker.
   --memory-limit SIZE
                     cap the DuckDB heap in the dataset generator (step 10).
                     Omit to accept that script's own default of 8GB. Takes an
@@ -117,6 +120,14 @@ Tokenizer:
   --tokenizer-worker
                 tokenize through a pool of persistent tokenizer processes; same
                 output. Needs --mode pipeline or pipeline-trees (default: off)
+  --copy-objects
+                copy every untokenized original blob into the cregit repo during
+                step 2, as before (env CREGIT_COPY_OBJECTS=1 does the same).
+                By default step 2 copies none: the cregit repo reads them from
+                the original repo through objects/info/alternates, and the pack
+                after step 2 (git repack -a -d, without -l) copies them in once
+                and deletes that file. Same objects, half the step-2 work.
+                --gc none and --mode sharded always copy.
   --jobs N      concurrent blame/HTML processes (default: CREGIT_JOBS,
                 otherwise min(4, available CPUs)). Blame is the pipeline's
                 bottleneck. Each file is independent, so the output does not
@@ -144,9 +155,64 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+# True while dst reads objects from src (blobExec --alternates). `.packing` is
+# the file set aside while fsck proves dst complete without it.
+borrowing_objects() {
+    [ -e "$REPO_PATH_CREGIT_BARE/objects/info/alternates" ] \
+        || [ -e "$REPO_PATH_CREGIT_BARE/objects/info/alternates.packing" ]
+}
+
+# Copies the borrowed objects into dst and stops the borrowing. Not optional, as
+# packing otherwise is: until this succeeds dst is unreadable without src.
+#   repack -a -d   one pack of every reachable object, the borrowed ones too:
+#                  WITHOUT -l, which would leave them out
+#   fsck           run with the alternates file set aside, so it proves that dst
+#                  is complete on its own; the file is deleted only after that
+# A failure puts the file back (dst readable again), writes PACK-FAILED and stops
+# the run; any resume retries this first.
+dissolve_alternates() {
+    local dst="$REPO_PATH_CREGIT_BARE" alt="$REPO_PATH_CREGIT_BARE/objects/info/alternates"
+    local repack_args=(-a -d)
+    [ "$GC_MODE" = aggressive ] && repack_args+=(-f --depth=50 --window=250)
+    # A run killed during fsck left the file set aside: put it back first.
+    if [ -e "$alt.packing" ] && [ ! -e "$alt" ]; then
+        mv "$alt.packing" "$alt"
+    fi
+    log "packing $dst with the objects it borrows from $(cat "$alt")"
+    if git --git-dir="$dst" pack-refs --all \
+        && git --git-dir="$dst" repack "${repack_args[@]}" \
+        && mv "$alt" "$alt.packing" \
+        && git --git-dir="$dst" fsck --connectivity-only --no-dangling; then
+        rm -f "$alt.packing" "${WORK}/PACK-FAILED"
+        # What gc does after its repack; neither one is needed for correctness.
+        git --git-dir="$dst" prune --expire=now \
+            || log "warning: git prune failed; unreachable loose objects stay"
+        git --git-dir="$dst" commit-graph write --reachable \
+            || log "warning: commit-graph write failed; later steps walk history more slowly"
+        log "pack done: $dst holds all its objects and no longer borrows any"
+        return 0
+    fi
+    if [ -e "$alt.packing" ] && [ ! -e "$alt" ]; then
+        mv "$alt.packing" "$alt"
+    fi
+    local summary="the pack that copies the borrowed original blobs into $dst failed.
+     $dst still reads them from $REPO_PATH_ORIGINAL_BARE (objects/info/alternates),
+     so it is readable, but it must not outlive that repo. Free memory or disk."
+    write_resume_marker "PACK-FAILED" "git repack -a -d" 1 "$summary"
+    die "$summary
+     Marker: ${WORK}/PACK-FAILED
+     Resume at step 3: the runner retries the pack before anything else.
+       run_pipeline_process.sh:  $0 [same flags] 3
+       ctp.py (the external driver):  python3 ctp.py run [same flags] --from-step 3"
+}
+
 # Packs the generated bare repo, as --gc selects. A gc failure only warns: under
 # `set -e` it would fire the EXIT trap, which deletes $WORK and every finished step.
 pack_cregit_repo() {
+    if borrowing_objects; then
+        dissolve_alternates
+        return 0
+    fi
     case "$GC_MODE" in
         none)
             log "gc skipped (--gc none)"
@@ -222,8 +288,10 @@ RETOKENIZE=""
 BLOB_TIMEOUT="${CREGIT_BLOB_TIMEOUT:-}"
 STALL_TIMEOUT="${CREGIT_STALL_TIMEOUT:-}"
 TOKENIZER_WORKER=0
+# 1: step 2 copies the original blobs into dst instead of borrowing them.
+COPY_OBJECTS="${CREGIT_COPY_OBJECTS:-0}"
 
-KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED TOKENIZE-PARSER-CRASHES"
+KEEP_MARKERS="TOKENIZE-TIMEOUTS TOKENIZE-STALLED TOKENIZE-PARSER-CRASHES PACK-FAILED"
 
 keep_markers_present() {
     local m
@@ -384,6 +452,7 @@ while [ $# -gt 0 ]; do
         --retokenize) need_val "$@"; RETOKENIZE="$2"; shift 2 ;;
         --blob-timeout)  need_val "$@"; BLOB_TIMEOUT="$2"; shift 2 ;;
         --tokenizer-worker) TOKENIZER_WORKER=1; shift ;;
+        --copy-objects) COPY_OBJECTS=1; shift ;;
         --stall-timeout) need_val "$@"; STALL_TIMEOUT="$2"; shift 2 ;;
         --gc)         need_val "$@"; GC_MODE="$2"; shift 2 ;;
         --memory-limit)   need_val "$@"; MEMORY_LIMIT="$2"; shift 2 ;;
@@ -877,12 +946,17 @@ else
   [ "$MASK_WIDENED" = 1 ] && WIDENED_FLAG="--mask-widened"
   WORKER_FLAG=""
   [ "$TOKENIZER_WORKER" = 1 ] && WORKER_FLAG="--tokenizer-worker=${CREGIT}/tokenizeByBlobId/tokenWorker.pl"
+  # Borrowing needs the pack that dissolves it, so --gc none copies instead.
+  ALTERNATES_FLAG=""
+  if [ "$COPY_OBJECTS" != 1 ] && [ "$GC_MODE" != none ]; then
+      ALTERNATES_FLAG="--alternates"
+  fi
   # blobExec refuses --retokenize without --memo-dir: the memo caches the same tokens.
   RETOKENIZE_FLAGS=()
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
   fi
-  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} \
+  java -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} $ALTERNATES_FLAG \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
     ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
@@ -914,6 +988,13 @@ fi
 pack_cregit_repo
 fi
 end_step
+
+# A resume past step 2 can find dst still borrowing: the pack failed or was
+# killed. Steps 3+ must not start on that, so the pack runs first.
+if [ "$FROM_STEP" -gt 2 ] && [ -d "$REPO_PATH_CREGIT_BARE" ] && borrowing_objects; then
+    log "resume: $REPO_PATH_CREGIT_BARE still borrows objects; packing it before step $FROM_STEP"
+    dissolve_alternates
+fi
 
 # ---------------------------------------------------------------------------
 # Step 3 — git log DB (original repo)
