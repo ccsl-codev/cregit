@@ -180,7 +180,7 @@ dissolve_alternates() {
     fi
     log "packing $dst with the objects it borrows from $(cat "$alt")"
     if git --git-dir="$dst" pack-refs --all \
-        && git --git-dir="$dst" repack "${repack_args[@]}" \
+        && git -c repack.writeBitmaps=false --git-dir="$dst" repack "${repack_args[@]}" \
         && mv "$alt" "$alt.packing" \
         && git --git-dir="$dst" fsck --connectivity-only --no-dangling; then
         rm -f "$alt.packing" "${WORK}/PACK-FAILED"
@@ -208,6 +208,9 @@ dissolve_alternates() {
 
 # Packs the generated bare repo, as --gc selects. A gc failure only warns: under
 # `set -e` it would fire the EXIT trap, which deletes $WORK and every finished step.
+# No bitmap index, here or in dissolve_alternates: git writes one by default for
+# a bare repo, it serves only fetches and clones over a transport, and nothing
+# does one (step 6 clones locally). It cost 1.4 h of Linux's 14.4 h gc.
 pack_cregit_repo() {
     if borrowing_objects; then
         dissolve_alternates
@@ -224,7 +227,7 @@ pack_cregit_repo() {
     esac
 
     # shellcheck disable=SC2086
-    if git --git-dir="$REPO_PATH_CREGIT_BARE" gc $gc_args; then
+    if git -c repack.writeBitmaps=false --git-dir="$REPO_PATH_CREGIT_BARE" gc $gc_args; then
         log "gc ($GC_MODE) done"
     else
         log "warning: gc ($GC_MODE) failed; the object store is still readable"

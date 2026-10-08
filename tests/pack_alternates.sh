@@ -138,6 +138,7 @@ self_contained "$W/$DST"; check "dst has no alternates file and fsck passes with
 git --git-dir="$W/$DST" count-objects -v | grep -q '^count: 0'
 check "every object is packed, none left loose" $?
 [ ! -e "$W/PACK-FAILED" ]; check "no PACK-FAILED marker" $?
+! compgen -G "$W/$DST/objects/pack/*.bitmap" >/dev/null; check "and no bitmap index" $?
 git clone -q "$W/$DST" "$W/clone" && [ -f "$W/clone/README" ] && [ ! -e "$W/clone/.git/objects/info/alternates" ]
 check "a step-6 style clone reads every file and borrows nothing" $?
 rm -rf "$W"
@@ -155,6 +156,11 @@ for how in flag env gcnone; do
     check "$how: blobExec was NOT given --alternates" $?
     [ ! -e "$W/$DST/objects/info/alternates" ] && git --git-dir="$W/$DST" cat-file -e 'master:README'
     check "$how: dst holds its objects without borrowing" $?
+    if [ "$how" = flag ]; then
+        compgen -G "$W/$DST/objects/pack/*.pack" >/dev/null \
+            && ! compgen -G "$W/$DST/objects/pack/*.bitmap" >/dev/null
+        check "$how: gc packed dst, without a bitmap index" $?
+    fi
     rm -rf "$W"
 done
 
