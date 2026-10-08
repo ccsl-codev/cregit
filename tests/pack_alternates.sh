@@ -180,6 +180,17 @@ grep blobExec "$ARGV" | grep -q -- '--commits-per-transaction=1 --loose-compress
 check "the blobExec flags, before the positional arguments" $?
 grep blobExec "$ARGV" | grep -q -- '^-Dorg.eclipse.jgit.util.sha1.implementation=java -XX:ActiveProcessorCount=3 -jar '
 check "the JVM flags, before -jar" $?
+grep -q 'blobExec flags from CREGIT_BLOBEXEC_OPTS: --commits-per-transaction=1 --loose-compression=-1' <<<"$OUT" \
+    && grep -q 'JVM flags from CREGIT_BLOBEXEC_JAVA_OPTS: -Dorg' <<<"$OUT"
+check "and both are logged" $?
+rm -rf "$W"
+# The runner runs in $REPO: a file there is what an unquoted --x=* would match.
+W=$(fixture); ARGV="$W/argv.log"; touch "$REPO/--x=bait"
+OUT=$(CREGIT_BLOBEXEC_OPTS="--x=*" STUB_ARGV="$ARGV" run_from "$W" 2)
+rm -f "$REPO/--x=bait"
+grep blobExec "$ARGV" | grep -qF -- ' --x=* '; check "a * in the flags is passed as is, not glob-expanded" $?
+OUT=$(STUB_ARGV="$W/argv2.log" run_from "$W" 2)
+! grep -q 'from CREGIT_BLOBEXEC' <<<"$OUT"; check "unset, nothing is logged" $?
 rm -rf "$W"
 
 # ---------------------------------------------------------------------------

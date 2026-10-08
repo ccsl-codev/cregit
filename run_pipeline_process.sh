@@ -965,10 +965,15 @@ else
   if [ -n "$RETOKENIZE" ]; then
       RETOKENIZE_FLAGS=("--retokenize=$RETOKENIZE" "--memo-dir=$MEMO_DIR")
   fi
-  # Word-split on purpose: each holds several flags.
+  # Each holds several flags: split on blanks, but never glob-expanded. Logged,
+  # because a stray export would change every run without a trace.
+  read -r -a BLOBEXEC_OPTS <<< "${CREGIT_BLOBEXEC_OPTS:-}"
+  read -r -a BLOBEXEC_JAVA_OPTS <<< "${CREGIT_BLOBEXEC_JAVA_OPTS:-}"
+  [ ${#BLOBEXEC_OPTS[@]} -gt 0 ] && log "blobExec flags from CREGIT_BLOBEXEC_OPTS: ${BLOBEXEC_OPTS[*]}"
+  [ ${#BLOBEXEC_JAVA_OPTS[@]} -gt 0 ] && log "JVM flags from CREGIT_BLOBEXEC_JAVA_OPTS: ${BLOBEXEC_JAVA_OPTS[*]}"
   # shellcheck disable=SC2086
-  java ${CREGIT_BLOBEXEC_JAVA_OPTS:-} -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} $ALTERNATES_FLAG \
-    ${CREGIT_BLOBEXEC_OPTS:-} \
+  java ${BLOBEXEC_JAVA_OPTS[@]+"${BLOBEXEC_JAVA_OPTS[@]}"} -jar "$BFG" $MODE_FLAG $WIDENED_FLAG ${WORKER_FLAG:+"$WORKER_FLAG"} $ALTERNATES_FLAG \
+    ${BLOBEXEC_OPTS[@]+"${BLOBEXEC_OPTS[@]}"} \
     "--tokenizer-identity=$TOKENIZER_IDENTITY" \
     ${RETOKENIZE_FLAGS[@]+"${RETOKENIZE_FLAGS[@]}"} \
     ${BLOB_TIMEOUT:+--blob-timeout=$BLOB_TIMEOUT} \
