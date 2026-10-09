@@ -121,9 +121,27 @@ numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
 Fifteen `LIST(TEXT)` columns, never NULL: absence is an empty list, so test with
 `len(footer_reviewed_by) = 0`. Source is the `footers` table of the original
 log DB (`<repo>-original.db`, Step 3 output), grouped by commit and joined on
-`original_commit_sha`. Keys are matched case-insensitively, and each list is in
-`footers.idx` order, with one value for each trailer line. The trailers are
+`original_commit_sha`. Keys are matched case-insensitively. The trailers are
 JGit's `getFooterLines` of the original commit message.
+
+Each of the 13 typed lists holds **one entry per person**, not the raw trailer
+lines. A message can name one person twice, with the same text or with another
+address (for example `Borislav Petkov (AMD) <bp@alien8.de>` and
+`Borislav Petkov <bp@suse.de>`). In one list, two values are the same person
+when:
+
+- their addresses resolve to the same `personid`. The address is the one that
+  `footer_personids` uses: the address inside `<…>`, else a bare address. It
+  is matched against `emails.emailaddr`. If the `emails` rows of one address
+  name two persons, the lowest `personid` is used.
+- their addresses are not in `emails`, and the lowercased addresses are equal.
+
+A value with no address is kept as it is and is never merged, also when its
+text repeats. For each person, the list keeps the value with the lowest
+`footers.idx`, at the place of that idx, so the list is in the order of the
+first trailer line of each person. The rule works in each list separately: one
+person can be in `footer_signed_off_by` and in `footer_reviewed_by`.
+`footer_personids` and `footer_person_names` do not change: they are sets.
 
 The source is not `cregit.db`. In the cregit repository, blobExec appends
 `"\n" + "Former-commit-id: <sha>"` to a message whose last paragraph has
