@@ -601,6 +601,22 @@ def test_a_cli_message_keeps_its_signed_off_by_and_reviewed_by(monkeypatch, tmp_
     assert list(names) == ["A Dev", "Bob B"]
 
 
+def test_an_address_with_two_names_does_not_repeat_the_trailer(monkeypatch, tmp_path):
+    """The persons DB has one emails row for each name that an address
+    committed with. The join to emails must not repeat the trailer."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reviewed-by", "Bob B <bob@example.com>"),
+        ("Reviewed-by", "Bob B <bob@example.com>"),
+        people=[("bob", "bob@example.com", "Bob B"),
+                ("bob", "bob@example.com", "bob-laptop")]))
+
+    ids, names, reviewed = footers_of(duckdb, out)
+    assert list(reviewed) == ["Bob B <bob@example.com>"] * 2   # two lines, two values
+    assert list(ids) == ["bob"]
+    assert list(names) == ["Bob B"]
+
+
 def test_the_trailers_of_the_cregit_db_are_not_read(monkeypatch, tmp_path):
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path, seed=seed_footers(

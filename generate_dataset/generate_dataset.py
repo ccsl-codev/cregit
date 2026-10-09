@@ -826,8 +826,8 @@ def main():
                 coalesce(ftr.footer_mentored_by, [])         AS footer_mentored_by,
                 coalesce(ftr.footer_assisted_by, [])        AS footer_assisted_by,
                 coalesce(ftr.footer_thanks_to, [])           AS footer_thanks_to,
-                coalesce(ftr.footer_personids, [])           AS footer_personids,
-                coalesce(ftr.footer_person_names, [])        AS footer_person_names
+                coalesce(fpr.footer_personids, [])           AS footer_personids,
+                coalesce(fpr.footer_person_names, [])        AS footer_person_names
 
             FROM token_map t
             JOIN commits c                ON t.commit_sha = c.cid
@@ -850,18 +850,27 @@ def main():
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'helped-by')           AS footer_helped_by,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'mentored-by')         AS footer_mentored_by,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'assisted-by')         AS footer_assisted_by,
-                    list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'thanks-to')           AS footer_thanks_to,
-                    list(DISTINCT fe.personid ORDER BY fe.personid)
-                        FILTER (WHERE fe.personid IS NOT NULL)                                           AS footer_personids,
-                    list(DISTINCT coalesce(fpn.personname, fe.personid)
-                        ORDER BY coalesce(fpn.personname, fe.personid))
-                        FILTER (WHERE coalesce(fpn.personname, fe.personid) IS NOT NULL)                AS footer_person_names
+                    list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'thanks-to')           AS footer_thanks_to
                 -- The trailers come from the original repository, keyed by
                 -- the original commit SHA. In the cregit repository, blobExec
                 -- appends "\\n" + "Former-commit-id: X" to a message whose last
                 -- paragraph has trailers. When that message ends in "\\n" (the
                 -- git CLI writes it so), a blank line comes before the new
                 -- trailer, and JGit then sees only Former-commit-id.
+                FROM original_log.footers f
+                GROUP BY f.cid
+            ) ftr ON coalesce(m.originalcid, t.commit_sha) = ftr.cid
+            -- A separate subquery, so that the emails join cannot repeat a
+            -- trailer in the lists above: one address can have many emails
+            -- rows, one for each name that it committed with.
+            LEFT JOIN (
+                SELECT
+                    f.cid,
+                    list(DISTINCT fe.personid ORDER BY fe.personid)
+                        FILTER (WHERE fe.personid IS NOT NULL)                                           AS footer_personids,
+                    list(DISTINCT coalesce(fpn.personname, fe.personid)
+                        ORDER BY coalesce(fpn.personname, fe.personid))
+                        FILTER (WHERE coalesce(fpn.personname, fe.personid) IS NOT NULL)                AS footer_person_names
                 FROM original_log.footers f
                 -- regexp_extract returns '' rather than NULL on no match, so
                 -- without nullif a no-address trailer joins on '' and matches
@@ -873,7 +882,7 @@ def main():
                     )
                 LEFT JOIN persons fpn ON fe.personid = fpn.personid
                 GROUP BY f.cid
-            ) ftr ON coalesce(m.originalcid, t.commit_sha) = ftr.cid
+            ) fpr ON coalesce(m.originalcid, t.commit_sha) = fpr.cid
 
             ORDER BY t.file_path, t.token_index
         ) TO '{output_path}'

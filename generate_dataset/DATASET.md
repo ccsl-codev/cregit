@@ -122,8 +122,8 @@ Fifteen `LIST(TEXT)` columns, never NULL: absence is an empty list, so test with
 `len(footer_reviewed_by) = 0`. Source is the `footers` table of the original
 log DB (`<repo>-original.db`, Step 3 output), grouped by commit and joined on
 `original_commit_sha`. Keys are matched case-insensitively, and each list is in
-`footers.idx` order. The trailers are JGit's `getFooterLines` of the original
-commit message.
+`footers.idx` order, with one value for each trailer line. The trailers are
+JGit's `getFooterLines` of the original commit message.
 
 The source is not `cregit.db`. In the cregit repository, blobExec appends
 `"\n" + "Former-commit-id: <sha>"` to a message whose last paragraph has
