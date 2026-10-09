@@ -1,0 +1,129 @@
+diff --git a/src/parser/CommentTextLexer.g b/src/parser/CommentTextLexer.g
+index d6d0c138a..5bf81cf32 100644
+--- a/src/parser/CommentTextLexer.g
++++ b/src/parser/CommentTextLexer.g
+@@ -232,7 +232,17 @@ COMMENT_TEXT {
+                 in_squotes = true;
+         }
+         (options { greedy = true; } :
+-            { !skip_dquote_processing && (prevLA != '\\' || noescape) }?
++            // in C, C++, and Objective-C, "a""b" is two adjacent string literals:
++            // the quote that ends a string must not take the quote that starts the next one
++            {
++                !skip_dquote_processing
++                && (prevLA != '\\' || noescape)
++                && !(
++                    mode == STRING_END
++                    && !noescape
++                    && (inLanguage(LANGUAGE_C) || inLanguage(LANGUAGE_CXX) || inLanguage(LANGUAGE_OBJECTIVE_C))
++                )
++            }?
+             '\042'
+             {
+                 ++dquote_count;
+diff --git a/src/parser/srcMLParser.g b/src/parser/srcMLParser.g
+index bc1b573d3..d1b18da94 100644
+--- a/src/parser/srcMLParser.g
++++ b/src/parser/srcMLParser.g
+@@ -766,6 +766,11 @@ public:
+     bool in_template_param = false;
+     int start_count = 0;
+ 
++    // The token at which the function-name rule last matched nothing; see
++    // statement_part's function-identifier alternative. A reference, not a
++    // pointer, keeps that token alive, so no later token can reuse its address.
++    antlr::RefToken function_name_stuck_at;
++
+     static const antlr::BitSet keyword_name_token_set;
+     static const antlr::BitSet keyword_token_set;
+     static const antlr::BitSet macro_call_token_set;
+@@ -5387,6 +5392,7 @@ statement_part[] {
+         CALL_TYPE type = NOCALL;
+         bool isempty = false;
+         int call_count = 0;
++        antlr::RefToken function_name_start;
+         ENTRY_DEBUG
+ } :
+         { inMode(MODE_EAT_TYPE) }?
+@@ -5610,7 +5616,21 @@ statement_part[] {
+ 
+         // function identifier
+         { inMode(MODE_FUNCTION_NAME) }?
+-        function_header[0] |
++        { function_name_start = LT(1); }
++        function_header[0]
++        {
++            // function_header[0] can match nothing, e.g., at auto after a type that a
++            // leading macro made too long. Once is harmless: another rule can still
++            // consume that token. Twice at the same token is a loop, because start()
++            // calls this rule again in the same state, so leave function-name mode.
++            if (LT(1).get() != function_name_start.get())
++                function_name_stuck_at = antlr::RefToken();
++            else if (function_name_stuck_at.get() == function_name_start.get()) {
++                function_name_stuck_at = antlr::RefToken();
++                clearMode(MODE_FUNCTION_NAME);
++            } else
++                function_name_stuck_at = function_name_start;
++        } |
+ 
+         // function identifier
+         { inMode(MODE_FUNCTION_PARAMETER) }?
+diff --git a/test/parser/testsuite/string_adjacent.cpp.xml b/test/parser/testsuite/string_adjacent.cpp.xml
+new file mode 100644
+index 000000000..5e85d85bc
+--- /dev/null
++++ b/test/parser/testsuite/string_adjacent.cpp.xml
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<unit xmlns="http://www.srcML.org/srcML/src" revision="1.0.0" language="C++" url="string_adjacent">
++
++<unit xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C++">
++<expr_stmt><expr><literal type="string">"a"</literal><literal type="string">"b"</literal></expr>;</expr_stmt>
++</unit>
++
++<unit xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C++">
++<expr_stmt><expr><literal type="string">""</literal><literal type="string">""</literal></expr>;</expr_stmt>
++</unit>
++
++<unit xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C++">
++<expr_stmt><expr><literal type="string">"a\""</literal><literal type="string">"b"</literal></expr>;</expr_stmt>
++</unit>
++
++</unit>
+diff --git a/test/parser/testsuite/suite.txt b/test/parser/testsuite/suite.txt
+index 3811cb22f..9df797c1e 100644
+--- a/test/parser/testsuite/suite.txt
++++ b/test/parser/testsuite/suite.txt
+@@ -1,5 +1,6 @@
+ LANGUAGE_ALL_NO_PYTHON comment
+ LANGUAGE_ALL_NO_PYTHON string
++LANGUAGE_C_FAMILY_NO_SHARP string_adjacent
+ LANGUAGE_ALL_BASE variable_names
+ LANGUAGE_ALL_NO_PYTHON expression
+ LANGUAGE_ALL_NO_PYTHON decl_simple
+@@ -46,6 +47,7 @@ LANGUAGE_CXX enum
+ LANGUAGE_C_FAMILY for
+ #LANGUAGE_C_FAMILY auto
+ LANGUAGE_CXX auto
++LANGUAGE_CXX template_after_macro
+ #LANGUAGE_C_FAMILY block_lambda
+ LANGUAGE_CXX block_lambda
+ #LANGUAGE_C_FAMILY cuda
+diff --git a/test/parser/testsuite/template_after_macro.cpp.xml b/test/parser/testsuite/template_after_macro.cpp.xml
+new file mode 100644
+index 000000000..eff461c78
+--- /dev/null
++++ b/test/parser/testsuite/template_after_macro.cpp.xml
+@@ -0,0 +1,12 @@
++<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
++<unit xmlns="http://www.srcML.org/srcML/src" revision="1.0.0" language="C++" url="template_after_macro">
++
++<unit xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C++">
++<decl_stmt><decl><type><name>X</name> <specifier>template</specifier> <name/>&lt;class</type> <name>R</name>&gt; auto <name>a</name></decl>;</decl_stmt>
++</unit>
++
++<unit xmlns:cpp="http://www.srcML.org/srcML/cpp" revision="1.0.0" language="C++">
++<decl_stmt><decl><type><name>X</name> <specifier>template</specifier> <name/>&lt;class</type> <name>R</name>&gt; const <name>a</name></decl>;</decl_stmt>
++</unit>
++
++</unit>
