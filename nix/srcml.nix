@@ -1,6 +1,22 @@
 # srcML develop at d38271916: it fixes the heap corruption on a GCC attribute
 # after an expression in parentheses (srcML/srcML#2425), which 1.1.0 dies on.
 # No release carries the fix yet; move the pin to the first one that does.
+#
+# srcml-nontermination.patch adds two fixes that upstream does not have yet.
+# Without them srcML never finishes on some files, so the census drops them:
+# - a C string that ends right before the next one, as in "a""b" (NSS
+#   certdata.c ran over 600 s; it takes about 1 s);
+# - no function name after a type that a macro made too long, as in
+#   "X template <class R> auto a;" (17 boost/hana headers looped for ever).
+# The patch is `git diff d38271916 543fed6af` on branch
+# fix/cregit-nontermination of a local srcML clone. Drop it when upstream has both.
+#
+# Measured over 8492 C, C++ and Java blobs: 8454 token streams are
+# byte-identical, 22 are files that never finished before, and 16 hold adjacent
+# string literals. In 12 of those the patch corrects the markup. The other 4 are
+# sqlite3.c copies, where an #error string continued over a backslash-newline
+# (a defect the patch does not touch) already puts the lexer out of step; the
+# patch only changes how that already wrong text is split.
 { lib
 , stdenv
 , fetchFromGitHub
@@ -58,6 +74,8 @@ stdenv.mkDerivation {
     rev = "d382719161daa1d035b594fcd3639ff376b4bb83";
     hash = "sha256-SRUvvsMLenVadNOG3S49Rwe0eDEf3AidTxvo3RtZPHg=";
   };
+
+  patches = [ ./srcml-nontermination.patch ];
 
   nativeBuildInputs = [ cmake ninja jdk_headless ];
 
