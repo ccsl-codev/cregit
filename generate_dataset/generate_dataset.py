@@ -851,13 +851,50 @@ def main():
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'mentored-by')         AS footer_mentored_by,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'assisted-by')         AS footer_assisted_by,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'thanks-to')           AS footer_thanks_to
-                -- The trailers come from the original repository, keyed by
-                -- the original commit SHA. In the cregit repository, blobExec
-                -- appends "\\n" + "Former-commit-id: X" to a message whose last
-                -- paragraph has trailers. When that message ends in "\\n" (the
-                -- git CLI writes it so), a blank line comes before the new
-                -- trailer, and JGit then sees only Former-commit-id.
-                FROM original_log.footers f
+                -- One entry for each person in each list: the trailer line with
+                -- the lowest idx. A message can name one person twice, with the
+                -- same text or with another address of that person.
+                FROM (
+                    SELECT
+                        f.cid, f.idx, f.key, f.value,
+                        row_number() OVER (PARTITION BY f.cid, LOWER(f.key), f.who
+                                           ORDER BY f.idx)                                    AS nth,
+                        f.who
+                    FROM (
+                        -- who: the personid of the address, else the lowercased
+                        -- address, else NULL (a value with no address is kept).
+                        -- The address is the one that footer_personids uses.
+                        SELECT
+                            f.cid, f.idx, f.key, f.value,
+                            CASE WHEN fa.personid IS NOT NULL THEN 'p:' || fa.personid
+                                 WHEN f.addr IS NOT NULL THEN 'a:' || LOWER(f.addr)
+                            END                                                               AS who
+                        FROM (
+                            SELECT
+                                f.cid, f.idx, f.key, f.value,
+                                coalesce(
+                                    nullif(regexp_extract(f.value, '<([^>]+)>', 1), ''),
+                                    nullif(regexp_extract(f.value, '([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{{2,}})', 1), '')
+                                )                                                             AS addr
+                            -- The trailers come from the original repository, keyed by
+                            -- the original commit SHA. In the cregit repository, blobExec
+                            -- appends "\\n" + "Former-commit-id: X" to a message whose last
+                            -- paragraph has trailers. When that message ends in "\\n" (the
+                            -- git CLI writes it so), a blank line comes before the new
+                            -- trailer, and JGit then sees only Former-commit-id.
+                            FROM original_log.footers f
+                        ) f
+                        -- One personid for each address. min() if the emails rows of
+                        -- one address name two persons.
+                        LEFT JOIN (
+                            SELECT emailaddr, min(personid) AS personid
+                            FROM emails
+                            WHERE personid IS NOT NULL
+                            GROUP BY emailaddr
+                        ) fa ON fa.emailaddr = f.addr
+                    ) f
+                ) f
+                WHERE f.who IS NULL OR f.nth = 1
                 GROUP BY f.cid
             ) ftr ON coalesce(m.originalcid, t.commit_sha) = ftr.cid
             -- A separate subquery, so that the emails join cannot repeat a

@@ -607,14 +607,132 @@ def test_an_address_with_two_names_does_not_repeat_the_trailer(monkeypatch, tmp_
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path, seed=seed_footers(
         ("Reviewed-by", "Bob B <bob@example.com>"),
-        ("Reviewed-by", "Bob B <bob@example.com>"),
         people=[("bob", "bob@example.com", "Bob B"),
                 ("bob", "bob@example.com", "bob-laptop")]))
 
     ids, names, reviewed = footers_of(duckdb, out)
-    assert list(reviewed) == ["Bob B <bob@example.com>"] * 2   # two lines, two values
+    assert list(reviewed) == ["Bob B <bob@example.com>"]
     assert list(ids) == ["bob"]
     assert list(names) == ["Bob B"]
+
+
+# --------------------------------------------------------------------------- #
+# One entry for each person in each typed list. Two values are the same person
+# when their addresses resolve to one personid; an address that is not in
+# emails merges on its lowercased text; a value with no address never merges.
+# The entry kept is the value with the lowest idx, at the place of that idx.
+# --------------------------------------------------------------------------- #
+
+def typed_lists_of(duckdb, path, *cols):
+    row = duckdb.sql(f"select {', '.join(cols)} from read_parquet('{path}')").fetchone()
+    return [list(v) for v in row]
+
+
+def test_an_identical_repeated_trailer_gives_one_entry(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        people=[("adev", "a@example.com", "A Dev")]))
+
+    [signed] = typed_lists_of(duckdb, out, "footer_signed_off_by")
+    assert signed == ["A Dev <a@example.com>"]
+
+
+def test_two_addresses_of_one_person_give_the_first_value(monkeypatch, tmp_path):
+    """The Linux case: "Borislav Petkov (AMD) <bp@alien8.de>" and
+    "Borislav Petkov <bp@suse.de>" are one personid."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "Borislav Petkov (AMD) <bp@alien8.de>"),
+        ("Signed-off-by", "Borislav Petkov <bp@suse.de>"),
+        people=[("bp", "bp@alien8.de", "Borislav Petkov"),
+                ("bp", "bp@suse.de", "Borislav Petkov")]))
+
+    signed, ids = typed_lists_of(duckdb, out, "footer_signed_off_by", "footer_personids")
+    assert signed == ["Borislav Petkov (AMD) <bp@alien8.de>"]
+    assert ids == ["bp"]
+
+
+def test_two_addresses_of_two_persons_stay_two_entries(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        ("Signed-off-by", "A Dev <a@other.example.com>"),
+        people=[("adev", "a@example.com", "A Dev"),
+                ("adev2", "a@other.example.com", "A Dev")]))
+
+    [signed] = typed_lists_of(duckdb, out, "footer_signed_off_by")
+    assert signed == ["A Dev <a@example.com>", "A Dev <a@other.example.com>"]
+
+
+def test_an_unresolved_address_merges_across_letter_case(monkeypatch, tmp_path):
+    """No emails row for the address: the lowercased address is the key."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reported-by", "Carol <Carol@Example.com>"),
+        ("Reported-by", "carol <carol@example.com>")))
+
+    reported, ids = typed_lists_of(duckdb, out, "footer_reported_by", "footer_personids")
+    assert reported == ["Carol <Carol@Example.com>"]
+    assert ids == []
+
+
+def test_a_bare_address_and_a_bracketed_one_are_one_person(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reported-by", "carol@example.com"),
+        ("Reported-by", "Carol <carol@example.com>")))
+
+    [reported] = typed_lists_of(duckdb, out, "footer_reported_by")
+    assert reported == ["carol@example.com"]
+
+
+def test_a_value_with_no_address_is_never_merged(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reported-by", "Daniel Stenberg"),
+        ("Reported-by", "Daniel Stenberg"),
+        ("Reported-by", "daniel stenberg")))
+
+    [reported] = typed_lists_of(duckdb, out, "footer_reported_by")
+    assert reported == ["Daniel Stenberg", "Daniel Stenberg", "daniel stenberg"]
+
+
+def test_the_entries_keep_the_order_of_their_first_idx(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),        # idx 0: a, kept
+        ("Signed-off-by", "Bob B <bob@example.com>"),      # idx 1: bob, kept
+        ("Signed-off-by", "No Address"),                   # idx 2: kept
+        ("Signed-off-by", "A Dev (work) <a@work.example>"),  # idx 3: a again, dropped
+        ("Signed-off-by", "Carol <carol@example.com>"),    # idx 4: unresolved, kept
+        ("Signed-off-by", "Bob B <bob@example.com>"),      # idx 5: bob again, dropped
+        people=[("adev", "a@example.com", "A Dev"),
+                ("adev", "a@work.example", "A Dev"),
+                ("bob", "bob@example.com", "Bob B")]))
+
+    signed, ids, names = typed_lists_of(duckdb, out, "footer_signed_off_by",
+                                        "footer_personids", "footer_person_names")
+    assert signed == ["A Dev <a@example.com>", "Bob B <bob@example.com>", "No Address",
+                      "Carol <carol@example.com>"]
+    assert ids == ["adev", "bob"]
+    assert names == ["A Dev", "Bob B"]
+
+
+def test_one_person_in_two_lists_stays_in_both(monkeypatch, tmp_path):
+    """The rule works inside each typed list, not across the lists."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        ("Reviewed-by", "A Dev <a@example.com>"),
+        ("signed-off-by", "A Dev <a@example.com>"),
+        people=[("adev", "a@example.com", "A Dev")]))
+
+    signed, reviewed = typed_lists_of(duckdb, out, "footer_signed_off_by",
+                                      "footer_reviewed_by")
+    assert signed == ["A Dev <a@example.com>"]
+    assert reviewed == ["A Dev <a@example.com>"]
 
 
 def test_the_trailers_of_the_cregit_db_are_not_read(monkeypatch, tmp_path):
