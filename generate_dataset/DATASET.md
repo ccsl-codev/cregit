@@ -119,8 +119,18 @@ numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
 ### Commit trailers (footers)
 
 Fifteen `LIST(TEXT)` columns, never NULL: absence is an empty list, so test with
-`len(footer_reviewed_by) = 0`. Source is `cregit.db`'s `footers` table, grouped by
-commit, keys matched case-insensitively, each list in `footers.idx` order.
+`len(footer_reviewed_by) = 0`. Source is the `footers` table of the original
+log DB (`<repo>-original.db`, Step 3 output), grouped by commit and joined on
+`original_commit_sha`. Keys are matched case-insensitively, and each list is in
+`footers.idx` order. The trailers are JGit's `getFooterLines` of the original
+commit message.
+
+The source is not `cregit.db`. In the cregit repository, blobExec appends
+`"\n" + "Former-commit-id: <sha>"` to a message whose last paragraph has
+trailers. A git CLI message ends in `"\n"`, so the result has a blank line
+before `Former-commit-id`, and JGit then finds no other trailer. A message with
+no final newline (for example, from the GitHub web UI) kept its trailers.
+Datasets made before this change have this defect.
 
 | Column | Trailer key |
 |--------|-------------|
@@ -244,6 +254,7 @@ tables) maps multiple email addresses to a single `personid`.
 ```
 token_map.commit_sha → commits.cid
                     → commitmap.cid     → commitmap.originalcid (original commit SHA)
+                                          → original DB footers.cid (trailers)
                     → emails.emailname  → persons.personid      → persons.personname
                       \_ (matched on autname + autemail)
 ```
@@ -341,6 +352,9 @@ source files ───────────┤
 cregit.db ──────────────┤
 (commits, commitmap)    │
                         │
+<repo>-original.db ─────┤
+(footers)               │
+                        │
 persons.db ─────────────┤
 (emails, persons)       │
                         │
@@ -364,9 +378,10 @@ For each `.blame` file:
 
 ### Phase 2: DuckDB JOIN → Parquet
 
-Join `token_map` with the three SQLite databases:
+Join `token_map` with the four SQLite databases:
 - `commits` — commit metadata (author, committer, dates, summary)
 - `commitmap` — cregit → original commit SHA mapping
+- `footers` of the original log DB — commit trailers, by original commit SHA
 - `emails` / `persons` — person identity resolution
 
 Output is written as ZSTD-compressed Parquet.
@@ -378,6 +393,7 @@ uv run python generate_dataset/generate_dataset.py \
     --blame-dir  ../cregit-files/blame \
     --source-dir ../cregit-files/jq-original \
     --cregit-db  ../cregit-files/jq-cregit.db \
+    --original-db ../cregit-files/jq-original.db \
     --persons-db ../cregit-files/jq-persons.db \
     --output     ../cregit-files/jq-dataset.parquet \
     --repo-name  jq \
@@ -391,6 +407,7 @@ uv run python generate_dataset/generate_dataset.py \
 | `--blame-dir` | yes | Directory containing `.blame` files (Step 8 output). |
 | `--source-dir` | yes | Root of the original source tree. |
 | `--cregit-db` | yes | Path to `cregit.db` (Step 5 output). |
+| `--original-db` | yes | Path to the git log DB of the original repository (Step 3 output). The `footer_*` columns come from its `footers` table. If the file is missing or has no `footers` table, the run stops before Phase 1. |
 | `--persons-db` | yes | Path to `persons.db` (Step 6 output). |
 | `--output` | yes | Output Parquet file path. |
 | `--repo-name` | no | Repository name. Default: inferred from output filename. |
