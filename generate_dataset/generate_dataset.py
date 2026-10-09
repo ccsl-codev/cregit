@@ -20,6 +20,7 @@ Usage:
       --blame-dir  ../cregit-files/blame \
       --source-dir ../cregit-files/jq-original \
       --cregit-db  ../cregit-files/jq-cregit.db \
+      --original-db ../cregit-files/jq-original.db \
       --persons-db ../cregit-files/jq-persons.db \
       --output     ../cregit-files/jq-dataset.parquet
 """
@@ -514,6 +515,33 @@ def project_meta_sql(project_meta) -> str:
     )
 
 
+# The columns that the trailer query reads from the footers table.
+FOOTER_COLUMNS = ("cid", "idx", "key", "value")
+
+
+def footers_table_problem(db_path) -> str:
+    """Return why db_path cannot supply the trailers, or "" when it can.
+
+    The trailers come from the footers table that slickGitLog writes for the
+    original repository. Check that table before Phase 1, because Phase 1 can
+    take half an hour, and a bad input must stop the run before that work.
+    """
+    try:
+        con = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
+        try:
+            names = {row[1] for row in con.execute("PRAGMA table_info(footers)")}
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return f"it is not a readable SQLite database ({exc})"
+    if not names:
+        return "it has no footers table"
+    missing = [c for c in FOOTER_COLUMNS if c not in names]
+    if missing:
+        return f"its footers table has no column {', '.join(missing)}"
+    return ""
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate unified Parquet dataset from CreGit pipeline outputs"
@@ -526,6 +554,15 @@ def main():
     )
     parser.add_argument(
         "--cregit-db", required=True, help="Path to cregit.db (Step 5 output)"
+    )
+    parser.add_argument(
+        "--original-db",
+        required=True,
+        help="Path to the git log DB of the original repository (Step 3 output). "
+        "The footer_* columns come from its footers table, keyed by the original "
+        "commit SHA. The cregit DB cannot supply them: its commit messages carry "
+        "the Former-commit-id trailer that blobExec adds, and when a blank line "
+        "comes before that trailer, JGit sees no other trailer.",
     )
     parser.add_argument(
         "--persons-db", required=True, help="Path to persons.db (Step 6 output)"
@@ -596,10 +633,21 @@ def main():
             print(f"ERROR: {label} not found: {p}", file=sys.stderr)
             sys.exit(1)
 
-    for p, label in [(args.cregit_db, "cregit-db"), (args.persons_db, "persons-db")]:
+    for p, label in [(args.cregit_db, "cregit-db"), (args.original_db, "original-db"),
+                     (args.persons_db, "persons-db")]:
         if not Path(p).is_file():
             print(f"ERROR: {label} not found: {p}", file=sys.stderr)
+            if label == "original-db":
+                print("  Step 3 writes this file. Run the pipeline again from step 3 "
+                      "or earlier. The trailers do not come from the cregit DB.",
+                      file=sys.stderr)
             sys.exit(1)
+
+    problem = footers_table_problem(args.original_db)
+    if problem:
+        print(f"ERROR: original-db {args.original_db} cannot supply the trailers: "
+              f"{problem}", file=sys.stderr)
+        sys.exit(1)
 
     if not args.repo_name:
         args.repo_name = output_path.stem.replace("-dataset", "")
@@ -727,6 +775,10 @@ def main():
     con.execute(f"CALL sqlite_attach('{sync_db_path}')")
     con.execute(f"CALL sqlite_attach('{args.cregit_db}')")
     con.execute(f"CALL sqlite_attach('{args.persons_db}')")
+    # A named catalog, not sqlite_attach: the original DB has the same table
+    # names as the cregit DB, and sqlite_attach puts every table in one schema.
+    original_db = str(args.original_db).replace(chr(39), chr(39) * 2)
+    con.execute(f"ATTACH '{original_db}' AS original_log (TYPE sqlite, READ_ONLY)")
 
     meta_sql = project_meta_sql(project_meta)
 
@@ -804,7 +856,13 @@ def main():
                     list(DISTINCT coalesce(fpn.personname, fe.personid)
                         ORDER BY coalesce(fpn.personname, fe.personid))
                         FILTER (WHERE coalesce(fpn.personname, fe.personid) IS NOT NULL)                AS footer_person_names
-                FROM footers f
+                -- The trailers come from the original repository, keyed by
+                -- the original commit SHA. In the cregit repository, blobExec
+                -- appends "\\n" + "Former-commit-id: X" to a message whose last
+                -- paragraph has trailers. When that message ends in "\\n" (the
+                -- git CLI writes it so), a blank line comes before the new
+                -- trailer, and JGit then sees only Former-commit-id.
+                FROM original_log.footers f
                 -- regexp_extract returns '' rather than NULL on no match, so
                 -- without nullif a no-address trailer joins on '' and matches
                 -- every `Name <>` row. Bracketed form first: correct precedence.
@@ -815,7 +873,7 @@ def main():
                     )
                 LEFT JOIN persons fpn ON fe.personid = fpn.personid
                 GROUP BY f.cid
-            ) ftr ON c.cid = ftr.cid
+            ) ftr ON coalesce(m.originalcid, t.commit_sha) = ftr.cid
 
             ORDER BY t.file_path, t.token_index
         ) TO '{output_path}'

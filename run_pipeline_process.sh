@@ -250,6 +250,7 @@ build_dataset_argv() {
         --blame-dir  "$WORK/blame"
         --source-dir "$REPO_PATH_ORIGINAL"
         --cregit-db  "$DB_PATH_CREGIT"
+        --original-db "$DB_PATH_ORIGINAL"
         --persons-db "$DB_PATH_PERSONS"
         --output     "$DATASET_PATH"
         --repo-name  "$REPO_NAME"
@@ -1125,6 +1126,8 @@ if [ "$STEP_NUM" -ge "$FROM_STEP" ]; then
 DATASET_SCRIPT="$CREGIT/generate_dataset/generate_dataset.py"
 [ -f "$DATASET_SCRIPT" ] || die "dataset generator not found: $DATASET_SCRIPT"
 if [ -n "$PYTHON" ] && "$PYTHON" -c 'import duckdb' 2>/dev/null; then
+# The footer_* columns come from the original log DB (see generate_dataset.py).
+[ -f "$DB_PATH_ORIGINAL" ] || die "step 3 did not produce $DB_PATH_ORIGINAL, and step 10 reads the trailers from it. Resume from step 3 or earlier."
 build_dataset_argv
 "$PYTHON" "$DATASET_SCRIPT" "${DATASET_ARGV[@]}"
 log "dataset written: $DATASET_PATH"
