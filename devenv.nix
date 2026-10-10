@@ -74,7 +74,8 @@ in
   # in `packages`: that would change the shell env in srcml2token's RUNPATH, and
   # so the tokenizer identity of every C, C++, Java and Rust blob.
   enterTest = ''
-    git ls-files -z '*.sh' | xargs -0 --no-run-if-empty ${pkgs.shellcheck}/bin/shellcheck -S error
+    # The sh tokenizer's fixtures are its input, and some are invalid shell on purpose.
+    git ls-files -z -- '*.sh' ':!:tokenize/shTokenizer/tests/fixtures/' | xargs -0 --no-run-if-empty ${pkgs.shellcheck}/bin/shellcheck -S error
     echo "shellcheck: no errors"
     pytest -q
     prove -r $(git ls-files '*/t/*.t' | xargs -n1 dirname | sort -u)

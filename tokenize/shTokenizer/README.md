@@ -131,6 +131,17 @@ character, and so does each other invalid byte.
   `?*' '?*)`) and reaches a quote it cannot close, everything from that quote to the end
   of the file is one error token, which comes out as a single `word`.
 
+## How to test
+
+```sh
+cd tokenize/shTokenizer
+make test
+```
+
+`make expected` regenerates the expected outputs in `tests/expected/` from
+`tests/fixtures/`: `NAME.sh.token` with `--position` and `NAME.sh.nopos.token` without.
+Check the diff of every regenerated file.
+
 ## License
 
 GPL-3.0+
