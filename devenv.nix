@@ -56,7 +56,8 @@ in
     perlEnv
 
     # pytest must come from this python: the system one's duckdb will not load.
-    (pkgs.python3.withPackages (ps: [ ps.duckdb ps.pytest ]))
+    # tree-sitter + tree-sitter-bash: the shell tokenizer.
+    (pkgs.python3.withPackages (ps: [ ps.duckdb ps.pytest ps.tree-sitter ps.tree-sitter-bash ]))
   ];
 
   # Scala 2.13 + sbt 1.x needs a modern JDK; the legacy sbt 0.13 hack is gone.

@@ -15,7 +15,8 @@
 
 # Prints blobExec's --tokenizer-identity, ext=<sha256>,...: a digest of each
 # extension's parser, tokenize.pl, CregitLanguages.pm and, for srcML languages,
-# srcml2token, libsrcml, ctags and CregitSrcMl.pm. A change refuses old caches.
+# srcml2token, libsrcml, ctags and CregitSrcMl.pm; for sh, the tree-sitter runtime and
+# bash grammar that sh_tokenizer.py names. A change refuses old caches.
 
 use strict;
 use warnings;
@@ -89,6 +90,21 @@ sub libsrcml_of {
     return $path;
 }
 
+# The tree-sitter runtime and the bash grammar decide sh tokens as libsrcml decides
+# srcML's, and like srcml2token the tokenizer names the files it loads.
+sub sh_libraries_of {
+    my ($shTokenizer) = @_;
+    open(my $ph, '-|', $shTokenizer, "--library-paths")
+        or die "tokenizerIdentity: cannot run [$shTokenizer]: $!\n";
+    my @paths = <$ph>;
+    close $ph;
+    chomp @paths;
+    die "tokenizerIdentity: [$shTokenizer] does not answer --library-paths, so the tree-sitter\n"
+      . "  libraries its tokens depend on cannot be digested. Run it inside devenv shell.\n"
+        if $? != 0 or not @paths;
+    return @paths;
+}
+
 my %digestCache;
 sub cached_digest {
     my ($path) = @_;
@@ -98,6 +114,7 @@ sub cached_digest {
 
 my @pairs;
 my $libsrcml;
+my $shLibraries;
 for my $ext (@extensions) {
     my $language = $CregitLanguages::EXT_LANG{$ext};
     die "tokenizerIdentity: no language for extension [$ext]\n" unless defined $language;
@@ -117,6 +134,10 @@ for my $ext (@extensions) {
         }
         $libsrcml //= libsrcml_of($srcml2tokenPath);
         push @components, $libsrcml, "$basedir/CregitSrcMl.pm";
+    }
+    if ($language eq "Sh") {
+        $shLibraries //= [sh_libraries_of($parser)];
+        push @components, @$shLibraries;
     }
 
     my $combined = sha256_hex(join("\n", map { cached_digest($_) } @components));
