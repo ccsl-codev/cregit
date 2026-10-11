@@ -2,9 +2,10 @@
 
 use strict;
 use warnings;
-use Test::More tests => 20;
+use Test::More tests => 41;
 use FindBin;
 use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
 
 my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
 
@@ -130,6 +131,111 @@ my $cid2 = commit_as($repo, "Bob", "second");
     my @right = grep { /^\Q$author\E;origin\.c;/ } @moved;
     is(scalar(@right), 6,
        "all six moved lines are credited to the author, naming origin.c");
+}
+
+# The -C100 time limit and the git exit status, on the same moved.c repository.
+# A fake git on PATH is slow or fails for "blame"; all other commands go to the real git.
+{
+    my $repo2 = "$workdir/moved";
+    my $mover = git($repo2, "rev-parse HEAD");
+    my $realGit = `command -v git`;
+    chomp $realGit;
+    my $fakeBin = "$workdir/fakebin";
+    mkdir $fakeBin or die $!;
+    write_file("$fakeBin/git", <<"FAKE");
+#!/bin/sh
+blame=0; c100=0
+for a in "\$@"; do
+    [ "\$a" = blame ] && blame=1
+    [ "\$a" = -C100 ] && c100=1
+done
+if [ \$blame = 1 ]; then
+    case "\$FAKE_GIT_MODE" in
+        slow-c100) [ \$c100 = 1 ] && exec sleep 60 ;;
+        slow-c100-plain-fails) [ \$c100 = 1 ] && exec sleep 60; exit 3 ;;
+        fail) echo "fatal: fake failure" >&2; exit 3 ;;
+        killed) printf '%040d 1 1 1\\n' 0; kill -9 \$\$ ;;
+    esac
+fi
+exec '$realGit' "\$@"
+FAKE
+    chmod 0755, "$fakeBin/git" or die $!;
+
+    my $buildDir = dirname($script) . "/build";
+    my @tempsBefore = glob("$buildDir/tmpfile-*");
+
+    my $slurp = sub {
+        my ($f) = @_;
+        open(my $fh, '<', $f) or return undef;
+        local $/;
+        my $c = <$fh>;
+        close $fh;
+        return $c;
+    };
+    my $run = sub {
+        my ($mode, $opts, %env) = @_;
+        my $dest = tempdir(CLEANUP => 1);
+        local $ENV{PATH} = "$fakeBin:$ENV{PATH}";
+        local $ENV{FAKE_GIT_MODE} = $mode;
+        local $ENV{CREGIT_C100_LIMIT} = $env{limit} if defined $env{limit};
+        my $t0 = time();
+        my $status = system("perl '$script' $opts '$repo2' moved.c '$dest' 2>'$workdir/stderr'");
+        return ($status, $dest, time() - $t0, $slurp->("$workdir/stderr"));
+    };
+
+    # (a) A blame that ends within the limit: the same bytes as with no limit.
+    my ($s1, $d1) = $run->('none', '');
+    my ($s2, $d2) = $run->('none', '--c100-limit=0');
+    my ($s3, $d3) = $run->('none', '--c100-limit=3600');
+    is($s1 + $s2 + $s3, 0, "the default, no limit and 3600 s runs all succeed");
+    my $bytes = $slurp->("$d1/moved.c.blame");
+    is($slurp->("$d2/moved.c.blame"), $bytes, "no limit gives the same bytes as the default limit");
+    is($slurp->("$d3/moved.c.blame"), $bytes, "a 3600 s limit gives the same bytes as the default limit");
+
+    # (b) -C100 passes the limit: plain blame output and the PLAIN-BLAME line.
+    my ($s4, $d4, $sec4, $err4) = $run->('slow-c100', '--c100-limit=1');
+    is($s4, 0, "a -C100 run that passes the limit still succeeds");
+    cmp_ok($sec4, '<', 30, "the script kills the slow -C100 git and does not wait for it");
+    like($err4, qr/^PLAIN-BLAME moved\.c after [0-9]+ s of -C100$/m,
+         "the script prints the PLAIN-BLAME line to STDERR");
+    my @plain = split /\n/, ($slurp->("$d4/moved.c.blame") // '');
+    is(scalar(@plain), 10, "the plain blame file has ten lines");
+    my @byMover = grep { /^\Q$mover\E;;/ } @plain[2 .. 7];
+    is(scalar(@byMover), 6, "plain blame credits the moved lines to the mover, so no -C100 ran");
+    my $plainRef = `git -C '$repo2' blame --porcelain moved.c | grep -c '^	'`;
+    chomp $plainRef;
+    is($plainRef, 10, "git blame without -C gives the same line count");
+
+    # The environment variable sets the limit when there is no flag.
+    my ($s5, $d5, $sec5, $err5) = $run->('slow-c100', '', limit => 1);
+    is($s5, 0, "CREGIT_C100_LIMIT=1 run succeeds");
+    like($err5, qr/^PLAIN-BLAME moved\.c after [0-9]+ s of -C100$/m,
+         "CREGIT_C100_LIMIT sets the -C100 limit");
+    is($slurp->("$d5/moved.c.blame"), $slurp->("$d4/moved.c.blame"),
+       "the flag and the environment variable give the same bytes");
+
+    # (c) git fails: a non-zero exit and no blame file.
+    my ($s6, $d6, undef, $err6) = $run->('fail', '');
+    isnt($s6, 0, "a failing git blame gives a non-zero exit");
+    ok(!-e "$d6/moved.c.blame", "a failing git blame writes no blame file");
+    like($err6, qr/^Error: git blame of \[moved\.c\]/m, "a failing git blame prints an error");
+
+    # git killed after part of its output: the defect that wrote an empty .blame.
+    my ($s7, $d7) = $run->('killed', '');
+    isnt($s7, 0, "a killed git blame gives a non-zero exit");
+    ok(!-e "$d7/moved.c.blame", "a killed git blame writes no blame file");
+
+    # -C100 passes the limit and plain blame then fails.
+    my ($s8, $d8, undef, $err8) = $run->('slow-c100-plain-fails', '--c100-limit=1');
+    isnt($s8, 0, "a failing plain blame after the limit gives a non-zero exit");
+    ok(!-e "$d8/moved.c.blame", "a failing plain blame writes no blame file");
+
+    my @tempsAfter = glob("$buildDir/tmpfile-*");
+    is(scalar(@tempsAfter), scalar(@tempsBefore), "the failed runs leave no temp file in build/");
+
+    # A limit that is not a whole number of seconds is rejected.
+    my ($s9) = $run->('none', '--c100-limit=abc');
+    isnt($s9, 0, "a limit that is not a number is rejected");
 }
 
 # Two non-contiguous groups from one commit, in a renamed file: --porcelain
