@@ -315,6 +315,31 @@ whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,
 `.cppm`, `.cxxm`, `.ipp`, for which srcML emits **zero tokens and exits 0**.
 `file_mask` on every row records the mask that decided this.
 
+### Files blamed without `-C100`
+
+Step 7 blames each file with `git blame -C100`. This option credits a line that
+moved in from another file to the commit that wrote it, not to the commit that
+moved it. On a huge generated file (protobuf or thrift Java, a tree-sitter
+`parser.c`, ICU `stubdata.cpp`), `-C100` can take 3 to 38 hours for one file.
+
+Thus `blameRepo/formatBlame.pl` has a wall-clock limit for `-C100`: 3600 seconds
+by default. The option `--c100-limit=SECONDS` or the environment variable
+`CREGIT_C100_LIMIT` sets a different limit. The value 0 removes the limit. When
+the limit passes, the script stops `-C100` and blames the same file with plain
+`git blame`, with no limit. The pipeline log then holds one line
+`PLAIN-BLAME <file> after <N> s of -C100`.
+
+In such a file, a line that moved in from another file has the commit that moved
+it. The rows of the file do not record this. To find these files, search the
+pipeline log for `PLAIN-BLAME`. A file that ends within the limit gets the same
+blame bytes as before.
+
+If git fails or stops early for a different reason (for example, the kernel
+kills it for memory), `formatBlame.pl` writes no `.blame` file and exits 1.
+`blameRepoFiles.pl` counts the error, and the blame step fails. Before this
+change, the script wrote an empty `.blame` file and exited 0. The tokens of that
+file were lost, and no error showed it.
+
 ### Computed and then dropped, or never typed
 
 - `func_name` is computed in Phase 1 for `DECL` tokens and is **not** carried into
