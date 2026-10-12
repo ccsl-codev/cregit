@@ -115,7 +115,7 @@ cd ../..
 bash tests/test_token_worker.sh
 prove tests/t
 pytest -q
-for t in tokenize_gate pipeline_workdir_guard ensure_artifacts retokenize_passthrough reblame_passthrough; do
+for t in tokenize_gate pipeline_workdir_guard ensure_artifacts retokenize_passthrough reblame_passthrough pack_alternates; do
   bash "tests/$t.sh"
 done
 

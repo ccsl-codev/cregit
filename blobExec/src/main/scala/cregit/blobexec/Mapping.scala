@@ -296,8 +296,10 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     Mapping.RetokenizeResult(before, rowCounts, extensions, invalidated, memo)
   }
 
-  /** Run `body` inside a transaction; commit on success, rollback on throw. */
+  /** Run `body` inside a transaction; commit on success, rollback on throw.
+    * An open group (see [[inGroupedTx]]) is committed first. */
   def inTx[A](body: => A): A = {
+    commitGroup()
     conn.setAutoCommit(false)
     try {
       val result = body
@@ -312,7 +314,67 @@ final class Mapping private (conn: Connection, warm: Option[Connection]) extends
     }
   }
 
+  /** A PRAGMA's current value on this connection, for tests. */
+  private[blobexec] def pragmaValue(name: String): Long = {
+    val st = conn.createStatement()
+    try { val rs = st.executeQuery(s"PRAGMA $name"); rs.next(); rs.getLong(1) } finally st.close()
+  }
+
+  // -- grouped transactions ---------------------------------------------------
+  // A commit's rows are one body; up to `maxBodies` bodies share one transaction.
+  // Each SQLite transaction rewrites the pages it touched into the WAL, and the
+  // walk touches the same index pages for every commit, so per-commit
+  // transactions cost more than the rows. A group is all-or-nothing, like the
+  // one-commit transaction it replaces: a crash loses whole bodies, never part of
+  // one, so a commit row is still never durable without its trees and blobs, and
+  // the lost commits are re-walked on resume (their tokens come from the memo).
+
+  private var groupOpen       = false
+  private var groupBodies     = 0
+  private var groupStartNanos = 0L
+
+  /** As [[inTx]], but `body` joins the open group, which is committed once it
+    * holds `maxBodies` bodies or is `maxNanos` old. A throw in `body` rolls back
+    * the whole group. `maxBodies` <= 1 is plain [[inTx]]. Not thread-safe: the
+    * caller serializes access, as it does for every other method here. */
+  def inGroupedTx[A](maxBodies: Int, maxNanos: Long)(body: => A): A =
+    if (maxBodies <= 1) inTx(body)
+    else {
+      if (!groupOpen) {
+        conn.setAutoCommit(false)
+        groupOpen = true
+        groupBodies = 0
+        groupStartNanos = System.nanoTime()
+      }
+      val result =
+        try body
+        catch { case t: Throwable => abandonGroup(); throw t }
+      groupBodies += 1
+      if (groupBodies >= maxBodies || System.nanoTime() - groupStartNanos >= maxNanos) commitGroup()
+      result
+    }
+
+  /** Commit the open group, if any. The walk calls it when it stops, by abort too. */
+  def commitGroup(): Unit =
+    if (groupOpen) {
+      try conn.commit()
+      catch { case t: Throwable => abandonGroup(); throw t }
+      groupOpen = false
+      groupBodies = 0
+      conn.setAutoCommit(true)
+    }
+
+  private def abandonGroup(): Unit =
+    if (groupOpen) {
+      groupOpen = false
+      groupBodies = 0
+      try conn.rollback() catch { case _: Throwable => () }
+      try conn.setAutoCommit(true) catch { case _: Throwable => () }
+    }
+
   override def close(): Unit = {
+    // Every body in the group finished (a failed one rolled the group back).
+    commitGroup()
     (List(selBlob, insBlob, selCommit, insCommit, selTree, insTree,
           selRef, insRef, delRef, selMeta, insMeta) ++ warmSelBlob.toList ++ warmSelTree.toList)
       .foreach(s => try s.close() catch { case _: Throwable => () })
@@ -456,6 +518,30 @@ object Mapping {
     } finally st.close()
   }
 
+  /** Read-path sizing for the walk's DB. Both change speed only, never results.
+    *   cacheMiB  SQLite's own page cache, private anonymous memory, filled only
+    *             as pages are read: the DB's size at most (default 2 MB).
+    *   mmapMiB   map up to this much of the file. Lookups then read the kernel's
+    *             page cache in place instead of copying each page out with a
+    *             syscall. Those are file pages: shared and reclaimable, and the
+    *             same pages that reads cache anyway. 0 turns it off. */
+  final case class Tuning(cacheMiB: Int = DefaultCacheMiB, mmapMiB: Int = DefaultMmapMiB) {
+    require(cacheMiB >= 0 && mmapMiB >= 0, s"SQLite sizes must be >= 0 (cache=$cacheMiB MiB, mmap=$mmapMiB MiB)")
+  }
+  val DefaultCacheMiB = 256
+  val DefaultMmapMiB  = 4096
+  /** SQLite's defaults: what every run used before. */
+  val UntunedSqlite: Tuning = Tuning(cacheMiB = 0, mmapMiB = 0)
+
+  private def applyTuning(conn: Connection, t: Tuning): Unit = {
+    val st = conn.createStatement()
+    try {
+      // Negative cache_size is KiB; 0 keeps the default.
+      if (t.cacheMiB > 0) st.execute(s"PRAGMA cache_size = -${t.cacheMiB.toLong * 1024L}")
+      if (t.mmapMiB > 0) st.execute(s"PRAGMA mmap_size = ${t.mmapMiB.toLong * 1024L * 1024L}")
+    } finally st.close()
+  }
+
   /** Opt-in for `--mask-widened`. `newBlobResolves` has no default: `new_blob` ids
     * live only in dst, and a wiped dst would dangle every reused row. */
   final case class MaskWidening(newBlobResolves: String => Boolean,
@@ -468,7 +554,8 @@ object Mapping {
   def open(path: Path, command: String, mask: String, warm: Option[Path] = None,
            maskWidening: Option[MaskWidening] = None,
            tokenizerIdentity: TokenizerIdentity = TokenizerIdentity.empty,
-           retokenize: Option[Retokenize] = None): Mapping = {
+           retokenize: Option[Retokenize] = None,
+           tuning: Tuning = Tuning()): Mapping = {
     // Refused, not composed: each invalidation is verified against a state the
     // other would change. Run one, then the other as a resume.
     require(!(maskWidening.isDefined && retokenize.isDefined),
@@ -492,6 +579,7 @@ object Mapping {
     val url = s"jdbc:sqlite:${path.toAbsolutePath}"
     val conn = DriverManager.getConnection(url)
     enableForeignKeys(conn)
+    applyTuning(conn, tuning)
     val st = conn.createStatement()
     try Schema.foreach(st.execute) finally st.close()
 

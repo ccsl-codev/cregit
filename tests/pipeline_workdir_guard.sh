@@ -247,7 +247,7 @@ echo "case 17: without the flag nothing changes, and the flag is what reaches bl
 grep -q 'WIDENED_FLAG=""' "$RUNNER"; check "the flag defaults to absent" $?
 grep -q '\[ "\$MASK_WIDENED" = 1 \] && WIDENED_FLAG="--mask-widened"' "$RUNNER"
 check "and is only added when asked for" $?
-grep -q 'java -jar "\$BFG" \$MODE_FLAG \$WIDENED_FLAG' "$RUNNER"
+grep -qF 'java ${BLOBEXEC_JAVA_OPTS[@]+"${BLOBEXEC_JAVA_OPTS[@]}"} -jar "$BFG" $MODE_FLAG $WIDENED_FLAG' "$RUNNER"
 check "so it reaches blobExec's argv" $?
 
 echo

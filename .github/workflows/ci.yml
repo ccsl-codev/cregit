@@ -85,7 +85,7 @@ jobs:
       - name: Pipeline tests (shell)
         run: |
           devenv shell -- bash -c 'set -e
-            for t in tokenize_gate pipeline_workdir_guard ensure_artifacts retokenize_passthrough reblame_passthrough; do
+            for t in tokenize_gate pipeline_workdir_guard ensure_artifacts retokenize_passthrough reblame_passthrough pack_alternates; do
               bash "tests/$t.sh"
             done'
 
