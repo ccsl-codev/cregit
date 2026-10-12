@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 24;
+use Test::More tests => 26;
 use FindBin;
 use File::Temp qw(tempdir);
 use Digest::SHA qw(sha1_hex);
@@ -87,6 +87,17 @@ my $memoFile = "$memoDir/" . substr($sha1, 0, 2) . "/" . substr($sha1, 2, 2) . "
     );
     is($status, 0, ".cpp run succeeds");
     like($out, qr/^STUB-TOKENIZER\n--language=C\+\+\n/, ".cpp maps to --language=C++");
+}
+
+{
+    my ($status, $out, $err) = run_tokenbysha("echo hi\n",
+        BFG_MEMO_DIR     => $memoDir,
+        BFG_TOKENIZE_CMD => $stub,
+        BFG_BLOB         => "6" x 40,
+        BFG_FILENAME     => "t0000-basic.sh",
+    );
+    is($status, 0, ".sh run succeeds");
+    like($out, qr/^STUB-TOKENIZER\n--language=Sh\n/, ".sh maps to --language=Sh");
 }
 
 {

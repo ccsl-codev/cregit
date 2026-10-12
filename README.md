@@ -38,9 +38,9 @@ the checkout — the repo ships an [`.envrc`](./.envrc), so the devenv shell the
 activates automatically whenever you `cd` in, and typing `devenv shell` is no
 longer needed.
 
-By default every file the tokenizer can parse is tokenized — C, C++, Java and
-Rust, case-insensitively. The default mask is derived from the tokenizer's own
-extension table, so it cannot drift from it; print it with `perl
+By default every file the tokenizer can parse is tokenized — C, C++, Java,
+Rust and sh, case-insensitively. The default mask is derived from the
+tokenizer's own extension table, so it cannot drift from it; print it with `perl
 tokenize/fileMask.pl`. Pass `--mask` to narrow it to one language. `.am`/`.ac`
 are routed to the m4 parser but are not in the default mask, because that parser
 mis-lexes real autotools quoting (see `%MASKED_LANGUAGES` in
@@ -90,6 +90,7 @@ This builds, in dependency order:
 | ------------------------------------------------------------- | ------------------- | ------------------------- |
 | `tokenize/srcMLtoken/srcml2token`                              | srcML tokenizer     | gcc + xerces-c + libsrcml |
 | `tokenize/rustTokenizer` binary                                | Rust tokenizer      | cargo                     |
+| `tokenize/shTokenizer/sh_tokenizer.py` (no build step)         | sh tokenizer        | python3 + tree-sitter-bash |
 | `blobExec/target/scala-2.13/blobExec-0.1.0-assembly.jar`       | tokenization driver | sbt, JDK 21               |
 | `{slickGitLog,persons,remapCommits}/target/scala-2.10/*-one-jar.jar` | history / persons / remap tools | sbt 0.13, JDK 8 |
 
@@ -161,7 +162,7 @@ Flags (see `./run_pipeline_process.sh --help` for the full list):
 | `--repo-url`          | git URL or local path of the repository to process         | **required**                     |
 | `--repo-name`         | short name prefixed to the output files                    | derived from `--repo-url`        |
 | `--commit-url`        | base URL for commit links in the generated HTML            | `<repo-url minus .git>/commit/`  |
-| `--mask`              | regex of files to tokenize (C, C++, Java, Rust); quote it   | `perl tokenize/fileMask.pl`      |
+| `--mask`              | regex of files to tokenize (C, C++, Java, Rust, sh); quote it | `perl tokenize/fileMask.pl`      |
 | `--work`              | working/output directory                                   | `../cregit-files`                |
 | `--memo-dir`          | where to memoize tokenized blobs; outside `--work` it survives the full-run wipe | `<work>/memo` |
 | `--mode` / `--shards` | tokenizer walk mode / shard count for `sharded`            | `pipeline` / `4`                 |

@@ -30,6 +30,10 @@ sub fixture {
     write_file("$tok/rustTokenizer/target/release/rust_tokenizer", "RUST TOKENIZER v1\n");
     make_path("$tok/m4Tokenizer");
     write_file("$tok/m4Tokenizer/m4.py", "M4 v1\n");
+    make_path("$tok/shTokenizer");
+    write_sh_tokenizer($dir, "v1");
+    write_file("$dir/tree-sitter",      "TREE-SITTER v1\n");
+    write_file("$dir/tree-sitter-bash", "TREE-SITTER-BASH v1\n");
     write_srcml2token($dir, "v1");
     write_file("$dir/libsrcml",    "LIBSRCML v1\n");
     write_file("$dir/ctags",       "CTAGS v1\n");
@@ -47,6 +51,12 @@ sub write_file {
 sub write_srcml2token {
     my ($dir, $version) = @_;
     write_file("$dir/srcml2token", "#!/bin/sh\n# SRCML2TOKEN $version\necho '$dir/libsrcml'\n");
+}
+
+sub write_sh_tokenizer {
+    my ($dir, $version) = @_;
+    write_file("$dir/tokenize/shTokenizer/sh_tokenizer.py",
+               "#!/bin/sh\n# SH TOKENIZER $version\necho '$dir/tree-sitter'\necho '$dir/tree-sitter-bash'\n");
 }
 
 sub identity {
@@ -113,6 +123,18 @@ for my $component (qw(srcml2token libsrcml ctags)) {
     is($a{rs}, $b{rs}, "changing $component leaves .rs alone");
 }
 
+for my $component (qw(sh_tokenizer.py tree-sitter tree-sitter-bash)) {
+    my $d = fixture();
+    my ($before) = identity($d);
+    if ($component eq "sh_tokenizer.py") { write_sh_tokenizer($d, "v2") }
+    else                                 { write_file("$d/$component", "$component v2\n") }
+    my ($after) = identity($d);
+    my %b = as_map($before);
+    my %a = as_map($after);
+    isnt($a{sh}, $b{sh}, "changing $component moves the .sh identity");
+    is($a{c}, $b{c}, "changing $component leaves .c alone");
+}
+
 # CregitSrcMl.pm is tokenizeSrcMl.pl's copy in the tokenizer worker.
 for my $script (qw(tokenizeSrcMl.pl CregitSrcMl.pm)) {
     my $d = fixture();
@@ -166,6 +188,14 @@ for my $shared (qw(tokenize.pl CregitLanguages.pm)) {
     write_file("$d/srcml2token", "#!/bin/sh\nexit 0\n");
     my ($out, $status) = identity($d);
     isnt($status, 0, "an srcml2token that does not name its libsrcml is fatal");
+    is($out, "", "and prints no identity");
+}
+
+{
+    my $d = fixture();
+    write_file("$d/tokenize/shTokenizer/sh_tokenizer.py", "#!/bin/sh\nexit 0\n");
+    my ($out, $status) = identity($d);
+    isnt($status, 0, "an sh tokenizer that does not name its tree-sitter libraries is fatal");
     is($out, "", "and prints no identity");
 }
 

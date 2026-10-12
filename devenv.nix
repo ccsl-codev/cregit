@@ -56,7 +56,8 @@ in
     perlEnv
 
     # pytest must come from this python: the system one's duckdb will not load.
-    (pkgs.python3.withPackages (ps: [ ps.duckdb ps.pytest ]))
+    # tree-sitter + tree-sitter-bash: the shell tokenizer.
+    (pkgs.python3.withPackages (ps: [ ps.duckdb ps.pytest ps.tree-sitter ps.tree-sitter-bash ]))
   ];
 
   # Scala 2.13 + sbt 1.x needs a modern JDK; the legacy sbt 0.13 hack is gone.
@@ -73,7 +74,8 @@ in
   # in `packages`: that would change the shell env in srcml2token's RUNPATH, and
   # so the tokenizer identity of every C, C++, Java and Rust blob.
   enterTest = ''
-    git ls-files -z '*.sh' | xargs -0 --no-run-if-empty ${pkgs.shellcheck}/bin/shellcheck -S error
+    # The sh tokenizer's fixtures are its input, and some are invalid shell on purpose.
+    git ls-files -z -- '*.sh' ':!:tokenize/shTokenizer/tests/fixtures/' | xargs -0 --no-run-if-empty ${pkgs.shellcheck}/bin/shellcheck -S error
     echo "shellcheck: no errors"
     pytest -q
     prove -r $(git ls-files '*/t/*.t' | xargs -n1 dirname | sort -u)
