@@ -2,10 +2,13 @@
 
 use strict;
 use warnings;
-use Test::More tests => 41;
+use Test::More tests => 51;
 use FindBin;
 use File::Temp qw(tempdir);
 use File::Basename qw(dirname);
+use Cwd qw(abs_path);
+use Digest::SHA qw(sha1_hex);
+use POSIX ();
 
 my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
 
@@ -269,4 +272,76 @@ FAKE
     # The regression: this is the group whose header git suppressed.
     is($lines[2], "$first;old.c;\tint three;",
        "the second group of the same commit still names the old filename");
+}
+
+# Two runners on one output directory: a lock per output file, and a skip when
+# the file is already there. A fake git counts the blames and makes them slow.
+{
+    my $realGit = `command -v git`;
+    chomp $realGit;
+    my $lockBin = "$workdir/lockbin";
+    mkdir $lockBin or die $!;
+    my $counter = "$workdir/blame-count";
+    write_file("$lockBin/git", <<"FAKE");
+#!/bin/sh
+for a in "\$@"; do
+    if [ "\$a" = blame ]; then echo x >> '$counter'; sleep 2; fi
+done
+exec '$realGit' "\$@"
+FAKE
+    chmod 0755, "$lockBin/git" or die $!;
+    my $count = sub {
+        return 0 unless -f $counter;
+        my @l = slurp_lines($counter);
+        unlink $counter;
+        return scalar(@l);
+    };
+    my $slurp = sub {
+        open(my $fh, '<', $_[0]) or return undef;
+        local $/;
+        my $c = <$fh>;
+        close $fh;
+        return $c;
+    };
+    local $ENV{PATH} = "$lockBin:$ENV{PATH}";
+
+    my $ref = tempdir(CLEANUP => 1);
+    system("perl '$script' '$repo' g.c '$ref' 2>/dev/null") == 0 or die "reference run failed";
+    $count->();
+    my $refBytes = $slurp->("$ref/g.c.blame");
+
+    # (a) The output file exists: no blame, and the file keeps its bytes.
+    my $done = tempdir(CLEANUP => 1);
+    write_file("$done/g.c.blame", "keep\n");
+    my $s0 = system("perl '$script' '$repo' g.c '$done' 2>/dev/null");
+    is($s0, 0, "a file that is already blamed gives exit 0");
+    is($slurp->("$done/g.c.blame"), "keep\n", "an existing blame file keeps its bytes");
+    is($count->(), 0, "an existing blame file starts no git blame");
+
+    # (b) Two processes on the same file at the same time: one blames, one skips.
+    my $both = tempdir(CLEANUP => 1);
+    my @pids;
+    for my $i (1, 2) {
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid == 0) {
+            exec("perl '$script' '$repo' g.c '$both' 2>/dev/null") or POSIX::_exit(127);
+        }
+        push @pids, $pid;
+        select(undef, undef, undef, 0.3);
+    }
+    my @st = map { waitpid($_, 0); $? } @pids;
+    is($st[0], 0, "the first of two runners gives exit 0");
+    is($st[1], 0, "the second of two runners gives exit 0");
+    is($count->(), 1, "two runners on one file start one git blame");
+    is($slurp->("$both/g.c.blame"), $refBytes, "the blame file of two runners equals a single run");
+    ok(-s "$both/g.c.blame", "the blame file of two runners is not empty");
+
+    # (c) The locks stay in build/, out of the output directory.
+    my $lock = dirname($script) . "/build/locks/" . sha1_hex(abs_path($both) . "/g.c.blame") . ".lock";
+    ok(-f $lock, "the lock file is in build/locks/");
+    opendir(my $dh, $both) or die $!;
+    my @entries = sort grep { !/^\.\.?$/ } readdir($dh);
+    closedir $dh;
+    is_deeply(\@entries, ["g.c.blame"], "the output directory holds only the blame file");
 }
