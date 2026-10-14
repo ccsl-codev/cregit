@@ -23,6 +23,9 @@ use Getopt::Long;
 use Pod::Usage;
 use FindBin qw($RealBin);
 use POSIX qw(_exit);
+use Cwd qw(abs_path);
+use Digest::SHA qw(sha1_hex);
+use Fcntl qw(:flock);
 
 # build/ tempdir anchored to the script's dir, not the caller's CWD.
 my $buildDir = "$RealBin/build";
@@ -66,6 +69,20 @@ my ($fh, $temp) = mkstemp( "$buildDir/tmpfile-XXXXX" );
 Usage("Error [$file] should be a file in repository [$repo] [$repo/$file]\n\n usage $0 <repo> <filename> <destinationDir>") unless -f "$repo/$file";
 Usage( "Error [$repo] should be a git repo\n\nUsage $0 <repo> <filename> <destinationDir>") unless -d "$repo/.git";
 Usage( "Error [$dest] should be a directory\n\nUsage $0 <repo> <filename> <destinationDir>") unless -d $dest and $dest ne "";
+
+# Two runners can blame into the same output directory. One lock per output file,
+# held until exit; the second runner skips a file that the first one finished.
+my $output = abs_path($dest) . "/" . $file . $blameExtension;
+my $lockDir = "$buildDir/locks";
+make_path($lockDir) if not -d $lockDir;
+open(my $lockFh, '>>', "$lockDir/" . sha1_hex($output) . ".lock")
+    or die "unable to open the lock of [$output]: $!";
+flock($lockFh, LOCK_EX) or die "unable to lock [$output]: $!";
+if (-f $output) {
+    close $fh;
+    unlink($temp);
+    exit(0);
+}
 
 if ($verbose) {
     print STDERR "$0 processing repo [$repo] file [$file] [$dest]\n";
