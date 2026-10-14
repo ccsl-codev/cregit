@@ -83,6 +83,11 @@ my $status = Blame_To_Temp($c100Limit, '-C100', '--porcelain');
 if (not defined $status) {
     printf STDERR "PLAIN-BLAME %s after %d s of -C100\n", $file, time() - $started;
     $status = Blame_To_Temp(0, '--porcelain');
+} elsif (($status & 127) == 0 and ($status >> 8) == 128) {
+    # git dies (exit 128) when -C100 must diff a candidate blob over 1 GiB (xdiff
+    # limit, "unable to generate diff"); a killed git keeps its signal and fails below.
+    printf STDERR "PLAIN-BLAME %s after git exit 128 of -C100\n", $file;
+    $status = Blame_To_Temp(0, '--porcelain');
 }
 close $fh;
 # A git that stops early (killed, out of memory) gives a short or empty stream.
