@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 41;
+use Test::More tests => 46;
 use FindBin;
 use File::Temp qw(tempdir);
 use File::Basename qw(dirname);
@@ -154,6 +154,8 @@ if [ \$blame = 1 ]; then
         slow-c100) [ \$c100 = 1 ] && exec sleep 60 ;;
         slow-c100-plain-fails) [ \$c100 = 1 ] && exec sleep 60; exit 3 ;;
         fail) echo "fatal: fake failure" >&2; exit 3 ;;
+        c100-exit128) [ \$c100 = 1 ] && { echo "fatal: unable to generate diff (fake)" >&2; exit 128; } ;;
+        exit128) echo "fatal: unable to generate diff (fake)" >&2; exit 128 ;;
         killed) printf '%040d 1 1 1\\n' 0; kill -9 \$\$ ;;
     esac
 fi
@@ -229,6 +231,19 @@ FAKE
     my ($s8, $d8, undef, $err8) = $run->('slow-c100-plain-fails', '--c100-limit=1');
     isnt($s8, 0, "a failing plain blame after the limit gives a non-zero exit");
     ok(!-e "$d8/moved.c.blame", "a failing plain blame writes no blame file");
+
+    # (d) -C100 ends with git exit 128 (xdiff refuses a candidate blob over 1 GiB): plain blame.
+    my ($s9, $d9, undef, $err9) = $run->('c100-exit128', '');
+    is($s9, 0, "a -C100 git exit 128 falls back to plain blame and succeeds");
+    like($err9, qr/^PLAIN-BLAME moved\.c after git exit 128 of -C100$/m,
+         "the script prints the PLAIN-BLAME line for the git exit 128");
+    is($slurp->("$d9/moved.c.blame"), $slurp->("$d4/moved.c.blame"),
+       "the exit 128 fallback gives the same bytes as the time-limit fallback");
+
+    # Plain blame also ends with exit 128: a non-zero exit and no blame file.
+    my ($s10, $d10) = $run->('exit128', '');
+    isnt($s10, 0, "a plain blame exit 128 after the fallback gives a non-zero exit");
+    ok(!-e "$d10/moved.c.blame", "a failing fallback writes no blame file");
 
     my @tempsAfter = glob("$buildDir/tmpfile-*");
     is(scalar(@tempsAfter), scalar(@tempsBefore), "the failed runs leave no temp file in build/");
