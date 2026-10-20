@@ -130,7 +130,8 @@ sub Blame_To_Temp {
     my $pid = open(IN, '-|');
     die "unable to start git blame: $!" unless defined $pid;
     if ($pid == 0) {
-        exec('git', '-C', $repo, 'blame', @options, $file);
+        # '--': a path that starts with '-' is a path, not an option.
+        exec('git', '-C', $repo, 'blame', @options, '--', $file);
         print STDERR "unable to execute git: $!\n";
         _exit(127);
     }
@@ -167,17 +168,20 @@ sub Read_Record {
             $f = "$1;";
             $sawFilename = 0;
         } elsif ($_ =~ /^(filename) (.+)$/) {
-            $filenameOfCommit{$cid} = $2 if defined $cid;
+            # As git prints it: C-quoted if needed, so never a raw tab or newline.
+            # Field 2 keeps this form; only the compare uses the raw bytes.
+            my $name = $2;
+            $filenameOfCommit{$cid} = $name if defined $cid;
             $sawFilename = 1;
-	    if ($2 ne $file) {
-		$f .=  $2 . ";";
+	    if (Unquote_Path($name) ne $file) {
+		$f .=  $name . ";";
 	    } else {
 		$f .= ";";
 	    }
 	} elsif (/^	(.*)/) { #actual line
             if (not $sawFilename) {
                 my $known = defined $cid ? $filenameOfCommit{$cid} : undef;
-                if (defined $known and $known ne $file) {
+                if (defined $known and Unquote_Path($known) ne $file) {
                     $f .= $known . ";";
                 } else {
                     $f .= ";";
@@ -190,6 +194,21 @@ sub Read_Record {
 	}
     }
     return $f;
+}
+
+# git blame --porcelain prints "filename" C-quoted (core.quotePath) when the path
+# has a byte >= 0x80, '"', '\' or a control byte. Gives the raw bytes back, as
+# the path is on the command line, for the compare with $file. A path that git
+# did not quote never starts with '"' (git quotes every path that has one), so
+# it comes back unchanged.
+sub Unquote_Path {
+    my ($s) = @_;
+    return $s unless $s =~ /^"(.*)"$/s;
+    my $q = $1;
+    my %escape = ('a' => "\a", 'b' => "\b", 't' => "\t", 'n' => "\n",
+                  'v' => "\x0b", 'f' => "\f", 'r' => "\r", '"' => '"', '\\' => '\\');
+    $q =~ s/\\([0-3][0-7][0-7]|[abtnvfr"\\])/length($1) == 3 ? chr(oct($1)) : $escape{$1}/ge;
+    return $q;
 }
 
 sub Usage {
