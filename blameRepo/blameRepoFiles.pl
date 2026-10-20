@@ -62,9 +62,12 @@ my $fileRegExpr = shift;
 
 
 
-open(my $files, '-|', 'git', '-C', $repoDir, 'ls-files')
+# -z: raw paths, each ended by a NUL. Without -z, git C-quotes a path that has a
+# byte >= 0x80, '"', '\' or a control byte; the quoted name does not match the
+# mask, and the file is silently not blamed.
+open(my $files, '-|', 'git', '-C', $repoDir, 'ls-files', '-z')
     or die "unable to traverse git repo [$repoDir] $!";
-my @trackedFiles = <$files>;
+my @trackedFiles = do { local $/ = "\0"; map { s/\0\z//r } <$files> };
 close($files) or die "unable to traverse git repo [$repoDir]";
 
 my $count = 0;
@@ -75,7 +78,7 @@ my @filesToBlame;
 
 foreach (@trackedFiles) {
 #    next unless /^kernel/;
-    chomp;
+    # No chomp: the NUL is gone, and a newline can be part of a raw path.
 
     if ($fileRegExpr ne "") {
         next unless /$fileRegExpr/;
@@ -124,7 +127,8 @@ foreach my $name (@filesToBlame) {
     $count++;
     print STDERR ("$count: $name\n");
 
-    start_command($name, $blameCommand, "--blameExtension=$blameExtension", $repoDir, $name, $outputDir);
+    # '--' ends the options: a path that starts with '-' is not read as one.
+    start_command($name, $blameCommand, "--blameExtension=$blameExtension", '--', $repoDir, $name, $outputDir);
 }
 
 reap_command() while %running;
