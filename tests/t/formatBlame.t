@@ -6,6 +6,7 @@ use Test::More tests => 56;
 use FindBin;
 use File::Temp qw(tempdir);
 use File::Basename qw(dirname);
+use File::Spec;
 use Cwd qw(abs_path);
 use Digest::SHA qw(sha1_hex);
 use POSIX ();
@@ -52,6 +53,17 @@ sub slurp_lines {
     my @lines = <$fh>;
     chomp @lines;
     return @lines;
+}
+
+# Find a program on PATH in Perl. Do not run `command -v`: Perl runs a command
+# with no shell characters directly, and `command` is often only a shell builtin.
+sub find_on_path {
+    my ($name) = @_;
+    for my $dir (File::Spec->path) {
+        my $file = File::Spec->catfile($dir, $name);
+        return $file if -f $file && -x _;
+    }
+    die "$name is not on PATH";
 }
 
 my $repo = "$workdir/repo";
@@ -141,8 +153,7 @@ my $cid2 = commit_as($repo, "Bob", "second");
 {
     my $repo2 = "$workdir/moved";
     my $mover = git($repo2, "rev-parse HEAD");
-    my $realGit = `command -v git`;
-    chomp $realGit;
+    my $realGit = find_on_path('git');
     my $fakeBin = "$workdir/fakebin";
     mkdir $fakeBin or die $!;
     write_file("$fakeBin/git", <<"FAKE");
@@ -292,8 +303,7 @@ FAKE
 # Two runners on one output directory: a lock per output file, and a skip when
 # the file is already there. A fake git counts the blames and makes them slow.
 {
-    my $realGit = `command -v git`;
-    chomp $realGit;
+    my $realGit = find_on_path('git');
     my $lockBin = "$workdir/lockbin";
     mkdir $lockBin or die $!;
     my $counter = "$workdir/blame-count";
