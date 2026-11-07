@@ -107,6 +107,9 @@ Output:
   --project-key NAME
                     which key of the sidecar holds this project. Omit to use
                     --repo-name. A key the sidecar does not hold fails the run.
+  --ctp-schema N    the metadata columns of the dataset: 3 (the default, the 19
+                    columns of ctp schema 3) or 1 (the 29 columns of ctp
+                    schemas 1 and 2). Omit to accept the generator's default.
 
 Tokenizer:
   --mode MODE   tokenizer walk mode (default: pipeline)
@@ -260,6 +263,7 @@ build_dataset_argv() {
     [ -n "$DUCKDB_THREADS" ] && DATASET_ARGV+=(--duckdb-threads "$DUCKDB_THREADS")
     [ -n "$PROJECT_META" ]   && DATASET_ARGV+=(--project-meta "$PROJECT_META")
     [ -n "$PROJECT_KEY" ]    && DATASET_ARGV+=(--project-key "$PROJECT_KEY")
+    [ -n "$CTP_SCHEMA" ]     && DATASET_ARGV+=(--ctp-schema "$CTP_SCHEMA")
     return 0   # a false test above must not fail the function under `set -e`
 }
 
@@ -293,6 +297,8 @@ DUCKDB_THREADS=""
 # on whether the caller knows about the sidecar.
 PROJECT_META=""
 PROJECT_KEY=""
+# Empty means "do not pass the flag": the generator then writes its default.
+CTP_SCHEMA=""
 FORCE_CLEAN=0
 MASK_WIDENED=0
 RETOKENIZE=""
@@ -476,6 +482,7 @@ while [ $# -gt 0 ]; do
         --duckdb-threads) need_val "$@"; DUCKDB_THREADS="$2"; shift 2 ;;
         --project-meta)   need_val "$@"; PROJECT_META="$2"; shift 2 ;;
         --project-key)    need_val "$@"; PROJECT_KEY="$2"; shift 2 ;;
+        --ctp-schema)     need_val "$@"; CTP_SCHEMA="$2"; shift 2 ;;
         --mode)       need_val "$@"; MODE="$2"; shift 2 ;;
         --shards)     need_val "$@"; SHARDS="$2"; shift 2 ;;
         --jobs)       need_val "$@"; JOBS="$2"; shift 2 ;;
@@ -580,6 +587,10 @@ if [ -n "$PROJECT_KEY" ] && [ -z "$PROJECT_META" ]; then
     echo "--project-key without --project-meta has nothing to key into" >&2
     exit 2
 fi
+case "$CTP_SCHEMA" in
+    ''|1|3) ;;
+    *) echo "invalid --ctp-schema: '$CTP_SCHEMA' (use 1 or 3)" >&2; exit 2 ;;
+esac
 
 # Validate early: step 2 runs for hours. blobExec enforces the relationship
 # between the two values; this only rejects non-positive integers.

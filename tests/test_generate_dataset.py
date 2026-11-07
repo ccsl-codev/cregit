@@ -366,12 +366,17 @@ def build_tiny_project(tmp_path):
     return blame, src, cregit_db, original_db, persons_db
 
 
-def generate(monkeypatch, tmp_path, repo_name="proj", argv_extra=(), seed=None):
+def generate(monkeypatch, tmp_path, repo_name="proj", argv_extra=(), seed=None,
+             ctp_schema="1"):
     """Run main() for real and return the Parquet path.
 
     `seed(cregit_db, original_db, persons_db)` runs between the fixture and
     main(), for the tests that need a trailer or a person in the input.
+    `ctp_schema` is the value of --ctp-schema; None sends no flag, so main()
+    uses its default. The older tests here check the 29-field layout.
     """
+    if ctp_schema is not None:
+        argv_extra = ("--ctp-schema", ctp_schema, *argv_extra)
     import generate_dataset as gd
 
     blame, src, cregit_db, original_db, persons_db = build_tiny_project(tmp_path)
@@ -465,6 +470,72 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
         generate(monkeypatch, tmp_path,
                  argv_extra=("--project-meta", str(meta)))
     assert not (tmp_path / "out" / "proj-dataset.parquet").exists()
+
+
+# --------------------------------------------------------------------------- #
+# ctp schema 3: 19 metadata columns, provenance_status named audit_frame_file
+# --------------------------------------------------------------------------- #
+
+SCHEMA_3_TOTAL_COLUMNS = 57              # 38 token/commit columns + 19 metadata
+
+
+def test_schema_3_keeps_19_fields_in_the_old_order():
+    from generate_dataset import (PROJECT_META_COLUMNS_3, SCHEMA_3_DROPPED,
+                                  SCHEMA_3_RENAMED)
+    assert len(SCHEMA_3_DROPPED) == 10
+    assert set(SCHEMA_3_DROPPED) <= set(PROJECT_META_FIELDS)
+    assert len(PROJECT_META_COLUMNS_3) == 19
+    back = tuple({v: k for k, v in SCHEMA_3_RENAMED.items()}.get(c, c)
+                 for c in PROJECT_META_COLUMNS_3)
+    assert back == tuple(f for f in PROJECT_META_FIELDS if f not in SCHEMA_3_DROPPED)
+    assert PROJECT_META_COLUMNS_3[:2] == ("clone_url", "audit_frame_file")
+    assert PROJECT_META_COLUMNS_3[-1] == "fork"
+
+
+def test_meta_columns_refuses_an_unknown_schema():
+    from generate_dataset import meta_columns
+    assert meta_columns("1") == PROJECT_META_FIELDS
+    with pytest.raises(ValueError, match="unknown ctp schema"):
+        meta_columns("2")
+
+
+def test_a_schema_3_column_reads_its_new_key_then_its_old_key(tmp_path):
+    from generate_dataset import PROJECT_META_COLUMNS_3
+    path = tmp_path / "meta.json"
+    path.write_text(json.dumps({
+        "old": {"provenance_status": "frame:a.csv", "fact": "roster:asf"},
+        "new": {"audit_frame_file": "frame:b.csv", "provenance_status": "x"},
+    }))
+    old = load_project_meta(str(path), "old", PROJECT_META_COLUMNS_3)
+    new = load_project_meta(str(path), "new", PROJECT_META_COLUMNS_3)
+    assert list(old) == list(PROJECT_META_COLUMNS_3)
+    assert old["audit_frame_file"] == "frame:a.csv"
+    assert new["audit_frame_file"] == "frame:b.csv"
+    assert "fact" not in old
+    assert list(load_project_meta("", "x", PROJECT_META_COLUMNS_3)) == list(
+        PROJECT_META_COLUMNS_3)
+
+
+def test_the_default_run_writes_the_schema_3_columns(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    from generate_dataset import PROJECT_META_COLUMNS_3
+    row = {f: "" for f in PROJECT_META_FIELDS}
+    row.update(provenance_status="frame:f.csv@sha256:0123456789ab",
+               stratum="foundation", fact="roster:asf", size_kb="12")
+    meta = tmp_path / "meta.json"
+    meta.write_text(json.dumps({"proj": row}))
+
+    out = generate(monkeypatch, tmp_path, ctp_schema=None,
+                   argv_extra=("--project-meta", str(meta)))
+
+    schema = schema_of(duckdb, out)
+    names = [n for n, _ in schema]
+    assert len(schema) == SCHEMA_3_TOTAL_COLUMNS
+    assert names[1:20] == list(PROJECT_META_COLUMNS_3)
+    assert names[20] == "file_path"
+    assert not {"fact", "size_kb", "provenance_status", "file_mask"} & set(names)
+    got = duckdb.sql(f"select audit_frame_file, stratum from read_parquet('{out}')").fetchone()
+    assert got == ("frame:f.csv@sha256:0123456789ab", "foundation")
 
 
 # --------------------------------------------------------------------------- #

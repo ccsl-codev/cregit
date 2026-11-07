@@ -467,6 +467,41 @@ PROJECT_META_FIELDS = (
     "manifest_category", "file_mask",
 )
 
+# ctp schema 3 (the "Token on Me" release). Ten of the 29 fields leave the token
+# file, and provenance_status gets the name audit_frame_file. The other 19 keep
+# their order. ctp has the same lists in validate_schema.py (META_FIELDS_3), and
+# its tests/test_meta_field_drift.py reads this file to compare them.
+# ctp schema 1 and 2 use the 29 fields above.
+SCHEMA_3_DROPPED = (
+    "size_kb", "file_mask", "manifest_category", "fact",
+    "history_cluster", "history_shared_with", "history_relation",
+    "history_includes", "history_first", "history_created",
+)
+SCHEMA_3_RENAMED = {"provenance_status": "audit_frame_file"}
+PROJECT_META_COLUMNS_3 = tuple(
+    SCHEMA_3_RENAMED.get(f, f) for f in PROJECT_META_FIELDS
+    if f not in SCHEMA_3_DROPPED
+)
+CTP_SCHEMAS = ("1", "3")
+DEFAULT_CTP_SCHEMA = "3"
+
+
+def meta_columns(ctp_schema: str) -> tuple[str, ...]:
+    """The metadata column names of a ctp schema, in column order."""
+    if ctp_schema not in CTP_SCHEMAS:
+        raise ValueError(f"unknown ctp schema {ctp_schema!r}; use one of {CTP_SCHEMAS}")
+    return PROJECT_META_FIELDS if ctp_schema == "1" else PROJECT_META_COLUMNS_3
+
+
+def sidecar_keys(column: str) -> tuple[str, ...]:
+    """The sidecar keys that fill a column, first match wins.
+
+    A renamed column reads its new key first, then its old key, so a sidecar
+    written for schema 1 or 2 still fills a schema 3 file.
+    """
+    old = [o for o, n in SCHEMA_3_RENAMED.items() if n == column]
+    return (column, *old)
+
 
 def sql_literal(value) -> str:
     """A single-quoted SQL literal, with embedded quotes doubled.
@@ -480,16 +515,18 @@ def sql_literal(value) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def load_project_meta(meta_path, project_key) -> dict:
+def load_project_meta(meta_path, project_key, columns=PROJECT_META_FIELDS) -> dict:
     """The project's constants, or empty strings when no sidecar was given.
+
+    The result maps each name of `columns` to its value, in that order.
 
     An absent sidecar is allowed, so an older caller still produces a file with
     the full column set. A sidecar that does not hold the key is not: that is a
     stale sidecar or a mistyped slug, and falling back to empty strings would
-    publish 29 blank columns without saying so.
+    publish blank provenance columns without saying so.
     """
     if not meta_path:
-        return {f: "" for f in PROJECT_META_FIELDS}
+        return {f: "" for f in columns}
     import json
 
     with open(meta_path) as fh:
@@ -500,18 +537,21 @@ def load_project_meta(meta_path, project_key) -> dict:
             "project_meta.py, or the dataset would carry blank provenance."
         )
     row = meta[project_key]
-    return {f: row.get(f, "") for f in PROJECT_META_FIELDS}
+    return {
+        c: next((row[k] for k in sidecar_keys(c) if k in row), "")
+        for c in columns
+    }
 
 
 def project_meta_sql(project_meta) -> str:
-    """The metadata columns as SQL, one per line, in PROJECT_META_FIELDS order.
+    """The metadata columns as SQL, one per line, in the order of the dict.
 
     Every value goes through sql_literal. Each line ends in a comma, so the
     block drops straight into the SELECT list.
     """
     return "".join(
-        f"                {sql_literal(project_meta[f])} AS {f},\n"
-        for f in PROJECT_META_FIELDS
+        f"                {sql_literal(value)} AS {name},\n"
+        for name, value in project_meta.items()
     )
 
 
@@ -588,6 +628,14 @@ def main():
         help="key into --project-meta (the manifest name). Defaults to --repo-name.",
     )
     parser.add_argument(
+        "--ctp-schema",
+        default=DEFAULT_CTP_SCHEMA,
+        choices=CTP_SCHEMAS,
+        help=f"the metadata columns to write (default: {DEFAULT_CTP_SCHEMA}). "
+        "3: the 19 columns of ctp schema 3, with provenance_status named "
+        "audit_frame_file. 1: the 29 columns of ctp schemas 1 and 2.",
+    )
+    parser.add_argument(
         "--memory-limit",
         default=DEFAULT_MEMORY_LIMIT,
         metavar="SIZE",
@@ -654,7 +702,8 @@ def main():
 
     # Resolve before Phase 1: a bad key must not surface after the inserts.
     project_meta = load_project_meta(
-        args.project_meta, args.project_key or args.repo_name)
+        args.project_meta, args.project_key or args.repo_name,
+        meta_columns(args.ctp_schema))
 
     blame_files = sorted(blame_root.rglob("*.blame"))
     if not blame_files:
