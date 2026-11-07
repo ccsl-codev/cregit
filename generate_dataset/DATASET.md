@@ -7,10 +7,15 @@ tokenized git repository, annotated with commit metadata, authorship information
 person identity, and the commit's git trailers.  It is the final
 output of the CreGit pipeline (Step 10).
 
-**ctp schema 3 is the default.** It writes 57 columns: the provenance block has
-19 columns, not 29. The 10 columns `size_kb`, `file_mask`, `manifest_category`,
-`fact` and the six `history_*` columns are not written, and `provenance_status`
-has the name `audit_frame_file`. The other 19 keep their order. The column is
+**ctp schema 3 is the default.** It writes 49 columns: the provenance block has
+16 columns, not 29. The 13 columns `size_kb`, `file_mask`, `manifest_category`,
+`fact`, the six `history_*` columns, `roster_lang`, `archived` and `fork` are
+not written, and `provenance_status` has the name `audit_frame_file`. The
+other 16 keep their order. The 5 token columns `person_name`, `person_email`,
+`footer_person_names`, `cregit_commit_sha` and `repo_tag` are not written
+either: the first three repeat `personid`, `author_email` and
+`footer_personids` with a fixed text change, `cregit_commit_sha` maps one to
+one to `original_commit_sha`, and `repo_tag` is always empty. The column is
 filled from the sidecar key `audit_frame_file`, else from `provenance_status`.
 `--ctp-schema 1` writes the 67 columns below, the layout of ctp schemas 1 and 2.
 `SCHEMA_3_TOTAL_COLUMNS` in `tests/test_generate_dataset.py` pins the count.

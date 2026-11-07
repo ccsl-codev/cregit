@@ -476,20 +476,20 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
 # ctp schema 3: 19 metadata columns, provenance_status named audit_frame_file
 # --------------------------------------------------------------------------- #
 
-SCHEMA_3_TOTAL_COLUMNS = 57              # 38 token/commit columns + 19 metadata
+SCHEMA_3_TOTAL_COLUMNS = 49              # 33 token/commit columns + 16 metadata
 
 
 def test_schema_3_keeps_19_fields_in_the_old_order():
     from generate_dataset import (PROJECT_META_COLUMNS_3, SCHEMA_3_DROPPED,
                                   SCHEMA_3_RENAMED)
-    assert len(SCHEMA_3_DROPPED) == 10
+    assert len(SCHEMA_3_DROPPED) == 13
     assert set(SCHEMA_3_DROPPED) <= set(PROJECT_META_FIELDS)
-    assert len(PROJECT_META_COLUMNS_3) == 19
+    assert len(PROJECT_META_COLUMNS_3) == 16
     back = tuple({v: k for k, v in SCHEMA_3_RENAMED.items()}.get(c, c)
                  for c in PROJECT_META_COLUMNS_3)
     assert back == tuple(f for f in PROJECT_META_FIELDS if f not in SCHEMA_3_DROPPED)
     assert PROJECT_META_COLUMNS_3[:2] == ("clone_url", "audit_frame_file")
-    assert PROJECT_META_COLUMNS_3[-1] == "fork"
+    assert PROJECT_META_COLUMNS_3[-1] == "owner_type"
 
 
 def test_meta_columns_refuses_an_unknown_schema():
@@ -531,9 +531,14 @@ def test_the_default_run_writes_the_schema_3_columns(monkeypatch, tmp_path):
     schema = schema_of(duckdb, out)
     names = [n for n, _ in schema]
     assert len(schema) == SCHEMA_3_TOTAL_COLUMNS
-    assert names[1:20] == list(PROJECT_META_COLUMNS_3)
-    assert names[20] == "file_path"
-    assert not {"fact", "size_kb", "provenance_status", "file_mask"} & set(names)
+    from generate_dataset import SCHEMA_3_DROPPED_TOKEN_COLUMNS
+    assert names[1:17] == list(PROJECT_META_COLUMNS_3)
+    assert names[17] == "file_path"
+    assert not {"fact", "size_kb", "provenance_status", "file_mask", "roster_lang"} & set(names)
+    assert not set(SCHEMA_3_DROPPED_TOKEN_COLUMNS) & set(names)
+    assert names[-1] == "footer_personids"
+    order = duckdb.sql(f"select file_path, token_index from read_parquet('{out}')").fetchall()
+    assert order == sorted(order)
     got = duckdb.sql(f"select audit_frame_file, stratum from read_parquet('{out}')").fetchone()
     assert got == ("frame:f.csv@sha256:0123456789ab", "foundation")
 

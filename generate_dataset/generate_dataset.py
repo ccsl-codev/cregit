@@ -467,8 +467,8 @@ PROJECT_META_FIELDS = (
     "manifest_category", "file_mask",
 )
 
-# ctp schema 3 (the "Token on Me" release). Ten of the 29 fields leave the token
-# file, and provenance_status gets the name audit_frame_file. The other 19 keep
+# ctp schema 3 (the "Token on Me" release). 13 of the 29 fields leave the token
+# file, and provenance_status gets the name audit_frame_file. The other 16 keep
 # their order. ctp has the same lists in validate_schema.py (META_FIELDS_3), and
 # its tests/test_meta_field_drift.py reads this file to compare them.
 # ctp schema 1 and 2 use the 29 fields above.
@@ -476,6 +476,15 @@ SCHEMA_3_DROPPED = (
     "size_kb", "file_mask", "manifest_category", "fact",
     "history_cluster", "history_shared_with", "history_relation",
     "history_includes", "history_first", "history_created",
+    "roster_lang", "archived", "fork",
+)
+# Five token columns that schema 3 does not write either: person_name,
+# person_email and footer_person_names repeat personid, author_email and
+# footer_personids with a fixed text change, cregit_commit_sha maps one to one
+# to original_commit_sha, and repo_tag is always empty.
+SCHEMA_3_DROPPED_TOKEN_COLUMNS = (
+    "person_name", "person_email", "footer_person_names",
+    "cregit_commit_sha", "repo_tag",
 )
 SCHEMA_3_RENAMED = {"provenance_status": "audit_frame_file"}
 PROJECT_META_COLUMNS_3 = tuple(
@@ -632,8 +641,9 @@ def main():
         default=DEFAULT_CTP_SCHEMA,
         choices=CTP_SCHEMAS,
         help=f"the metadata columns to write (default: {DEFAULT_CTP_SCHEMA}). "
-        "3: the 19 columns of ctp schema 3, with provenance_status named "
-        "audit_frame_file. 1: the 29 columns of ctp schemas 1 and 2.",
+        "3: ctp schema 3: 16 metadata columns, with provenance_status named "
+        "audit_frame_file, and without 5 token columns (49 columns in all). "
+        "1: the 29 metadata columns of ctp schemas 1 and 2 (67 columns).",
     )
     parser.add_argument(
         "--memory-limit",
@@ -831,8 +841,15 @@ def main():
 
     meta_sql = project_meta_sql(project_meta)
 
+    # Schema 3 leaves out five token columns. The outer SELECT keeps the order.
+    if args.ctp_schema == "1":
+        outer_open, outer_close = "", ""
+    else:
+        outer_open = ("SELECT * EXCLUDE ("
+                      + ", ".join(SCHEMA_3_DROPPED_TOKEN_COLUMNS) + ") FROM (")
+        outer_close = ") ORDER BY file_path, token_index"
     query = f"""
-        COPY (
+        COPY ({outer_open}
             SELECT
                 {sql_literal(args.repo_name)} AS repo_name,
 {meta_sql}                t.file_path,
@@ -971,7 +988,7 @@ def main():
             ) fpr ON coalesce(m.originalcid, t.commit_sha) = fpr.cid
 
             ORDER BY t.file_path, t.token_index
-        ) TO '{output_path}'
+        {outer_close}) TO '{output_path}'
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """
 
