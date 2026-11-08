@@ -364,12 +364,24 @@ def repair_token_line(token_content: str, repairable: bool,
     return token_content
 
 
+def read_blame_lines(blame_path: Path) -> list[str]:
+    """The lines of a .blame file, split on LF only, as git and the blame step
+    write them. Universal-newline text mode also split at a bare CR inside a
+    token ('// Foo\rBar'), so the token was cut at the CR and every later
+    token_index of the file grew by one. The CR of a CRLF line end still goes,
+    as text mode removed it."""
+    with open(blame_path, encoding="utf-8", errors="replace", newline="") as f:
+        lines = f.read().split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line[:-1] if line.endswith("\r") else line for line in lines]
+
+
 def process_blame_file(
     blame_path: Path, source_path: Path, rel_path: str, db_cursor,
     stats: Counter | None = None,
 ) -> int:
-    with open(blame_path, encoding="utf-8", errors="replace") as f:
-        blame_lines = f.readlines()
+    blame_lines = read_blame_lines(blame_path)
 
     source_text, has_bom, repairable = read_source(source_path)
     if stats is None:

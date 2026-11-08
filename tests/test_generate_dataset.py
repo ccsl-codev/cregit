@@ -15,7 +15,7 @@ from collections import Counter
 
 import pytest
 
-from generate_dataset import (DEFAULT_MEMORY_LIMIT, PROJECT_META_FIELDS,
+from generate_dataset import (read_blame_lines, parse_blame_line, DEFAULT_MEMORY_LIMIT, PROJECT_META_FIELDS,
                               SourceReader, is_ws, load_project_meta,
                               parse_memory_limit, process_blame_file,
                               project_meta_sql, repair_token_line,
@@ -1060,3 +1060,20 @@ def test_a_line_from_the_fixed_rust_tokenizer_is_kept(tmp_path):
 def test_repair_token_line(line, repairable, expected):
     assert repair_token_line(line, repairable, Counter(),
                              reader("")) == expected
+
+
+def test_a_bare_cr_stays_in_its_token_and_adds_no_line(tmp_path):
+    blame = tmp_path / "a.c.blame"
+    blame.write_bytes(b"s1;x;comment|// Foo\rBar\ns2;x;name|b\r\ns3;x;name|c\n")
+    lines = read_blame_lines(blame)
+    assert lines == ["s1;x;comment|// Foo\rBar", "s2;x;name|b", "s3;x;name|c"]
+    assert [parse_blame_line(x)[0] for x in lines] == ["s1", "s2", "s3"]
+
+
+def test_the_lf_split_equals_text_mode_without_a_bare_cr(tmp_path):
+    blame = tmp_path / "b.c.blame"
+    body = b"s1;x;name|a\r\ns2;x;op|+\n\ns3;x;name|c"
+    blame.write_bytes(body)
+    with open(blame, encoding="utf-8", errors="replace") as f:
+        old = [x.rstrip("\n") for x in f.readlines()]
+    assert read_blame_lines(blame) == old
