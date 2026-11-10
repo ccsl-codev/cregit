@@ -259,12 +259,12 @@ object  unifyPersons {
 
     logsIt.map { l =>
       val author = l.getAuthorIdent().getEmailAddress
-      val committer = l.getCommitterIdent().getEmailAddress
+      val committer = CommitterIdent.of(l).getEmailAddress
       val aut = splitEmail(author)
       val com = splitEmail(committer)
 
       val authorName = l.getAuthorIdent().getName
-      val committerName = l.getCommitterIdent().getName
+      val committerName = CommitterIdent.of(l).getName
 
       val authorKey = dealWithSingleWords(authorName, author)
       val commKey = dealWithSingleWords(committerName, committer)

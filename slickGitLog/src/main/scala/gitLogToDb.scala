@@ -158,7 +158,7 @@ object gitLogToDB extends ProgramInfo {
     val mapped = logsIt.map { l =>
       val dt = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
       val aWhen: String = dt.format(l.getAuthorIdent().getWhen)
-      val cWhen: String = dt.format(l.getCommitterIdent().getWhen)
+      val cWhen: String = dt.format(CommitterIdent.of(l).getWhen)
 
       val cid = l.getName
 
@@ -173,7 +173,7 @@ object gitLogToDB extends ProgramInfo {
         }.toSeq
 
       val aut = l.getAuthorIdent()
-      val com = l.getCommitterIdent()
+      val com = CommitterIdent.of(l)
 
       (
         // first is the commit tuple
