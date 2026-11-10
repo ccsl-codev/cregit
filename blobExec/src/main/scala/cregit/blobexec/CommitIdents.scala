@@ -25,13 +25,15 @@ object CommitIdents {
   /** The committer has an empty name, an empty e-mail and the author date. */
   case object Empty extends NullCommitterRule { val name = "empty" }
 
-  /** The committer keeps the text of the original header: the text before the
-    * date goes in the name (an `@` token goes in the e-mail), the date and the
-    * zone come from the header when they parse, else from the author. */
+  /** The committer is read from the `committer` header wherever it is in the header block (JGit only looks at the line after
+    * the first `author` line, so a commit with two `author` lines has no committer for JGit although the header is complete).
+    * The text before the date goes in the name (the `@` token, without `<` and `>`, goes in the e-mail); the date and the zone
+    * come from the header when they parse, else from the author. A commit with no `committer` header at all gets the author
+    * (an empty e-mail would join unrelated persons in unifyPersons). */
   case object RawHeader extends NullCommitterRule { val name = "raw-header" }
 
   /** The one place that sets the rule. Change it here and nowhere else. */
-  val NullCommitterRule: NullCommitterRule = CopyAuthor
+  val NullCommitterRule: NullCommitterRule = RawHeader
 
   private val UnknownAuthor: PersonIdent = new PersonIdent("", "", new Date(0L), TimeZone.getTimeZone("UTC"))
 
@@ -61,7 +63,7 @@ object CommitIdents {
   private def fromRawHeader(raw: Array[Byte], author: PersonIdent): PersonIdent = {
     val text = headerLine(raw, "committer ") match {
       case Some(t) => t
-      case None    => return new PersonIdent("", "", author.getWhen, author.getTimeZone)
+      case None    => return author
     }
     val tokens = text.trim.split(' ').filter(_.nonEmpty).toList
     val (rest, when, tz) = tokens.reverse match {
@@ -72,7 +74,7 @@ object CommitIdents {
     }
     val email = rest.find(_.contains("@")).map(_.stripPrefix("<").stripSuffix(">")).getOrElse("")
     val name = rest.filterNot(t => t.contains("@")).mkString(" ").replaceAll("[<>\n]", "")
-    new PersonIdent(name, email.replaceAll("[<>\n]", ""), when, tz)
+    if (name.isEmpty && email.isEmpty) author else new PersonIdent(name, email.replaceAll("[<>\n]", ""), when, tz)
   }
 
   private def zoneOffset(z: String): Option[Int] =

@@ -23,10 +23,12 @@ class NullCommitterSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll
 
   private val authorLine = "author Alice Author <alice@example.org> 1700000000 +0200"
 
+  private val secondAuthor = "author Zed Other <zed@example.org> 1690000000 +0500\n"
   private val variants = Seq(
     "no angle brackets" -> "committer bob@example.org 1700000100 -0300",
     "an empty committer value" -> "committer ",
-    "no committer header" -> "")
+    "no committer header" -> "",
+    "two author lines" -> (secondAuthor + "committer Alice Author <alice@example.org> 1700000700 +0200"))
 
   private final case class Fixture(repo: Repository, badSha: String, dir: Path)
 
@@ -113,7 +115,7 @@ class NullCommitterSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll
     }
 
     for (mode <- Seq("serial", "pipeline", "pipeline-trees"))
-      test(s"[$mode] the rewrite finishes and the committer is the author ($label)") {
+      test(s"[$mode] the rewrite finishes and the committer is readable ($label)") {
         val f = fixture(line)
         val (stats, dstPath, dbPath, command) = walk(f, mode)
         stats.aborted shouldBe false
@@ -129,9 +131,13 @@ class NullCommitterSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll
             val rc = rw.parseCommit(ObjectId.fromString(newSha.get))
             rc.getAuthorIdent.getEmailAddress shouldEqual "alice@example.org"
             rc.getCommitterIdent should not be null
-            rc.getCommitterIdent.getName shouldEqual rc.getAuthorIdent.getName
-            rc.getCommitterIdent.getEmailAddress shouldEqual rc.getAuthorIdent.getEmailAddress
-            rc.getCommitterIdent.getWhen shouldEqual rc.getAuthorIdent.getWhen
+            if (label != "no angle brackets") {
+              rc.getCommitterIdent.getName shouldEqual rc.getAuthorIdent.getName
+              rc.getCommitterIdent.getEmailAddress shouldEqual rc.getAuthorIdent.getEmailAddress
+            }
+            if (label == "two author lines") rc.getCommitterIdent.getWhen.getTime shouldEqual 1700000700000L
+            else if (label == "no angle brackets") rc.getCommitterIdent.getEmailAddress shouldEqual "bob@example.org"
+            else rc.getCommitterIdent.getWhen shouldEqual rc.getAuthorIdent.getWhen
             rc.getFullMessage should include(f.badSha)
           } finally { rw.close(); dst.close() }
         } finally m.close()
@@ -167,12 +173,11 @@ class NullCommitterSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll
     c.getWhen.getTime shouldEqual 1700000100000L
   }
 
-  test("rule raw-header without a committer header falls back to an empty committer") {
+  test("rule raw-header without a committer header falls back to the author") {
     val a = new PersonIdent("A", "a@x.org")
     val raw = ("tree 0\n" + authorLine + "\n\nm\n").getBytes(UTF_8)
     val (_, c) = CommitIdents.resolve("sha", a, null, raw, CommitIdents.RawHeader, _ => ())
-    c.getName shouldEqual ""
-    c.getEmailAddress shouldEqual ""
+    c shouldEqual a
   }
 
   test("a commit without a readable author takes its committer as author") {
