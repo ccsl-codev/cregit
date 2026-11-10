@@ -837,12 +837,14 @@ final class Walker(
     * the shared, single-threaded RevWalk owned by the producer. */
   private def snapshotCommit(rc: RevCommit): CommitData = {
     val enc = try rc.getEncoding catch { case _: Throwable => java.nio.charset.StandardCharsets.UTF_8 }
+    val (author, committer) =
+      CommitIdents.resolve(rc.getId.name, rc.getAuthorIdent, rc.getCommitterIdent, rc.getRawBuffer)
     CommitData(
       origCommitSha  = rc.getId.name,
       parentOrigShas = rc.getParents.toVector.map(_.getId.name),
       origTreeId     = rc.getTree.getId,
-      author         = rc.getAuthorIdent,
-      committer      = rc.getCommitterIdent,
+      author         = author,
+      committer      = committer,
       encoding       = enc,
       fullMessage    = rc.getFullMessage
     )
@@ -1259,8 +1261,10 @@ final class Walker(
       inserter: ObjectInserter
   ): ObjectId = {
     val cb = new CommitBuilder
-    cb.setAuthor(orig.getAuthorIdent)
-    cb.setCommitter(orig.getCommitterIdent)
+    val (author, committer) =
+      CommitIdents.resolve(orig.getId.name, orig.getAuthorIdent, orig.getCommitterIdent, orig.getRawBuffer)
+    cb.setAuthor(author)
+    cb.setCommitter(committer)
     val enc = try orig.getEncoding catch { case _: Throwable => java.nio.charset.StandardCharsets.UTF_8 }
     cb.setEncoding(enc)
     cb.setMessage(FormerCommitFooter.append(orig.getFullMessage, orig.getId.name))
