@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 56;
+use Test::More tests => 67;
 use FindBin;
 use File::Temp qw(tempdir);
 use File::Basename qw(dirname);
@@ -169,6 +169,7 @@ if [ \$blame = 1 ]; then
         slow-c100-plain-fails) [ \$c100 = 1 ] && exec sleep 60; exit 3 ;;
         fail) echo "fatal: fake failure" >&2; exit 3 ;;
         c100-exit128) [ \$c100 = 1 ] && { echo "fatal: unable to generate diff (fake)" >&2; exit 128; } ;;
+        c100-exit128-other) [ \$c100 = 1 ] && { echo "fatal: bad object (fake)" >&2; exit 128; } ;;
         exit128) echo "fatal: unable to generate diff (fake)" >&2; exit 128 ;;
         killed) printf '%040d 1 1 1\\n' 0; kill -9 \$\$ ;;
     esac
@@ -259,12 +260,47 @@ FAKE
     isnt($s10, 0, "a plain blame exit 128 after the fallback gives a non-zero exit");
     ok(!-e "$d10/moved.c.blame", "a failing fallback writes no blame file");
 
+    # An exit 128 of -C100 that is not the xdiff failure is an error, not a fallback.
+    my ($s11, $d11, undef, $err11) = $run->('c100-exit128-other', '');
+    isnt($s11, 0, "a -C100 exit 128 with another message gives a non-zero exit");
+    ok(!-e "$d11/moved.c.blame", "a -C100 exit 128 with another message writes no blame file");
+    unlike($err11, qr/PLAIN-BLAME/, "a -C100 exit 128 with another message prints no PLAIN-BLAME line");
+
     my @tempsAfter = glob("$buildDir/tmpfile-*");
     is(scalar(@tempsAfter), scalar(@tempsBefore), "the failed runs leave no temp file in build/");
 
     # A limit that is not a whole number of seconds is rejected.
     my ($s9) = $run->('none', '--c100-limit=abc');
     isnt($s9, 0, "a limit that is not a number is rejected");
+}
+
+# An existing output file: kept without --overwrite, replaced with it. A failed
+# write leaves no partial file and a non-zero exit.
+{
+    my $repo2 = "$workdir/moved";
+    my $dest = tempdir(CLEANUP => 1);
+    write_file("$dest/moved.c.blame", "stale\n");
+    is(system("perl '$script' '$repo2' moved.c '$dest' 2>/dev/null"), 0,
+       "a run with an existing output file succeeds");
+    is(join('', slurp_lines("$dest/moved.c.blame")), "stale",
+       "without --overwrite an existing output file is kept");
+    is(system("perl '$script' --overwrite '$repo2' moved.c '$dest' 2>/dev/null"), 0,
+       "a run with --overwrite succeeds");
+    my @fresh = slurp_lines("$dest/moved.c.blame");
+    is(scalar(@fresh), 10, "--overwrite replaces the existing output file");
+    my @partials = glob("$dest/*.partial.*");
+    is(scalar(@partials), 0, "no partial file stays next to the output");
+
+    SKIP: {
+        skip "root can write to a read-only folder", 3 if $> == 0;
+        my $ro = tempdir(CLEANUP => 1);
+        chmod 0555, $ro or die $!;
+        my $out = `perl '$script' '$repo2' moved.c '$ro' 2>&1`;
+        isnt($? , 0, "an output folder that cannot be written gives a non-zero exit");
+        ok(!-e "$ro/moved.c.blame", "no blame file is written to it");
+        like($out, qr/^Error: unable to copy/m, "the script says that the copy failed");
+        chmod 0755, $ro;
+    }
 }
 
 # Two non-contiguous groups from one commit, in a renamed file: --porcelain

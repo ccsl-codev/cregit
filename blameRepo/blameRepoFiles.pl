@@ -128,7 +128,7 @@ foreach my $name (@filesToBlame) {
     print STDERR ("$count: $name\n");
 
     # '--' ends the options: a path that starts with '-' is not read as one.
-    start_command($name, $blameCommand, "--blameExtension=$blameExtension", '--', $repoDir, $name, $outputDir);
+    start_command($name, $blameCommand, "--blameExtension=$blameExtension", ($overwrite ? ('--overwrite') : ()), '--', $repoDir, $name, $outputDir);
 }
 
 reap_command() while %running;
