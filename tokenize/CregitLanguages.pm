@@ -70,6 +70,8 @@ our %EXT_LANG = (
     'am'   => 'M4',
     # Rust
     'rs'   => 'Rust',
+    # Shell
+    'sh'   => 'Sh',
 );
 
 # Languages the pipeline's file mask is allowed to select, i.e. the ones whose
@@ -102,6 +104,7 @@ our %MASKED_LANGUAGES = (
     'C++'  => 1,
     'Java' => 1,
     'Rust' => 1,
+    'Sh'   => 1,
 );
 
 # Language -> parser, relative to the tokenize/ directory. Every value must
@@ -112,6 +115,7 @@ our %LANG_PARSER_REL = (
     'Java' => 'tokenizeSrcMl.pl',
     'M4'   => 'm4Tokenizer/m4.py',
     'Rust' => 'rustTokenizer/target/release/rust_tokenizer',
+    'Sh'   => 'shTokenizer/sh_tokenizer.py',
 );
 
 # The parser every srcML-routed language shares. Named so callers can ask "is

@@ -42,7 +42,7 @@ my $usage = "
 Usage $0 [options] <sourcefilename> <outputfile>*
 
 Options:
-   --language=<C/C++/Java/m4/Rust>
+   --language=<C/C++/Java/m4/Rust/Sh>
    --position
    --srcml=<path>          (forwarded to srcML-based parsers only)
    --srcml2token=<path>    (forwarded to srcML-based parsers only)
@@ -55,7 +55,7 @@ my $verbose;
 my $position = 0;
 # srcML-specific options. Accepted here so a single caller (e.g. BFG_TOKENIZE_CMD)
 # can pin the binary paths once and have them reach tokenizeSrcMl.pl without knowing
-# which language each blob is. For non-srcML parsers (Rust, M4) these are ignored.
+# which language each blob is. For non-srcML parsers (Rust, M4, Sh) these are ignored.
 my $srcmlPath = "";
 my $srcml2tokenPath = "";
 my $ctagsPath = "";
