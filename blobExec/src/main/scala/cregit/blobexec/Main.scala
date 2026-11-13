@@ -14,6 +14,11 @@ object Main {
   /** Not 3 (memo mismatch): a no-op request must be told apart from a refusal. */
   private[blobexec] val RetokenizeIneffectiveExitStatus = 7
 
+  /** zlib level 1 for dst's loose objects: they are temporary, because the pack
+    * after step 2 re-deflates every one at git's pack.compression. Measured -11%
+    * consumer CPU on psi-probe against JGit's default level. */
+  private[blobexec] val DefaultLooseCompression = 1
+
   private val UsageExitStatus   = 1
   private val RefusedExitStatus = 3
 
@@ -74,6 +79,16 @@ object Main {
       |                             --tokenizer-identity and --memo-dir; a no-op is refused (status ${RetokenizeIneffectiveExitStatus})
       |  --memo-dir=<dir>           the tokenizer memo ($$BFG_MEMO_DIR) that --retokenize purges
       |  --tokenizer-worker=<path>  tokenize through a pool of persistent workers; needs --pipeline(-trees)
+      |  --alternates               write <dst.git>/objects/info/alternates naming <src.git>'s objects
+      |                             and copy no original blob; the caller must then repack <dst.git>
+      |                             without -l and delete that file. Not with --shard
+      |  --commits-per-transaction=<n>
+      |                             commits whose mapping rows share one SQLite transaction
+      |                             (default ${Walker.DefaultCommitsPerTransaction}; 1 = one per commit)
+      |  --sqlite-cache-mb=<n>      SQLite page cache for the mapping DB (default ${Mapping.DefaultCacheMiB}; 0 = SQLite's 2 MB)
+      |  --sqlite-mmap-mb=<n>       memory-map up to this much of the mapping DB (default ${Mapping.DefaultMmapMiB}; 0 = off)
+      |  --loose-compression=<n>    zlib level of the loose objects written to <dst.git>, in memory only
+      |                             (default ${DefaultLooseCompression}; -1 = JGit's default, 6). git repacks them anyway
       |  --blob-timeout=<seconds>   budget for one <command> run (default ${BlobExec.DefaultTimeoutSeconds}); then its process
       |                             tree is killed and the blob excluded
       |  --stall-timeout=<seconds>  exit ${Walker.StalledExitStatus} after this long with no progress (default ${Walker.DefaultStallTimeoutSeconds});
@@ -103,6 +118,10 @@ object Main {
       retokenize: Set[String] = Set.empty,
       memoDir: Option[Path] = None,
       tokenizerWorker: Option[Path] = None,
+      alternates: Boolean = false,
+      commitsPerTransaction: Int = Walker.DefaultCommitsPerTransaction,
+      sqlite: Mapping.Tuning = Mapping.Tuning(),
+      looseCompression: Int = DefaultLooseCompression,
       blobTimeoutSeconds: Int = BlobExec.DefaultTimeoutSeconds,
       stallTimeoutSeconds: Int = Walker.DefaultStallTimeoutSeconds,
       stallExplicit: Boolean = false,
@@ -136,6 +155,8 @@ object Main {
         "into, or the invalidation would leave the real memo's stale entries in place."
 
     val PipelinesExclusive = withUsage("Error: --pipeline and --pipeline-trees are mutually exclusive")
+    val AlternatesUnderShard = withUsage(
+      "Error: --alternates cannot be used with --shard: shard_merge.py copies each shard's own objects")
     val ShardWithPipeline = withUsage(
       "Error: --shard uses the serial tree-only walker and cannot be combined with --pipeline / --pipeline-trees")
     val MaskWidenedUnderShard = withUsage(
@@ -222,9 +243,22 @@ object Main {
   private val TokenizerWorkerFlag   = new ValuedFlag("--tokenizer-worker")
   private val BlobTimeoutFlag       = new ValuedFlag("--blob-timeout")
   private val StallTimeoutFlag      = new ValuedFlag("--stall-timeout")
+  private val CommitsPerTxFlag      = new ValuedFlag("--commits-per-transaction")
+  private val SqliteCacheFlag       = new ValuedFlag("--sqlite-cache-mb")
+  private val SqliteMmapFlag        = new ValuedFlag("--sqlite-mmap-mb")
+  private val LooseCompressionFlag  = new ValuedFlag("--loose-compression")
 
   private def flagValue[A](flag: ValuedFlag, spec: String)(parse: String => Either[String, A]): Either[String, A] =
     parse(spec).left.map(Messages.badFlagValue(flag.name, _))
+
+  private def positive(spec: String): Either[String, Int] =
+    spec.toIntOption.filter(_ > 0).toRight(s"must be a positive whole number [$spec]")
+
+  private def mebibytes(spec: String): Either[String, Int] =
+    spec.toIntOption.filter(_ >= 0).toRight(s"must be a whole number of MiB, 0 or more [$spec]")
+
+  private def level(spec: String): Either[String, Int] =
+    spec.toIntOption.filter(n => n >= -1 && n <= 9).toRight(s"must be a zlib level, -1 to 9 [$spec]")
 
   private def seconds(spec: String): Either[String, Int] =
     parsePositiveSeconds(spec).toRight(Messages.secondsWanted(spec))
@@ -249,6 +283,7 @@ object Main {
     case "--pipeline"       => Right(o.copy(pipeline = true))
     case "--pipeline-trees" => Right(o.copy(pipelineTrees = true))
     case "--mask-widened"   => Right(o.copy(maskWidened = true))
+    case "--alternates"     => Right(o.copy(alternates = true))
     case TokenizerIdentityFlag(spec) =>
       flagValue(TokenizerIdentityFlag, spec)(TokenizerIdentity.parse).map(id => o.copy(tokenizerIdentity = id))
     case RetokenizeFlag(spec) =>
@@ -265,6 +300,14 @@ object Main {
       Right(o.copy(tokenizerWorker = Some(Paths.get(spec))))
     case BlobTimeoutFlag(spec) =>
       flagValue(BlobTimeoutFlag, spec)(seconds).map(secs => o.copy(blobTimeoutSeconds = secs))
+    case CommitsPerTxFlag(spec) =>
+      flagValue(CommitsPerTxFlag, spec)(positive).map(n => o.copy(commitsPerTransaction = n))
+    case SqliteCacheFlag(spec) =>
+      flagValue(SqliteCacheFlag, spec)(mebibytes).map(n => o.copy(sqlite = o.sqlite.copy(cacheMiB = n)))
+    case SqliteMmapFlag(spec) =>
+      flagValue(SqliteMmapFlag, spec)(mebibytes).map(n => o.copy(sqlite = o.sqlite.copy(mmapMiB = n)))
+    case LooseCompressionFlag(spec) =>
+      flagValue(LooseCompressionFlag, spec)(level).map(n => o.copy(looseCompression = n))
     case StallTimeoutFlag(spec) =>
       flagValue(StallTimeoutFlag, spec)(seconds).map(secs => o.copy(stallTimeoutSeconds = secs, stallExplicit = true))
     case other => Left(Messages.unknownFlag(other))
@@ -285,6 +328,7 @@ object Main {
       (retokenizing && o.shard.isDefined)           -> (() => Messages.RetokenizeUnderShard),
       (!retokenizing && o.memoDir.isDefined)        -> (() => Messages.MemoDirWithoutRetokenize),
       (o.shard.isDefined && o.anyPipeline)          -> (() => Messages.ShardWithPipeline),
+      (o.shard.isDefined && o.alternates)           -> (() => Messages.AlternatesUnderShard),
       o.tokenizerWorker.exists(p => !Files.isRegularFile(p) || !Files.isExecutable(p)) ->
         (() => Messages.workerNotExecutable(o.tokenizerWorker.get)),
       (o.tokenizerWorker.isDefined && !o.anyPipeline) -> (() => Messages.WorkerNeedsPipeline)
@@ -311,7 +355,20 @@ object Main {
     } yield full
   }
 
+  /** JGit hashes with its own Java SHA-1, which also runs collision detection
+    * (SHA1DC); the JDK's intrinsic one is faster (-5% on psi-probe). Both give the
+    * same id for every input that is not a crafted SHA-1 collision; on one of
+    * those the Java one throws instead. Set before JGit hashes anything, and only
+    * when the operator did not choose: -Dorg.eclipse.jgit.util.sha1.implementation=java
+    * keeps the old one. JGit reads the property on every new hasher. */
+  private[blobexec] val Sha1ImplementationProperty = "org.eclipse.jgit.util.sha1.implementation"
+
+  private[blobexec] def defaultSha1Implementation(): Unit =
+    if (System.getProperty(Sha1ImplementationProperty) == null)
+      System.setProperty(Sha1ImplementationProperty, "jdkNative")
+
   def main(args: Array[String]): Unit = {
+    defaultSha1Implementation()
     val options = parse(args.toVector) match {
       case Right(o)  => o
       case Left(why) => exit(why, UsageExitStatus)
@@ -339,7 +396,8 @@ object Main {
     println(startLine(o, stallSeconds, incremental))
 
     val src = openSrc(o.src)
-    val dst = openOrInitDst(o.dst)
+    val dst = openOrInitDst(o.dst, borrowFrom = Option.when(o.alternates)(src.getObjectsDirectory.toPath))
+    setLooseCompression(dst, o.looseCompression)
     val mapping = openMapping(o, src, dst) match {
       case Right(m) => m
       case Left(refusal) =>
@@ -368,13 +426,17 @@ object Main {
       s"maskWidened=${o.maskWidened} denylistEntries=${BlobDenylist.shipped.size} " +
       s"tokenizerIdentity=${if (o.tokenizerIdentity.isEmpty) "none" else o.tokenizerIdentity.render} " +
       s"retokenize=${if (o.retokenize.isEmpty) "none" else o.retokenize.toVector.sorted.mkString(",")} " +
-      s"memoDir=${orNone(o.memoDir)} tokenizerWorker=${orNone(o.tokenizerWorker)}"
+      s"memoDir=${orNone(o.memoDir)} tokenizerWorker=${orNone(o.tokenizerWorker)} " +
+      s"alternates=${o.alternates} commitsPerTransaction=${o.commitsPerTransaction} " +
+      s"sqliteCacheMiB=${o.sqlite.cacheMiB} sqliteMmapMiB=${o.sqlite.mmapMiB} " +
+      s"looseCompression=${o.looseCompression} sha1=${System.getProperty(Sha1ImplementationProperty)}"
   }
 
   private final case class Refusal(status: Int, message: String)
 
   private def openMapping(o: Options, src: FileRepository, dst: FileRepository): Either[Refusal, Mapping] =
-    Try(Mapping.open(o.db, o.command, o.mask, o.warm, widening(o, dst), o.tokenizerIdentity, retokenize(o, src, dst)))
+    Try(Mapping.open(o.db, o.command, o.mask, o.warm, widening(o, dst), o.tokenizerIdentity, retokenize(o, src, dst),
+                     o.sqlite))
       .toEither
       .left.map(e => refusalFor(e, o).getOrElse(throw e))
 
@@ -436,9 +498,11 @@ object Main {
         src, dst, mapping, o.mask.r, o.command, o.abortOnError, parallelism,
         o.pipeline, o.pipelineTrees, o.shard,
         destinationMayContainObjects = incremental,
+        borrowOriginalObjects = o.alternates,
         blobTimeoutSeconds = o.blobTimeoutSeconds,
         stallTimeoutSeconds = stallSeconds,
         workerPool = workerPool,
+        commitsPerTransaction = o.commitsPerTransaction,
         denylist = BlobDenylist.shipped
       ).run()
     finally workerPool.foreach(_.close())
@@ -456,6 +520,7 @@ object Main {
       s"originalBlobDestinationLookups=${stats.originalBlobDestinationLookups} " +
       s"originalBlobBytesCopied=${stats.originalBlobBytesCopied} " +
       s"originalBlobBytesAvoided=${stats.originalBlobBytesAvoided} " +
+      s"originalBlobsBorrowed=${stats.originalBlobsBorrowed} " +
       s"refsProjected=${stats.refsProjected} " +
       s"blobsTimedOut=${stats.blobsTimedOut} " +
       s"blobsOversized=${stats.blobsOversized} " +
@@ -480,10 +545,40 @@ object Main {
     FileRepositoryBuilder.create(gitDir).asInstanceOf[FileRepository]
   }
 
-  private def openOrInitDst(path: Path): FileRepository = {
+  /** `borrowFrom` names src's objects directory: it is written to dst's
+    * objects/info/alternates BEFORE dst is opened for the walk, because JGit reads
+    * that file once, and a walk that skipped a copy must find the object there. */
+  private[blobexec] def openOrInitDst(path: Path, borrowFrom: Option[Path] = None): FileRepository = {
     val exists = Files.isDirectory(path)
     val repo = FileRepositoryBuilder.create(path.toFile).asInstanceOf[FileRepository]
     if (!exists) repo.create(true)
-    repo
+    borrowFrom match {
+      case None => repo
+      case Some(objects) =>
+        val info = repo.getObjectsDirectory.toPath.resolve("info")
+        repo.close()
+        Files.createDirectories(info)
+        writeAlternates(info.resolve("alternates"), objects)
+        FileRepositoryBuilder.create(path.toFile).asInstanceOf[FileRepository]
+    }
+  }
+
+  /** In memory only: dst's config file is not touched, so nothing that reads dst
+    * later (git repack, steps 3+) can see it. Object ids do not depend on it. JGit
+    * reads it when an inserter is created; a reload of the file would only bring
+    * back the default level, a speed loss, never a different object. */
+  private[blobexec] def setLooseCompression(dst: FileRepository, level: Int): Unit = {
+    val config = dst.getConfig  // loads the file first, if it changed
+    config.setInt("core", null, "compression", level)
+  }
+
+  /** One absolute line, replacing whatever was there: a resume writes the same
+    * file again. Written to a temporary file and renamed, so git never reads half. */
+  private[blobexec] def writeAlternates(file: Path, objects: Path): Unit = {
+    val line = objects.toAbsolutePath.normalize.toString + "\n"
+    val tmp  = file.resolveSibling(file.getFileName.toString + ".tmp")
+    Files.write(tmp, line.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+      java.nio.file.StandardCopyOption.ATOMIC_MOVE)
   }
 }
