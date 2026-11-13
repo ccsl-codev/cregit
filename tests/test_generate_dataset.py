@@ -100,6 +100,16 @@ def test_is_ws_treats_none_as_not_whitespace():
 # there: filling a tmpfs also exhausts system memory.
 # --------------------------------------------------------------------------- #
 
+def make_original_db(path):
+    """The git log DB of the original repository, as slickGitLog writes it in
+    step 3. Only its footers table is read."""
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE footers (cid CHAR(40), idx INTEGER, key TEXT, value TEXT)")
+    con.commit()
+    con.close()
+    return path
+
+
 def run_main(monkeypatch, tmp_path, argv_extra=()):
     """Drive main() far enough to reach the scratch allocation, then stop.
 
@@ -116,6 +126,7 @@ def run_main(monkeypatch, tmp_path, argv_extra=()):
     (src / "a.c").write_text("int x;\n")
     for name in ("cregit.db", "persons.db"):
         (tmp_path / name).write_text("")
+    make_original_db(tmp_path / "original.db")
     out = tmp_path / "out" / "proj-dataset.parquet"
 
     seen = {}
@@ -130,6 +141,7 @@ def run_main(monkeypatch, tmp_path, argv_extra=()):
         "--blame-dir", str(blame),
         "--source-dir", str(tmp_path / "src"),
         "--cregit-db", str(tmp_path / "cregit.db"),
+        "--original-db", str(tmp_path / "original.db"),
         "--persons-db", str(tmp_path / "persons.db"),
         "--output", str(out),
         *argv_extra,
@@ -308,7 +320,8 @@ def test_a_key_absent_from_the_sidecar_fails_loudly(tmp_path):
 # --------------------------------------------------------------------------- #
 
 TOTAL_COLUMNS = 67                      # 38 token/commit columns + 29 metadata
-SHA = "a" * 40
+SHA = "a" * 40                          # the commit in the cregit repository
+ORIGINAL_SHA = "b" * 40                 # the same commit in the original repository
 
 
 def build_tiny_project(tmp_path):
@@ -333,8 +346,11 @@ def build_tiny_project(tmp_path):
     con.execute("INSERT INTO commits VALUES (?,?,?,?,?,?,?,?,0)",
                 (SHA, "A Dev", "a@example.com", "2020-01-01",
                  "A Dev", "a@example.com", "2020-01-01", "first"))
+    con.execute("INSERT INTO commitmap VALUES (?,?,'')", (SHA, ORIGINAL_SHA))
     con.commit()
     con.close()
+
+    original_db = make_original_db(tmp_path / "original.db")
 
     persons_db = tmp_path / "persons.db"
     con = sqlite3.connect(persons_db)
@@ -347,26 +363,27 @@ def build_tiny_project(tmp_path):
     """)
     con.commit()
     con.close()
-    return blame, src, cregit_db, persons_db
+    return blame, src, cregit_db, original_db, persons_db
 
 
 def generate(monkeypatch, tmp_path, repo_name="proj", argv_extra=(), seed=None):
     """Run main() for real and return the Parquet path.
 
-    `seed(cregit_db, persons_db)` runs between the fixture and main(), for the
-    tests that need a trailer or a person in the input.
+    `seed(cregit_db, original_db, persons_db)` runs between the fixture and
+    main(), for the tests that need a trailer or a person in the input.
     """
     import generate_dataset as gd
 
-    blame, src, cregit_db, persons_db = build_tiny_project(tmp_path)
+    blame, src, cregit_db, original_db, persons_db = build_tiny_project(tmp_path)
     if seed is not None:
-        seed(cregit_db, persons_db)
+        seed(cregit_db, original_db, persons_db)
     out = tmp_path / "out" / "proj-dataset.parquet"
     monkeypatch.setattr(gd.sys, "argv", [
         "generate_dataset.py",
         "--blame-dir", str(blame),
         "--source-dir", str(src),
         "--cregit-db", str(cregit_db),
+        "--original-db", str(original_db),
         "--persons-db", str(persons_db),
         "--output", str(out),
         "--repo-name", repo_name,
@@ -455,16 +472,21 @@ def test_an_unknown_project_key_stops_the_run_before_phase_1(monkeypatch, tmp_pa
 # --------------------------------------------------------------------------- #
 
 
-def seed_footers(*trailers, people=()):
-    """Return a `seed` for generate(): trailers into footers, people into
-    emails/persons. `people` is (personid, emailaddr, personname)."""
-    def seed(cregit_db, persons_db):
-        con = sqlite3.connect(cregit_db)
-        for idx, (key, value) in enumerate(trailers):
-            con.execute("INSERT INTO footers VALUES (?,?,?,?)",
-                        (SHA, idx, key, value))
-        con.commit()
-        con.close()
+def seed_footers(*trailers, people=(), cregit_trailers=()):
+    """Return a `seed` for generate(): trailers into the footers table of the
+    original DB, keyed by the original commit SHA, and people into
+    emails/persons. `people` is (personid, emailaddr, personname).
+    `cregit_trailers` go into the footers table of the cregit DB, keyed by the
+    cregit commit SHA, as slickGitLog writes them in step 4."""
+    def seed(cregit_db, original_db, persons_db):
+        for db, sha, rows in ((original_db, ORIGINAL_SHA, trailers),
+                              (cregit_db, SHA, cregit_trailers)):
+            con = sqlite3.connect(db)
+            for idx, (key, value) in enumerate(rows):
+                con.execute("INSERT INTO footers VALUES (?,?,?,?)",
+                            (sha, idx, key, value))
+            con.commit()
+            con.close()
         con = sqlite3.connect(persons_db)
         for i, (pid, addr, pname) in enumerate(people, start=1):
             con.execute("INSERT INTO emails (recordid, personid, fullemail, "
@@ -516,6 +538,287 @@ def test_a_trailer_with_no_address_attributes_nobody(monkeypatch, tmp_path):
     ids, names, _reviewed = footers_of(duckdb, out)
     assert list(ids) == []
     assert list(names) == []
+
+
+# --------------------------------------------------------------------------- #
+# The trailers come from the original repository. In the cregit repository,
+# blobExec appends "\n" + "Former-commit-id: X" to a message whose last
+# paragraph has trailers. A git CLI message ends in "\n", so a blank line then
+# comes before Former-commit-id, and JGit (step 4) sees no other trailer.
+# --------------------------------------------------------------------------- #
+
+CLI_MESSAGE = ("Fix the parser\n"
+               "\n"
+               "The parser stopped at the first comment.\n"
+               "\n"
+               "Signed-off-by: A Dev <a@example.com>\n"
+               "Reviewed-by: Bob B <bob@example.com>\n")
+
+
+def rewritten_by_blobexec(message: str, original_sha: str) -> str:
+    """FormerCommitFooter.append for a last paragraph that has trailers."""
+    return message + "\n" + "Former-commit-id: " + original_sha
+
+
+def git_trailer_keys(message: str) -> list[str]:
+    import subprocess
+    out = subprocess.run(["git", "interpret-trailers", "--parse"], input=message,
+                         capture_output=True, text=True, check=True).stdout
+    return [line.split(":", 1)[0] for line in out.splitlines()]
+
+
+def test_the_rewritten_cli_message_hides_its_trailers_from_a_trailer_parser():
+    """The defect itself, with git as the parser: the original message has two
+    trailers, and the rewritten message has only Former-commit-id."""
+    import shutil
+    if shutil.which("git") is None:
+        pytest.skip("git is not on PATH")
+    rewritten = rewritten_by_blobexec(CLI_MESSAGE, ORIGINAL_SHA)
+    assert "\n\nFormer-commit-id: " in rewritten
+    assert git_trailer_keys(CLI_MESSAGE) == ["Signed-off-by", "Reviewed-by"]
+    assert git_trailer_keys(rewritten) == ["Former-commit-id"]
+
+
+def test_a_cli_message_keeps_its_signed_off_by_and_reviewed_by(monkeypatch, tmp_path):
+    """The two DBs hold what slickGitLog finds for CLI_MESSAGE: the original DB
+    has both trailers, and the cregit DB has only Former-commit-id."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        ("Reviewed-by", "Bob B <bob@example.com>"),
+        cregit_trailers=[("Former-commit-id", ORIGINAL_SHA)],
+        people=[("adev", "a@example.com", "A Dev"),
+                ("bob", "bob@example.com", "Bob B")]))
+
+    row = duckdb.sql("select original_commit_sha, footer_signed_off_by, "
+                     "footer_reviewed_by, footer_personids, footer_person_names "
+                     f"from read_parquet('{out}')").fetchone()
+    sha, signed, reviewed, ids, names = row
+    assert sha == ORIGINAL_SHA
+    assert list(signed) == ["A Dev <a@example.com>"]
+    assert list(reviewed) == ["Bob B <bob@example.com>"]
+    assert list(ids) == ["adev", "bob"]
+    assert list(names) == ["A Dev", "Bob B"]
+
+
+def test_an_address_with_two_names_does_not_repeat_the_trailer(monkeypatch, tmp_path):
+    """The persons DB has one emails row for each name that an address
+    committed with. The join to emails must not repeat the trailer."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reviewed-by", "Bob B <bob@example.com>"),
+        people=[("bob", "bob@example.com", "Bob B"),
+                ("bob", "bob@example.com", "bob-laptop")]))
+
+    ids, names, reviewed = footers_of(duckdb, out)
+    assert list(reviewed) == ["Bob B <bob@example.com>"]
+    assert list(ids) == ["bob"]
+    assert list(names) == ["Bob B"]
+
+
+# --------------------------------------------------------------------------- #
+# One entry for each person in each typed list. Two values are the same person
+# when their addresses resolve to one personid; an address that is not in
+# emails merges on its lowercased text; a value with no address never merges.
+# The entry kept is the value with the lowest idx, at the place of that idx.
+# --------------------------------------------------------------------------- #
+
+def typed_lists_of(duckdb, path, *cols):
+    row = duckdb.sql(f"select {', '.join(cols)} from read_parquet('{path}')").fetchone()
+    return [list(v) for v in row]
+
+
+def test_an_identical_repeated_trailer_gives_one_entry(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        people=[("adev", "a@example.com", "A Dev")]))
+
+    [signed] = typed_lists_of(duckdb, out, "footer_signed_off_by")
+    assert signed == ["A Dev <a@example.com>"]
+
+
+def test_two_addresses_of_one_person_give_the_first_value(monkeypatch, tmp_path):
+    """The Linux case: "Pat Example (Corp) <pat@corp.example.com>" and
+    "Pat Example <pat@home.example.com>" are one personid."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "Pat Example (Corp) <pat@corp.example.com>"),
+        ("Signed-off-by", "Pat Example <pat@home.example.com>"),
+        people=[("pat", "pat@corp.example.com", "Pat Example"),
+                ("pat", "pat@home.example.com", "Pat Example")]))
+
+    signed, ids = typed_lists_of(duckdb, out, "footer_signed_off_by", "footer_personids")
+    assert signed == ["Pat Example (Corp) <pat@corp.example.com>"]
+    assert ids == ["pat"]
+
+
+def test_an_address_with_two_personids_uses_the_lowest(monkeypatch, tmp_path):
+    """Two emails rows name one address for two persons. The lowest personid is
+    the key, so the other address of that lowest person is the same person.
+    The higher personid is listed first in emails, so a rule that took the
+    first row, or the highest one, would give two entries."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "Sam One <sam@example.com>"),
+        ("Signed-off-by", "Sam Two <sam@other.example.com>"),
+        people=[("zed", "sam@example.com", "Sam One"),
+                ("abe", "sam@example.com", "Sam One"),
+                ("abe", "sam@other.example.com", "Sam Two")]))
+
+    [signed] = typed_lists_of(duckdb, out, "footer_signed_off_by")
+    assert signed == ["Sam One <sam@example.com>"]
+
+
+def test_two_addresses_of_two_persons_stay_two_entries(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        ("Signed-off-by", "A Dev <a@other.example.com>"),
+        people=[("adev", "a@example.com", "A Dev"),
+                ("adev2", "a@other.example.com", "A Dev")]))
+
+    [signed] = typed_lists_of(duckdb, out, "footer_signed_off_by")
+    assert signed == ["A Dev <a@example.com>", "A Dev <a@other.example.com>"]
+
+
+def test_an_unresolved_address_merges_across_letter_case(monkeypatch, tmp_path):
+    """No emails row for the address: the lowercased address is the key."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reported-by", "Carol <Carol@Example.com>"),
+        ("Reported-by", "carol <carol@example.com>")))
+
+    reported, ids = typed_lists_of(duckdb, out, "footer_reported_by", "footer_personids")
+    assert reported == ["Carol <Carol@Example.com>"]
+    assert ids == []
+
+
+def test_a_bare_address_and_a_bracketed_one_are_one_person(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reported-by", "carol@example.com"),
+        ("Reported-by", "Carol <carol@example.com>")))
+
+    [reported] = typed_lists_of(duckdb, out, "footer_reported_by")
+    assert reported == ["carol@example.com"]
+
+
+def test_a_value_with_no_address_is_never_merged(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Reported-by", "Dana Example"),
+        ("Reported-by", "Dana Example"),
+        ("Reported-by", "dana example")))
+
+    [reported] = typed_lists_of(duckdb, out, "footer_reported_by")
+    assert reported == ["Dana Example", "Dana Example", "dana example"]
+
+
+def test_the_entries_keep_the_order_of_their_first_idx(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),        # idx 0: a, kept
+        ("Signed-off-by", "Bob B <bob@example.com>"),      # idx 1: bob, kept
+        ("Signed-off-by", "No Address"),                   # idx 2: kept
+        ("Signed-off-by", "A Dev (work) <a@work.example>"),  # idx 3: a again, dropped
+        ("Signed-off-by", "Carol <carol@example.com>"),    # idx 4: unresolved, kept
+        ("Signed-off-by", "Bob B <bob@example.com>"),      # idx 5: bob again, dropped
+        people=[("adev", "a@example.com", "A Dev"),
+                ("adev", "a@work.example", "A Dev"),
+                ("bob", "bob@example.com", "Bob B")]))
+
+    signed, ids, names = typed_lists_of(duckdb, out, "footer_signed_off_by",
+                                        "footer_personids", "footer_person_names")
+    assert signed == ["A Dev <a@example.com>", "Bob B <bob@example.com>", "No Address",
+                      "Carol <carol@example.com>"]
+    assert ids == ["adev", "bob"]
+    assert names == ["A Dev", "Bob B"]
+
+
+def test_one_person_in_two_lists_stays_in_both(monkeypatch, tmp_path):
+    """The rule works inside each typed list, not across the lists."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "A Dev <a@example.com>"),
+        ("Reviewed-by", "A Dev <a@example.com>"),
+        ("signed-off-by", "A Dev <a@example.com>"),
+        people=[("adev", "a@example.com", "A Dev")]))
+
+    signed, reviewed = typed_lists_of(duckdb, out, "footer_signed_off_by",
+                                      "footer_reviewed_by")
+    assert signed == ["A Dev <a@example.com>"]
+    assert reviewed == ["A Dev <a@example.com>"]
+
+
+def test_the_trailers_of_the_cregit_db_are_not_read(monkeypatch, tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        cregit_trailers=[("Signed-off-by", "A Dev <a@example.com>")]))
+
+    (signed,) = duckdb.sql("select footer_signed_off_by "
+                           f"from read_parquet('{out}')").fetchone()
+    assert list(signed) == []
+
+
+def test_the_trailer_key_falls_back_to_the_cregit_sha_with_no_map_row(monkeypatch, tmp_path):
+    """The same fallback as original_commit_sha: no commitmap row, so the
+    original commit SHA is the cregit SHA."""
+    duckdb = pytest.importorskip("duckdb")
+
+    def seed(cregit_db, original_db, _persons_db):
+        con = sqlite3.connect(cregit_db)
+        con.execute("DELETE FROM commitmap")
+        con.commit()
+        con.close()
+        con = sqlite3.connect(original_db)
+        con.execute("INSERT INTO footers VALUES (?,0,'Signed-off-by','A Dev <a@example.com>')",
+                    (SHA,))
+        con.commit()
+        con.close()
+
+    out = generate(monkeypatch, tmp_path, seed=seed)
+    sha, signed = duckdb.sql("select original_commit_sha, footer_signed_off_by "
+                             f"from read_parquet('{out}')").fetchone()
+    assert sha == SHA
+    assert list(signed) == ["A Dev <a@example.com>"]
+
+
+def test_a_missing_original_db_stops_the_run_before_phase_1(monkeypatch, tmp_path, capsys):
+    """An old resume can lack the step 3 DB. The run must stop and say so, not
+    read the trailers from the cregit DB."""
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path,
+                 argv_extra=("--original-db", str(tmp_path / "absent.db")))
+    err = capsys.readouterr().err
+    assert "original-db not found" in err
+    assert "step 3" in err
+
+
+@pytest.mark.parametrize("content, reason", [
+    (b"", "no footers table"),
+    (b"not a database, only text" * 40, "not a readable SQLite database"),
+], ids=["empty-file", "not-sqlite"])
+def test_an_original_db_with_no_footers_table_stops_the_run_before_phase_1(
+        monkeypatch, tmp_path, capsys, content, reason):
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(content)
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path, argv_extra=("--original-db", str(bad)))
+    assert reason in capsys.readouterr().err
+
+
+def test_a_call_without_the_original_db_is_refused(monkeypatch, tmp_path):
+    """An old caller that does not pass --original-db must fail, not fall back."""
+    import generate_dataset as gd
+    blame, src, cregit_db, _original_db, persons_db = build_tiny_project(tmp_path)
+    monkeypatch.setattr(gd.sys, "argv", [
+        "generate_dataset.py", "--blame-dir", str(blame), "--source-dir", str(src),
+        "--cregit-db", str(cregit_db), "--persons-db", str(persons_db),
+        "--output", str(tmp_path / "out" / "proj-dataset.parquet")])
+    with pytest.raises(SystemExit):
+        gd.main()
 
 
 # --------------------------------------------------------------------------- #

@@ -2,9 +2,14 @@
 
 use strict;
 use warnings;
-use Test::More tests => 20;
+use Test::More tests => 70;
 use FindBin;
 use File::Temp qw(tempdir);
+use File::Basename qw(dirname);
+use File::Spec;
+use Cwd qw(abs_path);
+use Digest::SHA qw(sha1_hex);
+use POSIX ();
 
 my $root = "$FindBin::Bin/../..";   # tests/t -> repo root
 
@@ -48,6 +53,17 @@ sub slurp_lines {
     my @lines = <$fh>;
     chomp @lines;
     return @lines;
+}
+
+# Find a program on PATH in Perl. Do not run `command -v`: Perl runs a command
+# with no shell characters directly, and `command` is often only a shell builtin.
+sub find_on_path {
+    my ($name) = @_;
+    for my $dir (File::Spec->path) {
+        my $file = File::Spec->catfile($dir, $name);
+        return $file if -f $file && -x _;
+    }
+    die "$name is not on PATH";
 }
 
 my $repo = "$workdir/repo";
@@ -132,6 +148,185 @@ my $cid2 = commit_as($repo, "Bob", "second");
        "all six moved lines are credited to the author, naming origin.c");
 }
 
+# The -C100 time limit and the git exit status, on the same moved.c repository.
+# A fake git on PATH is slow or fails for "blame"; all other commands go to the real git.
+{
+    my $repo2 = "$workdir/moved";
+    my $mover = git($repo2, "rev-parse HEAD");
+    my $realGit = find_on_path('git');
+    my $fakeBin = "$workdir/fakebin";
+    mkdir $fakeBin or die $!;
+    write_file("$fakeBin/git", <<"FAKE");
+#!/bin/sh
+blame=0; c100=0
+for a in "\$@"; do
+    [ "\$a" = blame ] && blame=1
+    [ "\$a" = -C100 ] && c100=1
+done
+if [ \$blame = 1 ]; then
+    case "\$FAKE_GIT_MODE" in
+        slow-c100) [ \$c100 = 1 ] && exec sleep 60 ;;
+        slow-c100-plain-fails) [ \$c100 = 1 ] && exec sleep 60; exit 3 ;;
+        fail) echo "fatal: fake failure" >&2; exit 3 ;;
+        c100-exit128) [ \$c100 = 1 ] && { echo "fatal: unable to generate diff (fake)" >&2; exit 128; } ;;
+        c100-exit128-other) [ \$c100 = 1 ] && { echo "fatal: bad object (fake)" >&2; exit 128; } ;;
+        exit128) echo "fatal: unable to generate diff (fake)" >&2; exit 128 ;;
+        killed) printf '%040d 1 1 1\\n' 0; kill -9 \$\$ ;;
+    esac
+fi
+exec '$realGit' "\$@"
+FAKE
+    chmod 0755, "$fakeBin/git" or die $!;
+
+    my $buildDir = dirname($script) . "/build";
+    my @tempsBefore = glob("$buildDir/tmpfile-*");
+
+    my $slurp = sub {
+        my ($f) = @_;
+        open(my $fh, '<', $f) or return undef;
+        local $/;
+        my $c = <$fh>;
+        close $fh;
+        return $c;
+    };
+    my $run = sub {
+        my ($mode, $opts, %env) = @_;
+        my $dest = tempdir(CLEANUP => 1);
+        local $ENV{PATH} = "$fakeBin:$ENV{PATH}";
+        local $ENV{FAKE_GIT_MODE} = $mode;
+        local $ENV{CREGIT_C100_LIMIT} = $env{limit} if defined $env{limit};
+        my $t0 = time();
+        my $status = system("perl '$script' $opts '$repo2' moved.c '$dest' 2>'$workdir/stderr'");
+        return ($status, $dest, time() - $t0, $slurp->("$workdir/stderr"));
+    };
+
+    # (a) A blame that ends within the limit: the same bytes as with no limit.
+    my ($s1, $d1) = $run->('none', '');
+    my ($s2, $d2) = $run->('none', '--c100-limit=0');
+    my ($s3, $d3) = $run->('none', '--c100-limit=3600');
+    is($s1 + $s2 + $s3, 0, "the default, no limit and 3600 s runs all succeed");
+    my $bytes = $slurp->("$d1/moved.c.blame");
+    is($slurp->("$d2/moved.c.blame"), $bytes, "no limit gives the same bytes as the default limit");
+    is($slurp->("$d3/moved.c.blame"), $bytes, "a 3600 s limit gives the same bytes as the default limit");
+
+    # (b) -C100 passes the limit: plain blame output and the PLAIN-BLAME line.
+    my ($s4, $d4, $sec4, $err4) = $run->('slow-c100', '--c100-limit=1');
+    is($s4, 0, "a -C100 run that passes the limit still succeeds");
+    cmp_ok($sec4, '<', 30, "the script kills the slow -C100 git and does not wait for it");
+    like($err4, qr/^PLAIN-BLAME moved\.c after [0-9]+ s of -C100$/m,
+         "the script prints the PLAIN-BLAME line to STDERR");
+    my @plain = split /\n/, ($slurp->("$d4/moved.c.blame") // '');
+    is(scalar(@plain), 10, "the plain blame file has ten lines");
+    my @byMover = grep { /^\Q$mover\E;;/ } @plain[2 .. 7];
+    is(scalar(@byMover), 6, "plain blame credits the moved lines to the mover, so no -C100 ran");
+    my $plainRef = `git -C '$repo2' blame --porcelain moved.c | grep -c '^	'`;
+    chomp $plainRef;
+    is($plainRef, 10, "git blame without -C gives the same line count");
+
+    # The environment variable sets the limit when there is no flag.
+    my ($s5, $d5, $sec5, $err5) = $run->('slow-c100', '', limit => 1);
+    is($s5, 0, "CREGIT_C100_LIMIT=1 run succeeds");
+    like($err5, qr/^PLAIN-BLAME moved\.c after [0-9]+ s of -C100$/m,
+         "CREGIT_C100_LIMIT sets the -C100 limit");
+    is($slurp->("$d5/moved.c.blame"), $slurp->("$d4/moved.c.blame"),
+       "the flag and the environment variable give the same bytes");
+
+    # (c) git fails: a non-zero exit and no blame file.
+    my ($s6, $d6, undef, $err6) = $run->('fail', '');
+    isnt($s6, 0, "a failing git blame gives a non-zero exit");
+    ok(!-e "$d6/moved.c.blame", "a failing git blame writes no blame file");
+    like($err6, qr/^Error: git blame of \[moved\.c\]/m, "a failing git blame prints an error");
+
+    # git killed after part of its output: the defect that wrote an empty .blame.
+    my ($s7, $d7) = $run->('killed', '');
+    isnt($s7, 0, "a killed git blame gives a non-zero exit");
+    ok(!-e "$d7/moved.c.blame", "a killed git blame writes no blame file");
+
+    # -C100 passes the limit and plain blame then fails.
+    my ($s8, $d8, undef, $err8) = $run->('slow-c100-plain-fails', '--c100-limit=1');
+    isnt($s8, 0, "a failing plain blame after the limit gives a non-zero exit");
+    ok(!-e "$d8/moved.c.blame", "a failing plain blame writes no blame file");
+
+    # (d) -C100 ends with git exit 128 (xdiff refuses a candidate blob over 1 GiB): plain blame.
+    my ($s9, $d9, undef, $err9) = $run->('c100-exit128', '');
+    is($s9, 0, "a -C100 git exit 128 falls back to plain blame and succeeds");
+    like($err9, qr/^PLAIN-BLAME moved\.c after git exit 128 of -C100$/m,
+         "the script prints the PLAIN-BLAME line for the git exit 128");
+    is($slurp->("$d9/moved.c.blame"), $slurp->("$d4/moved.c.blame"),
+       "the exit 128 fallback gives the same bytes as the time-limit fallback");
+
+    # Plain blame also ends with exit 128: a non-zero exit and no blame file.
+    my ($s10, $d10) = $run->('exit128', '');
+    isnt($s10, 0, "a plain blame exit 128 after the fallback gives a non-zero exit");
+    ok(!-e "$d10/moved.c.blame", "a failing fallback writes no blame file");
+
+    # An exit 128 of -C100 that is not the xdiff failure is an error, not a fallback.
+    my ($s11, $d11, undef, $err11) = $run->('c100-exit128-other', '');
+    isnt($s11, 0, "a -C100 exit 128 with another message gives a non-zero exit");
+    ok(!-e "$d11/moved.c.blame", "a -C100 exit 128 with another message writes no blame file");
+    unlike($err11, qr/PLAIN-BLAME/, "a -C100 exit 128 with another message prints no PLAIN-BLAME line");
+
+    my @tempsAfter = glob("$buildDir/tmpfile-*");
+    is(scalar(@tempsAfter), scalar(@tempsBefore), "the failed runs leave no temp file in build/");
+
+    # A limit that is not a whole number of seconds is rejected.
+    my ($s9) = $run->('none', '--c100-limit=abc');
+    isnt($s9, 0, "a limit that is not a number is rejected");
+}
+
+# An existing output file: kept without --overwrite, replaced with it. A failed
+# write leaves no partial file and a non-zero exit.
+{
+    my $repo2 = "$workdir/moved";
+    my $dest = tempdir(CLEANUP => 1);
+    write_file("$dest/moved.c.blame", "stale\n");
+    is(system("perl '$script' '$repo2' moved.c '$dest' 2>/dev/null"), 0,
+       "a run with an existing output file succeeds");
+    is(join('', slurp_lines("$dest/moved.c.blame")), "stale",
+       "without --overwrite an existing output file is kept");
+    is(system("perl '$script' --overwrite '$repo2' moved.c '$dest' 2>/dev/null"), 0,
+       "a run with --overwrite succeeds");
+    my @fresh = slurp_lines("$dest/moved.c.blame");
+    is(scalar(@fresh), 10, "--overwrite replaces the existing output file");
+    my @partials = glob("$dest/*.partial.*");
+    is(scalar(@partials), 0, "no partial file stays next to the output");
+
+    SKIP: {
+        skip "root can write to a read-only folder", 3 if $> == 0;
+        my $ro = tempdir(CLEANUP => 1);
+        chmod 0555, $ro or die $!;
+        my $out = `perl '$script' '$repo2' moved.c '$ro' 2>&1`;
+        isnt($? , 0, "an output folder that cannot be written gives a non-zero exit");
+        ok(!-e "$ro/moved.c.blame", "no blame file is written to it");
+        like($out, qr/^Error: unable to copy/m, "the script says that the copy failed");
+        chmod 0755, $ro;
+    }
+}
+
+# Field 2 is the old file name as git prints it. It is not escaped, so a
+# semicolon in the old name adds a field when a reader splits on ";". This
+# test records the behavior; the dataset was built with it.
+{
+    my $repo4 = "$workdir/semicolon";
+    mkdir $repo4 or die $!;
+    git($repo4, "init -q -b main");
+    write_file("$repo4/old;name.c", "int one;\n");
+    git($repo4, "add .");
+    my $first = commit_as($repo4, "Alice", "write the file");
+    git($repo4, "mv 'old;name.c' new.c");
+    commit_as($repo4, "Carol", "rename the file");
+
+    my $dest = tempdir(CLEANUP => 1);
+    is(system("perl '$script' '$repo4' new.c '$dest' 2>/dev/null"), 0,
+       "formatBlame.pl succeeds when the old name has a semicolon");
+    my @lines = slurp_lines("$dest/new.c.blame");
+    is($lines[0], "$first;old;name.c;\tint one;",
+       "field 2 keeps the semicolon of the old name, unescaped");
+    my ($head) = split /\t/, $lines[0], 2;
+    is(scalar(split /;/, $head, -1), 4,
+       "a split on a semicolon gives one more field than a name without one");
+}
+
 # Two non-contiguous groups from one commit, in a renamed file: --porcelain
 # suppresses the second group's header, and field 2 must survive that.
 {
@@ -163,4 +358,75 @@ my $cid2 = commit_as($repo, "Bob", "second");
     # The regression: this is the group whose header git suppressed.
     is($lines[2], "$first;old.c;\tint three;",
        "the second group of the same commit still names the old filename");
+}
+
+# Two runners on one output directory: a lock per output file, and a skip when
+# the file is already there. A fake git counts the blames and makes them slow.
+{
+    my $realGit = find_on_path('git');
+    my $lockBin = "$workdir/lockbin";
+    mkdir $lockBin or die $!;
+    my $counter = "$workdir/blame-count";
+    write_file("$lockBin/git", <<"FAKE");
+#!/bin/sh
+for a in "\$@"; do
+    if [ "\$a" = blame ]; then echo x >> '$counter'; sleep 2; fi
+done
+exec '$realGit' "\$@"
+FAKE
+    chmod 0755, "$lockBin/git" or die $!;
+    my $count = sub {
+        return 0 unless -f $counter;
+        my @l = slurp_lines($counter);
+        unlink $counter;
+        return scalar(@l);
+    };
+    my $slurp = sub {
+        open(my $fh, '<', $_[0]) or return undef;
+        local $/;
+        my $c = <$fh>;
+        close $fh;
+        return $c;
+    };
+    local $ENV{PATH} = "$lockBin:$ENV{PATH}";
+
+    my $ref = tempdir(CLEANUP => 1);
+    system("perl '$script' '$repo' g.c '$ref' 2>/dev/null") == 0 or die "reference run failed";
+    $count->();
+    my $refBytes = $slurp->("$ref/g.c.blame");
+
+    # (a) The output file exists: no blame, and the file keeps its bytes.
+    my $done = tempdir(CLEANUP => 1);
+    write_file("$done/g.c.blame", "keep\n");
+    my $s0 = system("perl '$script' '$repo' g.c '$done' 2>/dev/null");
+    is($s0, 0, "a file that is already blamed gives exit 0");
+    is($slurp->("$done/g.c.blame"), "keep\n", "an existing blame file keeps its bytes");
+    is($count->(), 0, "an existing blame file starts no git blame");
+
+    # (b) Two processes on the same file at the same time: one blames, one skips.
+    my $both = tempdir(CLEANUP => 1);
+    my @pids;
+    for my $i (1, 2) {
+        my $pid = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid == 0) {
+            exec("perl '$script' '$repo' g.c '$both' 2>/dev/null") or POSIX::_exit(127);
+        }
+        push @pids, $pid;
+        select(undef, undef, undef, 0.3);
+    }
+    my @st = map { waitpid($_, 0); $? } @pids;
+    is($st[0], 0, "the first of two runners gives exit 0");
+    is($st[1], 0, "the second of two runners gives exit 0");
+    is($count->(), 1, "two runners on one file start one git blame");
+    is($slurp->("$both/g.c.blame"), $refBytes, "the blame file of two runners equals a single run");
+    ok(-s "$both/g.c.blame", "the blame file of two runners is not empty");
+
+    # (c) The locks stay in build/, out of the output directory.
+    my $lock = dirname($script) . "/build/locks/" . sha1_hex(abs_path($both) . "/g.c.blame") . ".lock";
+    ok(-f $lock, "the lock file is in build/locks/");
+    opendir(my $dh, $both) or die $!;
+    my @entries = sort grep { !/^\.\.?$/ } readdir($dh);
+    closedir $dh;
+    is_deeply(\@entries, ["g.c.blame"], "the output directory holds only the blame file");
 }

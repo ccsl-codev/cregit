@@ -20,6 +20,7 @@ Usage:
       --blame-dir  ../cregit-files/blame \
       --source-dir ../cregit-files/jq-original \
       --cregit-db  ../cregit-files/jq-cregit.db \
+      --original-db ../cregit-files/jq-original.db \
       --persons-db ../cregit-files/jq-persons.db \
       --output     ../cregit-files/jq-dataset.parquet
 """
@@ -514,6 +515,33 @@ def project_meta_sql(project_meta) -> str:
     )
 
 
+# The columns that the trailer query reads from the footers table.
+FOOTER_COLUMNS = ("cid", "idx", "key", "value")
+
+
+def footers_table_problem(db_path) -> str:
+    """Return why db_path cannot supply the trailers, or "" when it can.
+
+    The trailers come from the footers table that slickGitLog writes for the
+    original repository. Check that table before Phase 1, because Phase 1 can
+    take half an hour, and a bad input must stop the run before that work.
+    """
+    try:
+        con = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
+        try:
+            names = {row[1] for row in con.execute("PRAGMA table_info(footers)")}
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return f"it is not a readable SQLite database ({exc})"
+    if not names:
+        return "it has no footers table"
+    missing = [c for c in FOOTER_COLUMNS if c not in names]
+    if missing:
+        return f"its footers table has no column {', '.join(missing)}"
+    return ""
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate unified Parquet dataset from CreGit pipeline outputs"
@@ -526,6 +554,15 @@ def main():
     )
     parser.add_argument(
         "--cregit-db", required=True, help="Path to cregit.db (Step 5 output)"
+    )
+    parser.add_argument(
+        "--original-db",
+        required=True,
+        help="Path to the git log DB of the original repository (Step 3 output). "
+        "The footer_* columns come from its footers table, keyed by the original "
+        "commit SHA. The cregit DB cannot supply them: its commit messages carry "
+        "the Former-commit-id trailer that blobExec adds, and when a blank line "
+        "comes before that trailer, JGit sees no other trailer.",
     )
     parser.add_argument(
         "--persons-db", required=True, help="Path to persons.db (Step 6 output)"
@@ -596,10 +633,21 @@ def main():
             print(f"ERROR: {label} not found: {p}", file=sys.stderr)
             sys.exit(1)
 
-    for p, label in [(args.cregit_db, "cregit-db"), (args.persons_db, "persons-db")]:
+    for p, label in [(args.cregit_db, "cregit-db"), (args.original_db, "original-db"),
+                     (args.persons_db, "persons-db")]:
         if not Path(p).is_file():
             print(f"ERROR: {label} not found: {p}", file=sys.stderr)
+            if label == "original-db":
+                print("  Step 3 writes this file. Run the pipeline again from step 3 "
+                      "or earlier. The trailers do not come from the cregit DB.",
+                      file=sys.stderr)
             sys.exit(1)
+
+    problem = footers_table_problem(args.original_db)
+    if problem:
+        print(f"ERROR: original-db {args.original_db} cannot supply the trailers: "
+              f"{problem}", file=sys.stderr)
+        sys.exit(1)
 
     if not args.repo_name:
         args.repo_name = output_path.stem.replace("-dataset", "")
@@ -727,6 +775,10 @@ def main():
     con.execute(f"CALL sqlite_attach('{sync_db_path}')")
     con.execute(f"CALL sqlite_attach('{args.cregit_db}')")
     con.execute(f"CALL sqlite_attach('{args.persons_db}')")
+    # A named catalog, not sqlite_attach: the original DB has the same table
+    # names as the cregit DB, and sqlite_attach puts every table in one schema.
+    original_db = str(args.original_db).replace(chr(39), chr(39) * 2)
+    con.execute(f"ATTACH '{original_db}' AS original_log (TYPE sqlite, READ_ONLY)")
 
     meta_sql = project_meta_sql(project_meta)
 
@@ -774,8 +826,8 @@ def main():
                 coalesce(ftr.footer_mentored_by, [])         AS footer_mentored_by,
                 coalesce(ftr.footer_assisted_by, [])        AS footer_assisted_by,
                 coalesce(ftr.footer_thanks_to, [])           AS footer_thanks_to,
-                coalesce(ftr.footer_personids, [])           AS footer_personids,
-                coalesce(ftr.footer_person_names, [])        AS footer_person_names
+                coalesce(fpr.footer_personids, [])           AS footer_personids,
+                coalesce(fpr.footer_person_names, [])        AS footer_person_names
 
             FROM token_map t
             JOIN commits c                ON t.commit_sha = c.cid
@@ -798,13 +850,65 @@ def main():
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'helped-by')           AS footer_helped_by,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'mentored-by')         AS footer_mentored_by,
                     list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'assisted-by')         AS footer_assisted_by,
-                    list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'thanks-to')           AS footer_thanks_to,
+                    list(f.value ORDER BY f.idx) FILTER (WHERE LOWER(f.key) = 'thanks-to')           AS footer_thanks_to
+                -- One entry for each person in each list: the trailer line with
+                -- the lowest idx. A message can name one person twice, with the
+                -- same text or with another address of that person.
+                FROM (
+                    SELECT
+                        f.cid, f.idx, f.key, f.value,
+                        row_number() OVER (PARTITION BY f.cid, LOWER(f.key), f.who
+                                           ORDER BY f.idx)                                    AS nth,
+                        f.who
+                    FROM (
+                        -- who: the personid of the address, else the lowercased
+                        -- address, else NULL (a value with no address is kept).
+                        -- The address is the one that footer_personids uses.
+                        SELECT
+                            f.cid, f.idx, f.key, f.value,
+                            CASE WHEN fa.personid IS NOT NULL THEN 'p:' || fa.personid
+                                 WHEN f.addr IS NOT NULL THEN 'a:' || LOWER(f.addr)
+                            END                                                               AS who
+                        FROM (
+                            SELECT
+                                f.cid, f.idx, f.key, f.value,
+                                coalesce(
+                                    nullif(regexp_extract(f.value, '<([^>]+)>', 1), ''),
+                                    nullif(regexp_extract(f.value, '([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{{2,}})', 1), '')
+                                )                                                             AS addr
+                            -- The trailers come from the original repository, keyed by
+                            -- the original commit SHA. In the cregit repository, blobExec
+                            -- appends "\\n" + "Former-commit-id: X" to a message whose last
+                            -- paragraph has trailers. When that message ends in "\\n" (the
+                            -- git CLI writes it so), a blank line comes before the new
+                            -- trailer, and JGit then sees only Former-commit-id.
+                            FROM original_log.footers f
+                        ) f
+                        -- One personid for each address. min() if the emails rows of
+                        -- one address name two persons.
+                        LEFT JOIN (
+                            SELECT emailaddr, min(personid) AS personid
+                            FROM emails
+                            WHERE personid IS NOT NULL
+                            GROUP BY emailaddr
+                        ) fa ON fa.emailaddr = f.addr
+                    ) f
+                ) f
+                WHERE f.who IS NULL OR f.nth = 1
+                GROUP BY f.cid
+            ) ftr ON coalesce(m.originalcid, t.commit_sha) = ftr.cid
+            -- A separate subquery, so that the emails join cannot repeat a
+            -- trailer in the lists above: one address can have many emails
+            -- rows, one for each name that it committed with.
+            LEFT JOIN (
+                SELECT
+                    f.cid,
                     list(DISTINCT fe.personid ORDER BY fe.personid)
                         FILTER (WHERE fe.personid IS NOT NULL)                                           AS footer_personids,
                     list(DISTINCT coalesce(fpn.personname, fe.personid)
                         ORDER BY coalesce(fpn.personname, fe.personid))
                         FILTER (WHERE coalesce(fpn.personname, fe.personid) IS NOT NULL)                AS footer_person_names
-                FROM footers f
+                FROM original_log.footers f
                 -- regexp_extract returns '' rather than NULL on no match, so
                 -- without nullif a no-address trailer joins on '' and matches
                 -- every `Name <>` row. Bracketed form first: correct precedence.
@@ -815,7 +919,7 @@ def main():
                     )
                 LEFT JOIN persons fpn ON fe.personid = fpn.personid
                 GROUP BY f.cid
-            ) ftr ON c.cid = ftr.cid
+            ) fpr ON coalesce(m.originalcid, t.commit_sha) = fpr.cid
 
             ORDER BY t.file_path, t.token_index
         ) TO '{output_path}'

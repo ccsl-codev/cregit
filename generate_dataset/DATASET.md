@@ -38,7 +38,7 @@ ORDER BY tokens DESC;
 -- Tokens authored by a specific person
 SELECT file_path, source_line, source_text, token_type, token_value
 FROM 'dataset.parquet'
-WHERE person_name = 'Linus Torvalds'
+WHERE person_name = 'Ada Example'
 ORDER BY file_path, token_index;
 ```
 
@@ -119,8 +119,36 @@ numbers or booleans. Cast at the query: `CAST(size_kb AS BIGINT)`, or
 ### Commit trailers (footers)
 
 Fifteen `LIST(TEXT)` columns, never NULL: absence is an empty list, so test with
-`len(footer_reviewed_by) = 0`. Source is `cregit.db`'s `footers` table, grouped by
-commit, keys matched case-insensitively, each list in `footers.idx` order.
+`len(footer_reviewed_by) = 0`. Source is the `footers` table of the original
+log DB (`<repo>-original.db`, Step 3 output), grouped by commit and joined on
+`original_commit_sha`. Keys are matched case-insensitively. The trailers are
+JGit's `getFooterLines` of the original commit message.
+
+Each of the 13 typed lists holds **one entry per person**, not the raw trailer
+lines. A message can name one person twice, with the same text or with another
+address (for example `Pat Example (Corp) <pat@corp.example.com>` and
+`Pat Example <pat@home.example.com>`). In one list, two values are the same person
+when:
+
+- their addresses resolve to the same `personid`. The address is the one that
+  `footer_personids` uses: the address inside `<…>`, else a bare address. It
+  is matched against `emails.emailaddr`. If the `emails` rows of one address
+  name two persons, the lowest `personid` is used.
+- their addresses are not in `emails`, and the lowercased addresses are equal.
+
+A value with no address is kept as it is and is never merged, also when its
+text repeats. For each person, the list keeps the value with the lowest
+`footers.idx`, at the place of that idx, so the list is in the order of the
+first trailer line of each person. The rule works in each list separately: one
+person can be in `footer_signed_off_by` and in `footer_reviewed_by`.
+`footer_personids` and `footer_person_names` do not change: they are sets.
+
+The source is not `cregit.db`. In the cregit repository, blobExec appends
+`"\n" + "Former-commit-id: <sha>"` to a message whose last paragraph has
+trailers. A git CLI message ends in `"\n"`, so the result has a blank line
+before `Former-commit-id`, and JGit then finds no other trailer. A message with
+no final newline (for example, from the GitHub web UI) kept its trailers.
+Datasets made before this change have this defect.
 
 | Column | Trailer key |
 |--------|-------------|
@@ -244,6 +272,7 @@ tables) maps multiple email addresses to a single `personid`.
 ```
 token_map.commit_sha → commits.cid
                     → commitmap.cid     → commitmap.originalcid (original commit SHA)
+                                          → original DB footers.cid (trailers)
                     → emails.emailname  → persons.personid      → persons.personname
                       \_ (matched on autname + autemail)
 ```
@@ -315,6 +344,48 @@ whose tokenizer's lexer is not fit for real autotools input, and `.ixx`, `.inl`,
 `.cppm`, `.cxxm`, `.ipp`, for which srcML emits **zero tokens and exits 0**.
 `file_mask` on every row records the mask that decided this.
 
+### Files blamed without `-C100`
+
+Step 7 blames each file with `git blame -C100`. This option credits a line that
+moved in from another file to the commit that wrote it, not to the commit that
+moved it. On a huge generated file (protobuf or thrift Java, a tree-sitter
+`parser.c`, ICU `stubdata.cpp`), `-C100` can take 3 to 38 hours for one file.
+
+Thus `blameRepo/formatBlame.pl` has a wall-clock limit for `-C100`: 3600 seconds
+by default. The option `--c100-limit=SECONDS` or the environment variable
+`CREGIT_C100_LIMIT` sets a different limit. The value 0 removes the limit. When
+the limit passes, the script stops `-C100` and blames the same file with plain
+`git blame`, with no limit. The pipeline log then holds one line
+`PLAIN-BLAME <file> after <N> s of -C100`.
+
+In such a file, a line that moved in from another file has the commit that moved
+it. The rows of the file do not record this. To find these files, search the
+pipeline log for `PLAIN-BLAME`. A file that ends within the limit gets the same
+blame bytes as before.
+
+Git also exits 128 when `-C100` must diff a candidate blob over 1 GiB (xdiff
+limit). The script then reads the stderr of git. Only when it holds
+`unable to generate diff` does it run plain `git blame` and print
+`PLAIN-BLAME <file> after git exit 128 of -C100`. Any other exit 128 is a
+failure, as below.
+
+The script writes each `.blame` file under a temporary name in the output
+folder and renames it into place, so an existing `.blame` file is complete. A
+failed write, close, copy or rename removes the partial file, prints an error
+and exits 1. Without `--overwrite`, the script skips a file that exists; with
+it, the script replaces the file. `blameRepoFiles.pl --overwrite` passes the
+option on.
+
+Field 2 of a `.blame` record is the old file name as git prints it, with no
+escape. A semicolon in the old name adds a field for a reader that splits the
+record on `;`. The dataset has this form, so it stays.
+
+If git fails or stops early for a different reason (for example, the kernel
+kills it for memory), `formatBlame.pl` writes no `.blame` file and exits 1.
+`blameRepoFiles.pl` counts the error, and the blame step fails. Before this
+change, the script wrote an empty `.blame` file and exited 0. The tokens of that
+file were lost, and no error showed it.
+
 ### Computed and then dropped, or never typed
 
 - `func_name` is computed in Phase 1 for `DECL` tokens and is **not** carried into
@@ -341,6 +412,9 @@ source files ───────────┤
 cregit.db ──────────────┤
 (commits, commitmap)    │
                         │
+<repo>-original.db ─────┤
+(footers)               │
+                        │
 persons.db ─────────────┤
 (emails, persons)       │
                         │
@@ -364,9 +438,10 @@ For each `.blame` file:
 
 ### Phase 2: DuckDB JOIN → Parquet
 
-Join `token_map` with the three SQLite databases:
+Join `token_map` with the four SQLite databases:
 - `commits` — commit metadata (author, committer, dates, summary)
 - `commitmap` — cregit → original commit SHA mapping
+- `footers` of the original log DB — commit trailers, by original commit SHA
 - `emails` / `persons` — person identity resolution
 
 Output is written as ZSTD-compressed Parquet.
@@ -378,6 +453,7 @@ uv run python generate_dataset/generate_dataset.py \
     --blame-dir  ../cregit-files/blame \
     --source-dir ../cregit-files/jq-original \
     --cregit-db  ../cregit-files/jq-cregit.db \
+    --original-db ../cregit-files/jq-original.db \
     --persons-db ../cregit-files/jq-persons.db \
     --output     ../cregit-files/jq-dataset.parquet \
     --repo-name  jq \
@@ -391,6 +467,7 @@ uv run python generate_dataset/generate_dataset.py \
 | `--blame-dir` | yes | Directory containing `.blame` files (Step 8 output). |
 | `--source-dir` | yes | Root of the original source tree. |
 | `--cregit-db` | yes | Path to `cregit.db` (Step 5 output). |
+| `--original-db` | yes | Path to the git log DB of the original repository (Step 3 output). The `footer_*` columns come from its `footers` table. If the file is missing or has no `footers` table, the run stops before Phase 1. |
 | `--persons-db` | yes | Path to `persons.db` (Step 6 output). |
 | `--output` | yes | Output Parquet file path. |
 | `--repo-name` | no | Repository name. Default: inferred from output filename. |

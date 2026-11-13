@@ -22,6 +22,10 @@ use File::Copy;
 use Getopt::Long;
 use Pod::Usage;
 use FindBin qw($RealBin);
+use POSIX qw(_exit);
+use Cwd qw(abs_path);
+use Digest::SHA qw(sha1_hex);
+use Fcntl qw(:flock);
 
 # build/ tempdir anchored to the script's dir, not the caller's CWD.
 my $buildDir = "$RealBin/build";
@@ -31,12 +35,22 @@ my $blameExtension = ".blame";
 my $help = 0;
 my $man = 0;
 my $verbose = 0;
+my $overwrite = 0;
+# Wall-clock limit in seconds for blame -C100. 0 means no limit.
+# blameRepoFiles.pl starts this script, so CREGIT_C100_LIMIT reaches it with no new flag.
+my $c100Limit = (defined $ENV{CREGIT_C100_LIMIT} and $ENV{CREGIT_C100_LIMIT} ne '')
+    ? $ENV{CREGIT_C100_LIMIT} : 3600;
 
 GetOptions ("blameExtension=s" => \$blameExtension, 
+            "c100-limit=s" => \$c100Limit,
+            "overwrite" => \$overwrite,
             "help"     => \$help,      # string
             "verbose"  => \$verbose,
             "man"      => \$man)   # flag
         or die("Error in command line arguments\n");
+
+die "Error: the -C100 limit must be a whole number of seconds, not [$c100Limit]\n"
+    unless $c100Limit =~ /^[0-9]+$/;
 
 if ($man) {
     pod2usage(-verbose=>2);
@@ -58,27 +72,110 @@ Usage("Error [$file] should be a file in repository [$repo] [$repo/$file]\n\n us
 Usage( "Error [$repo] should be a git repo\n\nUsage $0 <repo> <filename> <destinationDir>") unless -d "$repo/.git";
 Usage( "Error [$dest] should be a directory\n\nUsage $0 <repo> <filename> <destinationDir>") unless -d $dest and $dest ne "";
 
+# Two runners can blame into the same output directory. One lock per output file,
+# held until exit; the second runner skips a file that the first one finished.
+my $output = abs_path($dest) . "/" . $file . $blameExtension;
+my $lockDir = "$buildDir/locks";
+make_path($lockDir) if not -d $lockDir;
+open(my $lockFh, '>>', "$lockDir/" . sha1_hex($output) . ".lock")
+    or die "unable to open the lock of [$output]: $!";
+flock($lockFh, LOCK_EX) or die "unable to lock [$output]: $!";
+if (-f $output and not $overwrite) {
+    close $fh;
+    unlink($temp);
+    exit(0);
+}
+
 if ($verbose) {
     print STDERR "$0 processing repo [$repo] file [$file] [$dest]\n";
 }
 
+# Suppressed headers still owe field 2 a filename.
+my %filenameOfCommit;
+my $gitStderr = '';
+
 # -C100: credit a line moved in from another file to its author, not the mover.
 # --porcelain: same shas, but the header once per commit instead of once per line.
-open(IN, "git -C '$repo' blame -C100 --porcelain '$file'|" ) or "unable to execute git ";
-while (my $l = Read_Record()) {
-    print $fh $l;
-    print $fh "\n";
+# A huge generated file can take hours with -C100. After $c100Limit seconds, the
+# script stops it and runs plain blame on the same file, with no limit.
+my $started = time();
+my $status = Blame_To_Temp($c100Limit, '-C100', '--porcelain');
+if (not defined $status) {
+    printf STDERR "PLAIN-BLAME %s after %d s of -C100\n", $file, time() - $started;
+    $status = Blame_To_Temp(0, '--porcelain');
+} elsif (($status & 127) == 0 and ($status >> 8) == 128
+         and $gitStderr =~ /unable to generate diff/) {
+    # git dies (exit 128) when -C100 must diff a candidate blob over 1 GiB (xdiff
+    # limit, "unable to generate diff"). Any other exit 128, and a killed git,
+    # fail below.
+    printf STDERR "PLAIN-BLAME %s after git exit 128 of -C100\n", $file;
+    $status = Blame_To_Temp(0, '--porcelain');
 }
-close IN;
-close $fh;
+close($fh) or Fail("unable to close [$temp]: $!");
+# A git that stops early (killed, out of memory) gives a short or empty stream.
+# Do not keep it: no .blame file, and a non-zero exit that blameRepoFiles.pl counts.
+if ($status != 0) {
+    unlink($temp);
+    unlink("$temp.err");
+    print STDERR "Error: git blame of [$file] in [$repo] failed with status [$status]; no blame file written\n";
+    exit(1);
+}
 copy_file($temp, $dest, $file . $blameExtension);
+unlink($temp);
 if ($verbose) {
     print STDERR "...completed\n";
 }
 
-
-# Suppressed headers still owe field 2 a filename.
-my %filenameOfCommit;
+# Runs git blame with @options on $file and writes the records to the temp file.
+# Returns the wait status of git, or undef if $limit (seconds, 0 = none) passed first.
+# On undef, git is killed and the temp file is empty again.
+sub Blame_To_Temp {
+    my ($limit, @options) = @_;
+    %filenameOfCommit = ();
+    seek($fh, 0, 0) and truncate($fh, 0) or die "unable to empty [$temp]: $!";
+    # fork + exec, not a shell, so the pid and the exit status are those of git.
+    # The stderr of git goes to a file, so the script can tell the xdiff failure
+    # from another exit 128. It is printed again to STDERR after git ends.
+    my $errFile = "$temp.err";
+    $gitStderr = '';
+    my $pid = open(IN, '-|');
+    die "unable to start git blame: $!" unless defined $pid;
+    if ($pid == 0) {
+        open(STDERR, '>', $errFile) or _exit(127);
+        # '--': a path that starts with '-' is a path, not an option.
+        exec('git', '-C', $repo, 'blame', @options, '--', $file);
+        print STDERR "unable to execute git: $!\n";
+        _exit(127);
+    }
+    my $timedOut = 0;
+    eval {
+        local $SIG{ALRM} = sub { die "c100-limit\n" };
+        alarm($limit);
+        while (my $l = Read_Record()) {
+            print $fh $l or Fail("unable to write [$temp]: $!");
+            print $fh "\n" or Fail("unable to write [$temp]: $!");
+        }
+        alarm(0);
+    };
+    alarm(0);
+    if ($@) {
+        die $@ unless $@ eq "c100-limit\n";
+        $timedOut = 1;
+        kill('KILL', $pid);
+    }
+    close IN;
+    my $waitStatus = $?;
+    if (open(my $efh, '<', $errFile)) {
+        local $/;
+        $gitStderr = <$efh>;
+        $gitStderr = '' unless defined $gitStderr;
+        close $efh;
+        print STDERR $gitStderr;
+    }
+    unlink($errFile);
+    return undef if $timedOut;
+    return $waitStatus;
+}
 
 sub Read_Record {
     my $f ;
@@ -91,17 +188,20 @@ sub Read_Record {
             $f = "$1;";
             $sawFilename = 0;
         } elsif ($_ =~ /^(filename) (.+)$/) {
-            $filenameOfCommit{$cid} = $2 if defined $cid;
+            # As git prints it: C-quoted if needed, so never a raw tab or newline.
+            # Field 2 keeps this form; only the compare uses the raw bytes.
+            my $name = $2;
+            $filenameOfCommit{$cid} = $name if defined $cid;
             $sawFilename = 1;
-	    if ($2 ne $file) {
-		$f .=  $2 . ";";
+	    if (Unquote_Path($name) ne $file) {
+		$f .=  $name . ";";
 	    } else {
 		$f .= ";";
 	    }
 	} elsif (/^	(.*)/) { #actual line
             if (not $sawFilename) {
                 my $known = defined $cid ? $filenameOfCommit{$cid} : undef;
-                if (defined $known and $known ne $file) {
+                if (defined $known and Unquote_Path($known) ne $file) {
                     $f .= $known . ";";
                 } else {
                     $f .= ";";
@@ -116,6 +216,21 @@ sub Read_Record {
     return $f;
 }
 
+# git blame --porcelain prints "filename" C-quoted (core.quotePath) when the path
+# has a byte >= 0x80, '"', '\' or a control byte. Gives the raw bytes back, as
+# the path is on the command line, for the compare with $file. A path that git
+# did not quote never starts with '"' (git quotes every path that has one), so
+# it comes back unchanged.
+sub Unquote_Path {
+    my ($s) = @_;
+    return $s unless $s =~ /^"(.*)"$/s;
+    my $q = $1;
+    my %escape = ('a' => "\a", 'b' => "\b", 't' => "\t", 'n' => "\n",
+                  'v' => "\x0b", 'f' => "\f", 'r' => "\r", '"' => '"', '\\' => '\\');
+    $q =~ s/\\([0-3][0-7][0-7]|[abtnvfr"\\])/length($1) == 3 ? chr(oct($1)) : $escape{$1}/ge;
+    return $q;
+}
+
 sub Usage {
     my ($m) = @_;
     print STDERR "$m\n";
@@ -123,23 +238,41 @@ sub Usage {
     exit(1);
 }
 
+# Removes the partial output and stops with a non-zero exit.
+sub Fail {
+    my ($m) = @_;
+    unlink($temp, "$temp.err");
+    print STDERR "Error: $m; no blame file written\n";
+    exit(1);
+}
+
 sub copy_file
 {
     my ($from, $toDir, $toName) = @_;
-    
+
     my $to = "${toDir}/$toName";
     $toDir = dirname($to);
-
-#    printf ("copy [$from] to [$to] [$toDir][$toName]\n");
 
     die "from file does not exist in copy_file [$from]" if not -f $from;
 
     if (not -d $toDir) {
         printf("Creating directory [$toDir]\n");
-	make_path($toDir) or "die unable to create directory $to";
-    } 
-    move($from, $to) or
-            (unlink($to),  "unable to move [$from] to [$to]");
+        make_path($toDir);
+        Fail("unable to create directory [$toDir]") unless -d $toDir;
+    }
+    # Same folder as the output, so the rename is atomic: an existing output
+    # file is always complete.
+    my $partial = "$to.partial.$$";
+    if (not copy($from, $partial)) {
+        my $err = $!;
+        unlink($partial);
+        Fail("unable to copy [$from] to [$partial]: $err");
+    }
+    if (not rename($partial, $to)) {
+        my $err = $!;
+        unlink($partial);
+        Fail("unable to move [$partial] to [$to]: $err");
+    }
 }
 
 __END__
@@ -155,6 +288,12 @@ formatBlame.pl [options] <repository> <file> <outputDirectory>
      Options:
        --blame-extension=s  extension to append to output files. 
                             Default is .blame
+       --c100-limit=N       seconds for git blame -C100. After that, the
+                            script kills it and runs git blame without -C.
+                            Default is $CREGIT_C100_LIMIT, else 3600.
+                            0 means no limit.
+       --overwrite          replace an existing output file. Without it, the
+                            script skips a file that already exists.
        --help               brief help message
        --man                full documentation
 
@@ -176,5 +315,11 @@ B<This program> will read run blame on a given file in a given git
 repository and create a file in the output directory
 with the same full path as the original file, with 
 the .blame extension (which can be changed with the --blame option).
+
+If git blame -C100 does not end within the limit, the script runs
+git blame without -C and prints "PLAIN-BLAME <file> after <N> s of -C100"
+to STDERR. The script does this only after the xdiff failure of git
+(exit 128 with "unable to generate diff" on STDERR); any other exit 128 is a
+failure. If git fails, the script writes no output file and exits 1.
 
 =cut
