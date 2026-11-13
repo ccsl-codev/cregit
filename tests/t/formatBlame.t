@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 67;
+use Test::More tests => 70;
 use FindBin;
 use File::Temp qw(tempdir);
 use File::Basename qw(dirname);
@@ -301,6 +301,30 @@ FAKE
         like($out, qr/^Error: unable to copy/m, "the script says that the copy failed");
         chmod 0755, $ro;
     }
+}
+
+# Field 2 is the old file name as git prints it. It is not escaped, so a
+# semicolon in the old name adds a field when a reader splits on ";". This
+# test records the behavior; the dataset was built with it.
+{
+    my $repo4 = "$workdir/semicolon";
+    mkdir $repo4 or die $!;
+    git($repo4, "init -q -b main");
+    write_file("$repo4/old;name.c", "int one;\n");
+    git($repo4, "add .");
+    my $first = commit_as($repo4, "Alice", "write the file");
+    git($repo4, "mv 'old;name.c' new.c");
+    commit_as($repo4, "Carol", "rename the file");
+
+    my $dest = tempdir(CLEANUP => 1);
+    is(system("perl '$script' '$repo4' new.c '$dest' 2>/dev/null"), 0,
+       "formatBlame.pl succeeds when the old name has a semicolon");
+    my @lines = slurp_lines("$dest/new.c.blame");
+    is($lines[0], "$first;old;name.c;\tint one;",
+       "field 2 keeps the semicolon of the old name, unescaped");
+    my ($head) = split /\t/, $lines[0], 2;
+    is(scalar(split /;/, $head, -1), 4,
+       "a split on a semicolon gives one more field than a name without one");
 }
 
 # Two non-contiguous groups from one commit, in a renamed file: --porcelain

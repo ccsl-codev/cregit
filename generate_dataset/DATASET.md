@@ -38,7 +38,7 @@ ORDER BY tokens DESC;
 -- Tokens authored by a specific person
 SELECT file_path, source_line, source_text, token_type, token_value
 FROM 'dataset.parquet'
-WHERE person_name = 'Linus Torvalds'
+WHERE person_name = 'Ada Example'
 ORDER BY file_path, token_index;
 ```
 
@@ -126,8 +126,8 @@ JGit's `getFooterLines` of the original commit message.
 
 Each of the 13 typed lists holds **one entry per person**, not the raw trailer
 lines. A message can name one person twice, with the same text or with another
-address (for example `Borislav Petkov (AMD) <bp@alien8.de>` and
-`Borislav Petkov <bp@suse.de>`). In one list, two values are the same person
+address (for example `Pat Example (Corp) <pat@corp.example.com>` and
+`Pat Example <pat@home.example.com>`). In one list, two values are the same person
 when:
 
 - their addresses resolve to the same `personid`. The address is the one that
@@ -362,6 +362,23 @@ In such a file, a line that moved in from another file has the commit that moved
 it. The rows of the file do not record this. To find these files, search the
 pipeline log for `PLAIN-BLAME`. A file that ends within the limit gets the same
 blame bytes as before.
+
+Git also exits 128 when `-C100` must diff a candidate blob over 1 GiB (xdiff
+limit). The script then reads the stderr of git. Only when it holds
+`unable to generate diff` does it run plain `git blame` and print
+`PLAIN-BLAME <file> after git exit 128 of -C100`. Any other exit 128 is a
+failure, as below.
+
+The script writes each `.blame` file under a temporary name in the output
+folder and renames it into place, so an existing `.blame` file is complete. A
+failed write, close, copy or rename removes the partial file, prints an error
+and exits 1. Without `--overwrite`, the script skips a file that exists; with
+it, the script replaces the file. `blameRepoFiles.pl --overwrite` passes the
+option on.
+
+Field 2 of a `.blame` record is the old file name as git prints it, with no
+escape. A semicolon in the old name adds a field for a reader that splits the
+record on `;`. The dataset has this form, so it stays.
 
 If git fails or stops early for a different reason (for example, the kernel
 kills it for memory), `formatBlame.pl` writes no `.blame` file and exits 1.

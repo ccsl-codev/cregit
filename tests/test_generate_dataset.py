@@ -640,18 +640,35 @@ def test_an_identical_repeated_trailer_gives_one_entry(monkeypatch, tmp_path):
 
 
 def test_two_addresses_of_one_person_give_the_first_value(monkeypatch, tmp_path):
-    """The Linux case: "Borislav Petkov (AMD) <bp@alien8.de>" and
-    "Borislav Petkov <bp@suse.de>" are one personid."""
+    """The Linux case: "Pat Example (Corp) <pat@corp.example.com>" and
+    "Pat Example <pat@home.example.com>" are one personid."""
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path, seed=seed_footers(
-        ("Signed-off-by", "Borislav Petkov (AMD) <bp@alien8.de>"),
-        ("Signed-off-by", "Borislav Petkov <bp@suse.de>"),
-        people=[("bp", "bp@alien8.de", "Borislav Petkov"),
-                ("bp", "bp@suse.de", "Borislav Petkov")]))
+        ("Signed-off-by", "Pat Example (Corp) <pat@corp.example.com>"),
+        ("Signed-off-by", "Pat Example <pat@home.example.com>"),
+        people=[("pat", "pat@corp.example.com", "Pat Example"),
+                ("pat", "pat@home.example.com", "Pat Example")]))
 
     signed, ids = typed_lists_of(duckdb, out, "footer_signed_off_by", "footer_personids")
-    assert signed == ["Borislav Petkov (AMD) <bp@alien8.de>"]
-    assert ids == ["bp"]
+    assert signed == ["Pat Example (Corp) <pat@corp.example.com>"]
+    assert ids == ["pat"]
+
+
+def test_an_address_with_two_personids_uses_the_lowest(monkeypatch, tmp_path):
+    """Two emails rows name one address for two persons. The lowest personid is
+    the key, so the other address of that lowest person is the same person.
+    The higher personid is listed first in emails, so a rule that took the
+    first row, or the highest one, would give two entries."""
+    duckdb = pytest.importorskip("duckdb")
+    out = generate(monkeypatch, tmp_path, seed=seed_footers(
+        ("Signed-off-by", "Sam One <sam@example.com>"),
+        ("Signed-off-by", "Sam Two <sam@other.example.com>"),
+        people=[("zed", "sam@example.com", "Sam One"),
+                ("abe", "sam@example.com", "Sam One"),
+                ("abe", "sam@other.example.com", "Sam Two")]))
+
+    [signed] = typed_lists_of(duckdb, out, "footer_signed_off_by")
+    assert signed == ["Sam One <sam@example.com>"]
 
 
 def test_two_addresses_of_two_persons_stay_two_entries(monkeypatch, tmp_path):
@@ -691,12 +708,12 @@ def test_a_bare_address_and_a_bracketed_one_are_one_person(monkeypatch, tmp_path
 def test_a_value_with_no_address_is_never_merged(monkeypatch, tmp_path):
     duckdb = pytest.importorskip("duckdb")
     out = generate(monkeypatch, tmp_path, seed=seed_footers(
-        ("Reported-by", "Daniel Stenberg"),
-        ("Reported-by", "Daniel Stenberg"),
-        ("Reported-by", "daniel stenberg")))
+        ("Reported-by", "Dana Example"),
+        ("Reported-by", "Dana Example"),
+        ("Reported-by", "dana example")))
 
     [reported] = typed_lists_of(duckdb, out, "footer_reported_by")
-    assert reported == ["Daniel Stenberg", "Daniel Stenberg", "daniel stenberg"]
+    assert reported == ["Dana Example", "Dana Example", "dana example"]
 
 
 def test_the_entries_keep_the_order_of_their_first_idx(monkeypatch, tmp_path):
